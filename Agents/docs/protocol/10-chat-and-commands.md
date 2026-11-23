@@ -18,6 +18,10 @@ rows with `SendsGenericCommandPacket` never arrive as chat: the client sends C�
 (`/destroy` 9, `/hideout` 45: [21](21-hideouts.md) §3), so our commands must not reuse those words. `InstanceChat.Length` frames it
 (the length depends on the text), and `SplitClientMessages` uses it for id 0x15.
 
+`/played` is `ShowTimePlayed`, Commands row 1: **C→S 0x16, u8 2, empty wstr** (`00 16 02 00 00`).
+The Commands module answers with a chat line and saves online seconds in character module data.
+The counter starts when this support is installed; earlier playtime cannot be reconstructed from existing saves.
+
 The prefixes are `#` global, `$` trade, `%` party, `&` guild and `@` whisper; local has none (live 2026-10-25, typed in
 the chat box: `hello local`, `#hello global`, `$hello trade`).
 After a trade line the chat box opens with `$` already typed, so the next line goes to trade too.
@@ -310,8 +314,9 @@ Sent, in order: **0x20** (once per variety and level on a connection), **0x2bb**
   DiesAfterTime, StateMachine or Transitionable. The blob also writes MinimapIcon (u8), DiesAfterTime (no data: its
   live vtable is the factory's `0x1435a7888`, slot 17 `ret`), Preload, Functions, PlayerClass (no data), Transitionable
   and StateMachine (below), NPC (`00 ff`, [17](17-npcs.md)), InteractionAction (u8 flags 0, `0x141e218a0`: Act 2's
-  bandit lords Kraityn, Alira and Oak) and Timer (no data: its only vtable `0x1435ab790` has slot 17 `ret`; Solaris and
-  Lunaris on The Harbour Bridge). The rest have ControlZone, BlightTower, Mercenary, LimitedLifespan … components and
+  bandit lords Kraityn, Alira and Oak), Timer (no data: its only vtable `0x1435ab790` has slot 17 `ret`; Solaris and
+  Lunaris on The Harbour Bridge) and TriggerableBlockage (`0x141e47880`: u8 blocked, then only while blocked a u8 section
+  count; Oshabi's Root Wall, sent unblocked, not yet seen live). The rest have ControlZone, BlightTower, Mercenary, LimitedLifespan … components and
   are refused with a message box. The type is the variety's own Id when an
   `.ot` exists under it, else its `BaseMonsterTypeIndex`: `KitavaBoss/KitavaFinal`'s base column names `Kitava1`, but
   the client builds it from `kitavafinal.ot`, which has no Transitionable; sent with Kitava1's list, the extra byte was
@@ -395,7 +400,7 @@ Sent, in order: **0x20** (once per variety and level on a connection), **0x2bb**
   animation, along the client's own path around walls, on the terrain height**. Alternatives: **0x1ba** (Positioned
   move) only slides it in a straight line through walls, at `duration = cell distance / value` (value ≈ cells per
   second; `0x141e33fd0` → `0x141e37460`), keeping the old height; **0x1b7** teleports it.
-- **AI** (Gateway, `RunMonsterAi`; live 2026-10-17). Every 50 ms of game time (`MonsterAiCadence`) per connection: a monster within
+- **AI** (Gateway, `StartMonsterAi`; live 2026-10-17). Every 50 ms of game time (`MonsterAiCadence`) per connection: a monster within
   its MonsterVarieties `MaxAgroRange` (taken as grid cells: 60 for Hungry Corpse, 105 for most) of the server's estimate
   of the player starts chasing: a Move action (0x1ab, 0x2909) to its own cell around the player, re-sent when that cell
   moves by 3+ cells; beyond twice the range it gives up: an S→C 0x1ac ends the client's chase action (925 of 1166
@@ -438,7 +443,7 @@ another server with `ChatRoutes.Use(id, host, port)`, at once and until it unloa
 `Failed to connect to host:port chat channel, switching back to local chat server.` in chat when that server fails or the
 connection drops, each reason once, and tries again at an area change after 60 s.
 
-To host one: `dotnet run -c Release --project src/GameServer.Chat` (solution `GameServer.Chat.slnx`), with
+To host one: `dotnet run -c Release --project src/GameServer.Chat`, with
 `Chat.BindAddress` and `Chat.Port` in `localexile.conf` (or `Game_CHAT_BIND`, `Game_CHAT_PORT`; default 0.0.0.0:6113). It needs an open TCP port, so a VM, not an HTTP-only host.
 Nothing is encrypted, stored or authenticated. Separate Gateways can have characters of one name, so a later one gets the
 first free `Name_n` for that connection; `@Name_n` whispers to it. Not `Name[n]`: the client drew `#Build[1]: hey` all
