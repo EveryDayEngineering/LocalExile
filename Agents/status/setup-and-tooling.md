@@ -104,7 +104,7 @@ Part of [Status](../Status.md); what to build next in this area is in
   copy the 3.29 client loads into `My Games\Path of Exile`.
   It drops item, class and mod names missing from `sql/updates/client` and disables blocks that use `Fated`.
   Checked on a 3.30 NeverSink filter: no names or keywords left that the 3.29.3c tables and `Game.exe` lack.
-  Not yet: loaded in the real client.
+  Loaded and used in the real 3.29.3c client, a synced 3.30 filter and a newly downloaded one.
   scripts (`scripts/dev/clientdb.py`) alike; no `data/tables/` path is read. The Gateway holds every client table in
   memory and builds every catalog in a fixed, logged order before it listens (`WorldLoader`, each module's
   `LoadData`), so no game action reads SQLite or loads data on first use
