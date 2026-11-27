@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using GameServer.Core.Accounts;
+using GameServer.Core.Projectiles;
 using GameServer.Core.Protocol.Instance;
 using GameServer.Core.Protocol.Login;
 using GameServer.Core.World;
@@ -115,6 +116,70 @@ public sealed class TriggeredSummonTests
     }
 
     [Fact]
+    public async Task Royale_desecrate_commits_corpses_and_its_local_chaos_ground()
+    {
+        var clock = new DesecrateClock();
+        using var f = new Fixture(clock);
+        var player = f.Player;
+        player.Use(new(1, "desecrate-test", 400, 400, 100, 100, (_, _) => true, []) { Sight = (_, _) => 2 });
+        player.Walk.Teleport(100, 100, clock.At);
+        player.Connection.LockstepClient = false;
+        player.Connection.PlayerObjectCreated = true;
+        player.ProjectileRuntimeState = f.Session;
+        var items = Game.ItemsOf(player);
+        var host = Assert.Single(items.Items(PlayerInventories.Weapon1));
+        var type = Program.Items.Find("Metadata/Items/Gems/SkillGemDesecrateRoyale")!;
+        var variant = Assert.Single(Program.Items.Gem(type)!.Variants);
+        var royale = ItemCatalog.Create(type) with { GemVariant = variant.Index };
+        items.Change(PlayerInventories.Weapon1, host.Id, item => item with
+        {
+            Sockets = [new(SocketColour.White, royale)], Links = [1],
+        });
+        var gem = Assert.Single(Game.GemSkillEffects(player));
+        Assert.Equal("DesecrateRoyale", Program.Skills.EffectId(gem.Effect));
+        var inside = Target(901, 110);
+        var outside = Target(902, 140);
+        var previous = Game.AreaUpdateContext.Value;
+        Game.AreaUpdateContext.Value = new(f.Lifetime, clock);
+        try
+        {
+            f.Session.AdvanceTo(ProjectileRuntime.Time(clock.At));
+            Assert.True(await Game.CastGemSkill(player, gem.Id, (100, 100), (110, 100)));
+            Assert.Equal(5, player.Summons.Corpses.Count);
+            clock.At += 5;
+            f.Session.AdvanceTo(ProjectileRuntime.Time(clock.At));
+            Assert.InRange(inside.Life, 1u, inside.MaxLife - 1);
+            Assert.Equal(outside.MaxLife, outside.Life);
+            uint life = inside.Life;
+            clock.At += 2;
+            f.Session.AdvanceTo(ProjectileRuntime.Time(clock.At));
+            Assert.Equal(life, inside.Life);
+        }
+        finally { Game.AreaUpdateContext.Value = previous; }
+
+        SpawnedMonster Target(uint id, int x)
+        {
+            var target = new SpawnedMonster("Desecrate witness", new(x, 100, 0), 0, 0, 10000)
+                { ObjectId = id, Hostile = true, NoRewards = true };
+            player.Area.Monsters[id] = target;
+            player.Area.Grid.Set(new(id), (x, 100));
+            return target;
+        }
+    }
+
+    sealed class DesecrateClock : IPlayerUpdateSchedule
+    {
+        public double At = 3;
+        public double Now(Player player) => At;
+        public async Task Wait(int milliseconds, CancellationToken stopping)
+        {
+            await Task.Yield();
+            stopping.ThrowIfCancellationRequested();
+            At += milliseconds / 1000d;
+        }
+    }
+
+    [Fact]
     public async Task Desecrate_creates_corpses_with_nonzero_wire_life_then_zeroes_them()
     {
         using var f = new Fixture();
@@ -218,6 +283,76 @@ public sealed class TriggeredSummonTests
             Program.Outgoing = outgoing;
         }
     }
+
+    [Fact]
+    public async Task Crafted_trigger_wand_greys_out_skills_and_triggers_desecrate_offering_convocation_round_robin()
+    {
+        using var f = new Fixture();
+        var wandMod = Program.Items.Mods.ById("JunMaster2TriggerSocketedSpellOnSkillUse1")!;
+        Item Gem(string name)
+        {
+            var type = Program.Items.FindGem(name)!.Value;
+            return ItemCatalog.Create(type.Type) with { GemVariant = type.Variant.Index,
+                GemExperience = Program.Items.Gem(type.Type)!.ExperienceFor(20) };
+        }
+        var wand = ItemCatalog.Create(Program.Items.Find("Prophecy Wand")!) with
+        {
+            Mods = [wandMod.Roll(ModSection.Explicit, new Random(1))],
+            Sockets = new[] { "Desecrate", "Flesh Offering", "Convocation" }
+                .Select(n => new ItemSocket(SocketColour.White, Gem(n))).ToArray(),
+            Links = [1, 1, 1],
+        };
+        uint existingWeaponId = Game.ItemsOf(f.Player).Items(PlayerInventories.Weapon1).Single().Id;
+        Game.ItemsOf(f.Player).Change(PlayerInventories.Weapon1, existingWeaponId, _ => wand);
+        // Equip an active skill in another slot (boots) to trigger the crafted weapon spells on skill use.
+        var boots = ItemCatalog.Create(Program.Items.Find("Iron Greaves")!) with
+        {
+            Sockets = [new ItemSocket(SocketColour.Blue, Gem("Arc"))],
+            Links = [1],
+        };
+        Game.ItemsOf(f.Player).Put(PlayerInventories.Boots, new(2, 0, 0, boots));
+
+        var skills = Game.PlayerSkills(f.Player);
+        var gemMap = Game.GemSkillEffects(f.Player).ToDictionary(g => Program.Skills.EffectId(g.Effect)!, g => g);
+
+        string convocationEffect = gemMap.ContainsKey("Convocation") ? "Convocation" : "ConvocationOld";
+        foreach (string triggered in new[] { "Desecrate", "FleshOffering", convocationEffect })
+        {
+            var entry = gemMap[triggered];
+            var gs = skills.Single(s => s.Id == entry.Id);
+            var stats = gs.Stats!.ToDictionary(kv => kv.Key, kv => kv.Value);
+            Assert.Equal(1, stats[Stat.SpellHasTriggerFromCraftedItemMod]);
+            Assert.Equal(1, stats[Stat.SpellUncastableIfTriggerable]);
+            Assert.Equal(1, stats[OwnAuraRestriction.SkillDisabled]);
+            Assert.NotNull(Game.GemSkillInstanceDisabled(f.Player, entry.Effect, entry.Id));
+        }
+
+        // 3 consecutive active skill uses within 1s trigger Desecrate -> Flesh Offering -> Convocation round-robin
+        // (each spell keeps its own 8s cooldown instead of a global 8s block).
+        f.Player.ProjectileRuntime = f.Session;
+        f.Player.PlayerMana = 1000;
+        var arc = gemMap["Arc"];
+        Game.RecordAcceptedGemUseAt(f.Player, arc.Effect, (120, 100), 100.0);
+        await Drain(f.Session);
+        Assert.Equal(5, f.Player.Summons.Corpses.Count);
+
+        Game.RecordAcceptedGemUseAt(f.Player, arc.Effect, (120, 100), 100.2);
+        await Drain(f.Session);
+        Assert.Contains(f.Player.Summons.Offerings, o => o.Effect == "FleshOffering");
+        Assert.Contains(f.Player.Area.Monsters.Values, m => m.CorpseConsumed);
+
+        uint manaBeforeConvocation = f.Player.PlayerMana;
+        Game.RecordAcceptedGemUseAt(f.Player, arc.Effect, (120, 100), 100.4);
+        await Drain(f.Session);
+        Assert.True(f.Player.PlayerMana < manaBeforeConvocation, "Convocation should trigger on the 3rd use within 1s");
+
+        // A 4th use while all three are on their individual 8s cooldowns triggers nothing.
+        uint manaAfterAllThree = f.Player.PlayerMana;
+        Game.RecordAcceptedGemUseAt(f.Player, arc.Effect, (120, 100), 100.6);
+        await Drain(f.Session);
+        Assert.Equal(manaAfterAllThree, f.Player.PlayerMana);
+    }
+
     internal sealed class Fixture : IDisposable
     {
         readonly string save = Path.Combine(Path.GetTempPath(), $"animated-admission-{Guid.NewGuid():N}.db");
@@ -241,7 +376,7 @@ public sealed class TriggeredSummonTests
             Pools = new(100, 10000, 10000, 2, 0, Strength: 1000, Dexterity: 1000, Intelligence: 1000),
             LeagueModule = new(new League("animate-test", "Standard", false, false), new HashSet<string>(["Game"]))
         };
-        internal Fixture()
+        internal Fixture(IPlayerUpdateSchedule? projectileSchedule = null)
         {
             Saves.Open(save); Game.CombatLifetime = lifetime;
             Program.SetGameLogic(new GameServer.Modules.Game.GameLogic(lifetime));
@@ -265,7 +400,11 @@ public sealed class TriggeredSummonTests
             Player.Connection.Session = new("test", Stream, Ciphers);
             drain = Task.Run(async () => { try { var bytes = new byte[65536]; while (await reader.GetStream().ReadAsync(bytes) > 0) { } }
                 catch (Exception ex) when (ex is IOException or ObjectDisposedException) { } });
-            Session = new(Player);
+            // The projectile outbox captures the schedule when the session is created.
+            var previousUpdates = Game.AreaUpdateContext.Value;
+            if (projectileSchedule is not null) Game.AreaUpdateContext.Value = new(lifetime, projectileSchedule);
+            try { Session = new(Player); }
+            finally { Game.AreaUpdateContext.Value = previousUpdates; }
         }
         internal Task<uint> Summon(string effect, uint target)
         {

@@ -8,15 +8,23 @@ public sealed record VaalUseReservation(ushort Skill, int Effect, int Action, in
     public long WorkGeneration;
     public int RecoveryGeneration;
     public bool RageConverted;
+    public int? TotemPlacements;
+    internal Game.KtashEmpowerment? Ktash { get; init; }
+    internal double PactDamageMore => Ktash?.DamageMore ?? 1;
 }
 
 public static partial class Game
 {
     // A Vaal name never opts into the generic area fallback. Each executor is admitted explicitly.
-    public static bool VaalExecutor(Player player, int effect) =>
-        SkillsFor(player).EffectId(effect) is "VaalGroundSlam" or "VaalFireball" or "VaalSpark" or "VaalMoltenStrike"
-            or VaalImmortalCallEffect or "VaalHaste" or "VaalSmite"
-            || IsVaalMinion(SkillsFor(player).EffectId(effect)) || VaalAuras.ContainsKey(SkillsFor(player).EffectId(effect) ?? "");
+    public static bool VaalExecutor(Player player, int effect)
+    {
+        string id = SkillsFor(player).EffectId(effect) ?? "";
+        return id is "VaalGroundSlam" or "VaalFireball" or "VaalSpark" or "VaalMoltenStrike" or "VaalFireTrap" or "VaalSweep" or VaalReaveEffect
+            or VaalImmortalCallEffect or VaalArcticArmourEffect or VaalRejuvenationTotemEffect
+            or "VaalHaste" or "VaalSmite" or "VaalHeavyStrike" or VaalMoltenShellEffect or VaalLightningWarpEffect
+            or VaalAncestralWarchiefEffect or "VaalDetonateDead" or VaalArcEffect or VaalBladeVortexEffect or VaalVenomGyreEffect
+            || IsVaalMinion(id) || TimedVaalAuraBuffRows.ContainsKey(id);
+    }
     static double VaalResourceTime(Player player) => player.LeavingArea && player.RampageTransferAt is double frozen
         ? frozen : ProjectileWorldTime(player);
 
@@ -46,22 +54,33 @@ public static partial class Game
             conversion, true, SkillsFor(player).IsAttack(gem.Effect), true, new(Get(Stat.BaseCostPlusPct), Get(Stat.BaseRageCostPlusPct),
                 Get(Stat.CostPlusPctFinal), Sum(Stat.BaseSkillCostEfficiencyPlusPct, Stat.BaseAttackSkillCostEfficiencyPlusPct),
                 Get(Stat.BaseRageCostEfficiencyPlusPct), free));
+        rage = ActorScale.Saturate((long)rage + ChainbreakerRageCost(Get));
         uint souls = conversion || free ? 0 : (uint)VaalSoulCost.Required(definition.BaseCost, Get);
-        uint mana = free ? 0 : (uint)Math.Max(0, SupportedStats(player, id).GetValueOrDefault(Stat.ManaCost));
-        // Lifetap and Blood Magic turn the whole upfront Mana cost into Life.
-        uint life = 0;
-        if (!free && Lifetap.ConvertsCostToLife(gem.Stats, CharacterPlayerStats(player)))
+        uint mana = 0, life = 0;
+        if (!free)
         {
-            life = mana;
-            mana = 0;
+            var costStats = SupportedStats(player, id);
+            mana = (uint)Math.Max(0, costStats.GetValueOrDefault(Stat.ManaCost));
+            if (Lifetap.ConvertsCostToLife(gem.Stats, costStats))
+            {
+                life = mana;
+                mana = 0;
+            }
         }
+        if (Get(Stat.NoManaCost) != 0) mana = 0;
         int preventionMs = SkillsFor(player).SoulGainPreventionMs(gem.Effect, gem.Level);
         // Vaal auras: "Modifiers to Buff Duration also apply to this Skill's Soul Gain Prevention".
         bool buffScaled = Get(Stat.ModifiersToBuffEffectDurationAlsoAffectSoulPreventionDuration) != 0;
-        double preventionBase = buffScaled ? VaalAuraSeconds(preventionMs, playerStats, gem.Stats, SkillDurationModifiers.Kinds.Buff)
-            : Get(Stat.ModifiersToSkillEffectDurationAlsoAffectSoulPreventionDuration) != 0
-            ? SkillDurationModifiers.Seconds(preventionMs, n => GolemStat(playerStats, n), n => GolemStat(gem.Stats, n))
-            : preventionMs / 1000d;
+        bool skillScaled = Get(Stat.ModifiersToSkillEffectDurationAlsoAffectSoulPreventionDuration) != 0;
+        int preventionIncrease = Get(Stat.VaalSkillSoulGainPreventationDurationPlusPct);
+        if (Get(Stat.ModifiersToTotemDurationAlsoAffectSoulPreventionDuration) != 0)
+            preventionIncrease = ActorScale.Saturate((long)preventionIncrease + Get(Stat.TotemDurationPlusPct));
+        int PreventionPlayer(uint name) => ActorScale.Saturate((long)GolemStat(playerStats, name)
+            + (name == SkillDurationModifiers.IncreasedDuration ? preventionIncrease : 0));
+        double preventionBase = buffScaled || skillScaled
+            ? SkillDurationModifiers.Seconds(preventionMs, PreventionPlayer, n => GolemStat(gem.Stats, n),
+                buffScaled ? SkillDurationModifiers.Kinds.Buff : SkillDurationModifiers.Kinds.None)
+            : preventionMs / 1000d * Math.Max(0, 1 + preventionIncrease / 100d);
         double prevention = Get(Stat.VaalSkillDoesNotApplySoulGainPrevention) != 0
             || Get(Stat.MapPlayerDisableSoulGainPrevention) != 0 ? 0
             : Math.Max(0, preventionBase
@@ -73,7 +92,7 @@ public static partial class Game
     static bool CanPayVaalUse(Player player, VaalUseReservation plan)
     {
         var stats = CharacterPlayerStats(player);
-        var rage = player.Rage.Read(VaalResourceTime(player), RageStats.Inputs(n => RageStat(stats, n)));
+        var rage = player.Rage.Read(VaalResourceTime(player), RageStats.Inputs(player, n => RageStat(stats, n)));
         if (player.PlayerMana < plan.Mana || plan.Life > 0 && player.PlayerLife <= plan.Life
             || rage.Current < plan.Rage) return false;
         if (plan.Souls == 0) return true;
@@ -99,25 +118,35 @@ public static partial class Game
         // The caller checked every resource under this same combat lock before changing action/cooldown state.
         var stats = CharacterPlayerStats(player);
         double now = VaalResourceTime(player);
-        if (!player.Rage.Spend(plan.Rage, now, RageStats.Inputs(n => RageStat(stats, n))))
+        if (!player.Rage.Spend(plan.Rage, now, RageStats.Inputs(player, n => RageStat(stats, n))))
             throw new InvalidOperationException("Vaal Rage reservation changed inside admission");
         if (plan.Souls > 0)
         {
             var definition = SkillsFor(player).VaalBudget(plan.Effect, SupportedSkill(player, plan.Skill).Level)!.Value;
-            if (!player.VaalSouls.TryConsume(definition.ActiveSkillsRow, plan.Souls))
+            bool refund = plan.Ktash is { RefundChance: > 0 } empowerment
+                && (empowerment.RefundChance == 100 || AreaRng(player).Next(100) < empowerment.RefundChance);
+            if (!player.VaalSouls.TryConsume(definition.ActiveSkillsRow, plan.Souls, refund))
                 throw new InvalidOperationException("Vaal soul reservation changed inside admission");
         }
+        if (plan.Ktash is { } admitted) UseKtashEmpowerment(player, admitted);
         player.PlayerMana -= plan.Mana;
         player.PlayerLife -= plan.Life;
         ManaSpentLocked(player, plan.Mana, stats);
+        uint adrenaline = Stat.AdrenalineOnVaalSkillUseDurationMs;
+        if (player.WardBreak.GrantAdrenaline(now, stats.GetValueOrDefault(adrenaline), adrenaline))
+        {
+            player.Pools = PoolsFor(player, player.Pools.Level);
+            player.ApplyMovementSpeed();
+        }
         if (plan.Life > 0 || plan.Mana > 0)
             ApplyPaidSupportCostsLocked(player, plan.Skill, SupportedSkill(player, plan.Skill).Stats, plan.Mana, (int)plan.Life, now);
-        if (plan.Life > 0) PresentStats(player);
+        uint sacrificed = SacrificeItemLifeLocked(player, plan.Effect, stats);
+        if (plan.Life + sacrificed > 0) PresentStats(player);
         if (attackDeadline is double next) player.NextAttackAt = next;
         player.VaalPreventionUntil = Math.Max(player.VaalPreventionUntil, now + plan.PreventionSeconds);
         Console.WriteLine($"[gateway] Vaal use paid: skill 0x{plan.Skill:x4} {SkillsFor(player).EffectId(plan.Effect)}, " +
             $"-{plan.Souls} souls, -{plan.Rage} Rage, soul gain prevention {plan.PreventionSeconds:0.##} s (until t={player.VaalPreventionUntil:0.000})");
-        player.VaalUse = plan with { Action = player.ActionCount, Epoch = player.ProjectileEpoch,
+        player.VaalUse = plan with { Action = player.ActionCount, Epoch = player.ProjectileEpoch, Life = plan.Life + sacrificed,
             CriticalRoll = CaptureSkillCriticalRoll(player, plan.Skill), RecoveryGeneration = player.ActionInterruptionGeneration };
     }
 

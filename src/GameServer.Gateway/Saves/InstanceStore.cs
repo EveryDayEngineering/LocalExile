@@ -8,7 +8,13 @@ using GameServer.Core.Protocol.Instance;
 /// </summary>
 public sealed class InstanceStore(TimeProvider clock, TimeSpan lifetime)
 {
+    /// <summary>How long an unentered pre-generated layout stays cached on an empty instance before its grid is released.</summary>
+    public static readonly TimeSpan PreparedLayoutLifetime = TimeSpan.FromSeconds(30);
+
     readonly Dictionary<(ulong Id, long Created, string? SoloOwner), InstanceState> _instances = [];
+
+    /// <summary>Current UTC timestamp from this store's clock.</summary>
+    public DateTimeOffset Now => clock.GetUtcNow();
 
     public InstanceState[] Snapshot()
     {
@@ -21,17 +27,74 @@ public sealed class InstanceStore(TimeProvider clock, TimeSpan lifetime)
         lock (_instances) return _instances.GetValueOrDefault((id, created, soloOwner?.ToUpperInvariant()));
     }
 
-    /// <summary>A connection enters the instance: its state, a fresh one for a new or expired instance.</summary>
-    public InstanceState Enter(ulong id, long created, string? soloOwner = null)
+    /// <summary>Gets or creates the instance state before a connection opens (during a transfer's "Entering" wait),
+    /// without claiming a connection slot: a newly created state starts with <see cref="InstanceState.EmptySince"/> set
+    /// so it still expires after <c>lifetime</c> if the client never connects.</summary>
+    public InstanceState Prepare(ulong id, long created, string? soloOwner = null)
     {
+        InstanceState state;
+        List<InstanceState>? evicted;
         lock (_instances)
         {
             var now = clock.GetUtcNow();
-            foreach (var (key, _) in _instances.Where(e => e.Value.EmptySince is { } t && now - t >= lifetime).ToList())
-                _instances.Remove(key);
+            evicted = PruneLocked(now);
+            var instanceKey = (id, created, soloOwner?.ToUpperInvariant());
+            if (!_instances.TryGetValue(instanceKey, out state!))
+            {
+                var presence = _instances.Where(e => e.Key.Id == id && e.Key.Created == created)
+                    .Select(e => e.Value.Presence).FirstOrDefault();
+                _instances[instanceKey] = state = new InstanceState(presence) { EmptySince = now };
+            }
+            else if (state.Connections == 0)
+            {
+                // Refresh expiry so an empty instance near its lifetime is not pruned between Prepare and Enter.
+                state.EmptySince = now;
+            }
+        }
+        NotifyClosing(evicted);
+        return state;
+    }
+
+    /// <summary>Releases any cached pre-generated layout on an empty instance (e.g. a transfer abandoned before 0x27).</summary>
+    public void ClearPreparedLayoutIfEmpty(ulong id, long created, string? soloOwner = null)
+    {
+        lock (_instances)
+            if (_instances.TryGetValue((id, created, soloOwner?.ToUpperInvariant()), out var state) && state.Connections == 0)
+                state.ReleasePreparedLayout();
+    }
+
+    internal bool Remove(ulong id, long created, string? soloOwner = null)
+    {
+        InstanceState? removed;
+        lock (_instances)
+            _instances.Remove((id, created, soloOwner?.ToUpperInvariant()), out removed);
+        if (removed is null) return false;
+        InstanceEvents.RunInstanceClosing(removed);
+        return true;
+    }
+
+    /// <summary>Prunes expired empty instances immediately and returns how many were evicted, invoking
+    /// <see cref="InstanceEvents.InstanceClosing"/> outside the store lock.</summary>
+    public int Prune()
+    {
+        List<InstanceState>? evicted;
+        lock (_instances) evicted = PruneLocked(clock.GetUtcNow());
+        NotifyClosing(evicted);
+        return evicted?.Count ?? 0;
+    }
+
+    /// <summary>A connection enters the instance: its state, a fresh one for a new or expired instance.</summary>
+    public InstanceState Enter(ulong id, long created, string? soloOwner = null)
+    {
+        InstanceState state;
+        List<InstanceState>? evicted;
+        lock (_instances)
+        {
+            var now = clock.GetUtcNow();
+            evicted = PruneLocked(now);
             // SSF towns may share their social instance, but never their dropped items or other mutable world state.
             var instanceKey = (id, created, soloOwner?.ToUpperInvariant());
-            if (!_instances.TryGetValue(instanceKey, out var state))
+            if (!_instances.TryGetValue(instanceKey, out state!))
             {
                 // Auth assigns distinct instance IDs to private non-town areas. A shared ID/creation pair is the
                 // social boundary; only player presence crosses the per-character world-state boundary in towns.
@@ -41,15 +104,44 @@ public sealed class InstanceStore(TimeProvider clock, TimeSpan lifetime)
             }
             state.Connections++;
             state.EmptySince = null;
-            return state;
         }
+        NotifyClosing(evicted);
+        return state;
+    }
+
+    List<InstanceState>? PruneLocked(DateTimeOffset now)
+    {
+        List<InstanceState>? evicted = null;
+        foreach (var (key, state) in _instances.ToList())
+        {
+            if (state.EmptySince is { } t && now - t >= lifetime)
+            {
+                if (_instances.Remove(key)) (evicted ??= []).Add(state);
+            }
+            else if (state.Connections == 0)
+            {
+                state.ExpirePreparedLayout(now, PreparedLayoutLifetime);
+            }
+        }
+        return evicted;
+    }
+
+    static void NotifyClosing(List<InstanceState>? evicted)
+    {
+        if (evicted is null) return;
+        foreach (var state in evicted) InstanceEvents.RunInstanceClosing(state);
     }
 
     /// <summary>A connection left the instance; the lifetime starts when the last one leaves.</summary>
     public void Leave(InstanceState state)
     {
         lock (_instances)
-            if (--state.Connections == 0) state.EmptySince = clock.GetUtcNow();
+            if (--state.Connections == 0)
+            {
+                state.EmptySince = clock.GetUtcNow();
+                // Release the ~11 MB layout pin while empty; ServerLevels.Generated provides the bounded 8-level LRU cache.
+                state.ReleasePreparedLayout();
+            }
     }
 }
 
@@ -73,12 +165,20 @@ public sealed partial class InstanceState
 
     readonly Lock _areaStatsGate = new();
     IReadOnlyDictionary<uint, int>? _areaStats;
+    IReadOnlyDictionary<uint, int>? _areaDisplayStats;
 
     /// <summary>The area stats the instance is played with (InstanceEvents.AreaStats), composed by its first connection and
     /// kept for its life: a later atlas change or another map does not change a level already generated.</summary>
     public IReadOnlyDictionary<uint, int> AreaStats(Func<IReadOnlyDictionary<uint, int>> compose)
     {
         lock (_areaStatsGate) return _areaStats ??= System.Collections.Frozen.FrozenDictionary.ToFrozenDictionary(compose());
+    }
+
+    /// <summary>The area stats shown in the right-hand map modifier list (S→C 0x1d's second stat list, world +0x140),
+    /// composed by its first connection and kept for the instance's life.</summary>
+    public IReadOnlyDictionary<uint, int> AreaDisplayStats(Func<IReadOnlyDictionary<uint, int>> compose)
+    {
+        lock (_areaStatsGate) return _areaDisplayStats ??= System.Collections.Frozen.FrozenDictionary.ToFrozenDictionary(compose());
     }
 
     int? _leagueCategory;
@@ -99,10 +199,99 @@ public sealed partial class InstanceState
         lock (_areaStatsGate) return _terrainPluginStates ??= compose();
     }
 
+    public bool HasTerrainPlugin(ushort id)
+    {
+        var plugins = Volatile.Read(ref _terrainPluginStates);
+        if (plugins is null) return false;
+        for (int i = 0; i < plugins.Count; i++)
+            if (plugins[i].Plugin == id) return true;
+        return false;
+    }
+
     /// <summary>The instance is played without terrain plugin states from now on (0x1d carries other extra data).</summary>
     public void DropTerrainPluginStates()
     {
         lock (_areaStatsGate) _terrainPluginStates = [];
+        ClearPreparedLayout();
+    }
+
+    readonly Lock _preparedLayoutGate = new();
+    // Lightweight resolved seed kept across empty-instance layout releases so re-entry into an AreaHeader-overridden
+    // area (Simulacrum/Delve) reuses the same seed without advancing ServerLevels.PlayableSeed.
+    (uint AuthSeed, byte AreaLevel, uint Seed)? _preparedSeed;
+    (uint AuthSeed, byte AreaLevel, uint Seed, AreaLayout Layout, DateTimeOffset PreparedAt)? _preparedLayout;
+
+    internal bool HasPreparedLayout { get { lock (_preparedLayoutGate) return _preparedLayout is not null; } }
+
+    /// <summary>The playable seed and layout prepared for this instance (during a transfer's "Entering" pause, or on its
+    /// first connection), reused on connect and re-entries while the layout has walkability so level generation does not
+    /// run during the client's loading screen.</summary>
+    public (uint Seed, AreaLayout Layout) PreparedLayout(uint authSeed, byte areaLevel, Func<(uint Seed, AreaLayout Layout)> build) =>
+        PreparedLayout(authSeed, areaLevel, build, null, DateTimeOffset.UtcNow);
+
+    /// <inheritdoc cref="PreparedLayout(uint, byte, Func{ValueTuple{uint, AreaLayout}})"/>
+    public (uint Seed, AreaLayout Layout) PreparedLayout(uint authSeed, byte areaLevel, Func<(uint Seed, AreaLayout Layout)> build,
+        Func<uint, AreaLayout>? rebuild, DateTimeOffset now)
+    {
+        lock (_preparedLayoutGate)
+        {
+            if (_preparedLayout is { } kept && kept.AuthSeed == authSeed && kept.AreaLevel == areaLevel
+                && kept.Layout.Walkable is not null)
+                return (kept.Seed, kept.Layout);
+            (uint Seed, AreaLayout Layout) built = rebuild is not null && _preparedSeed is { } known
+                && known.AuthSeed == authSeed && known.AreaLevel == areaLevel
+                ? (known.Seed, rebuild(known.Seed))
+                : build();
+            if (built.Layout.Walkable is not null)
+            {
+                _preparedSeed = (authSeed, areaLevel, built.Seed);
+                _preparedLayout = (authSeed, areaLevel, built.Seed, built.Layout, now);
+            }
+            else
+            {
+                _preparedLayout = null;
+            }
+            return built;
+        }
+    }
+
+    /// <summary>Updates the cached prepared layout after an AreaHeader override (level or extra terrain data),
+    /// keyed by the original request <paramref name="areaLevel"/> so party joins and re-entries still hit.</summary>
+    public void UpdatePreparedLayout(uint authSeed, byte areaLevel, uint seed, AreaLayout layout) =>
+        UpdatePreparedLayout(authSeed, areaLevel, seed, layout, DateTimeOffset.UtcNow);
+
+    /// <inheritdoc cref="UpdatePreparedLayout(uint, byte, uint, AreaLayout)"/>
+    public void UpdatePreparedLayout(uint authSeed, byte areaLevel, uint seed, AreaLayout layout, DateTimeOffset now)
+    {
+        lock (_preparedLayoutGate)
+        {
+            _preparedSeed = (authSeed, areaLevel, seed);
+            _preparedLayout = layout.Walkable is not null ? (authSeed, areaLevel, seed, layout, now) : null;
+        }
+    }
+
+    /// <summary>Releases the cached layout reference while keeping the resolved seed for re-entry.</summary>
+    public void ReleasePreparedLayout()
+    {
+        lock (_preparedLayoutGate) _preparedLayout = null;
+    }
+
+    /// <summary>Drops a cached prepared layout that has sat unentered past <paramref name="maxAge"/>.</summary>
+    internal void ExpirePreparedLayout(DateTimeOffset now, TimeSpan maxAge)
+    {
+        lock (_preparedLayoutGate)
+            if (_preparedLayout is { } kept && now - kept.PreparedAt >= maxAge)
+                _preparedLayout = null;
+    }
+
+    /// <summary>Clears any cached prepared layout and resolved seed so the next lookup rebuilds from scratch.</summary>
+    public void ClearPreparedLayout()
+    {
+        lock (_preparedLayoutGate)
+        {
+            _preparedLayout = null;
+            _preparedSeed = null;
+        }
     }
 
     /// <summary>The area stats the instance is played with, or null before its first connection composed them.</summary>
@@ -236,6 +425,7 @@ public sealed class InstanceGround
     // Where they lie, by grid cell: a pickup looks at the cells its radius covers, not at every item.
     readonly AreaGrid _cells = new();
     uint _nextId = FirstItemId;
+    readonly System.Runtime.CompilerServices.ConditionalWeakTable<Item, Item> preparedItems = new();
     long birthVersion;
     readonly Dictionary<uint, long> births = [];
     sealed record Observer(long Since);
@@ -275,6 +465,8 @@ public sealed class InstanceGround
 
     public uint Add(WorldItemObject item, object? by, bool shared, bool justDropped)
     {
+        if (justDropped && !item.PlayerDropped && by is Player player)
+            item.Prepare(contents => preparedItems.GetValue(contents, original => GameEvents.PrepareGroundItem(player, original)));
         lock (_items)
         {
             uint id = _nextId++;
@@ -373,9 +565,34 @@ public sealed record SavedMonster(int Variety, byte Level, MonsterRarity Rarity,
     /// planned one, its mods are not rolled and its life is full.</summary>
     public bool Planned { get; init; }
 
+    /// <summary>Instance-local pack identifier from AreaPopulation.Spawn (0 when standalone).</summary>
+    public int PackId { get; init; }
+    public bool Scripted { get; init; }
+    public bool NoRewards { get; init; }
+    [System.Text.Json.Serialization.JsonConverter(typeof(StateMachineSnapshotConverter))]
+    public StateMachineData? States { get; init; }
+    public ActorAction? CurrentAction { get; init; }
+    public IReadOnlyList<VisibleItem>? Equipped { get; init; }
+    public ushort ActorBuild { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public int[]? OwnedSkillEffects { get; init; }
+
+    public sealed class StateMachineSnapshotConverter : System.Text.Json.Serialization.JsonConverter<StateMachineData>
+    {
+        sealed record Machine(IReadOnlyList<int> SharedStates, int SharedTimers, IReadOnlyList<string>? Names, int[]? Overridden);
+        public override StateMachineData? Read(ref System.Text.Json.Utf8JsonReader reader, Type type, System.Text.Json.JsonSerializerOptions options)
+        {
+            var machine = System.Text.Json.JsonSerializer.Deserialize<Machine>(ref reader, options);
+            return machine is null ? null : new(machine.SharedStates, machine.SharedTimers, machine.Names) { Overridden = machine.Overridden?.ToHashSet() ?? [] };
+        }
+        public override void Write(System.Text.Json.Utf8JsonWriter writer, StateMachineData value, System.Text.Json.JsonSerializerOptions options) =>
+            System.Text.Json.JsonSerializer.Serialize(writer, new Machine(value.SharedStates, value.SharedTimers, value.Names, value.Overridden?.ToArray()), options);
+    }
+
     /// <summary>The living monsters: <paramref name="monsters"/> (the connection's) and the ones waiting to rise
     /// (<paramref name="unrisen"/>: the buried ones and the lurking ones, which are among the connection's too).</summary>
-    public static List<SavedMonster> Save(IEnumerable<SpawnedMonster> monsters, double now, IEnumerable<SpawnedMonster>? unrisen = null)
+    public static List<SavedMonster> Save(IEnumerable<SpawnedMonster> monsters, double now, IEnumerable<SpawnedMonster>? unrisen = null,
+        Func<SpawnedMonster, MonsterObject?>? origin = null)
     {
         var waiting = new HashSet<SpawnedMonster>(unrisen ?? [], ReferenceEqualityComparer.Instance);
         var all = monsters.ToList();
@@ -383,7 +600,13 @@ public sealed record SavedMonster(int Variety, byte Level, MonsterRarity Rarity,
         return [.. all.Concat(waiting.Where(m => !all.Contains(m))).Where(m => !m.Dead && m.OwnerId is null && m.SummonerId is null && m.Variety is not null).Select(m =>
         {
             var (x, y) = m.Walk.Position(now);
-            return new SavedMonster(m.Variety!.Row, m.Level, m.Rarity, m.Hostile, x, y, m.Life, waiting.Contains(m)) { Mods = m.Mods };
+            var shown = origin?.Invoke(m);
+            return new SavedMonster(m.Variety!.Row, m.Level, m.Rarity, m.OriginallyHostile, x, y, m.Life, waiting.Contains(m))
+            {
+                Mods = m.Mods, PackId = m.PackId, Scripted = m.Scripted, NoRewards = m.NoRewards, States = m.States,
+                CurrentAction = m.Scripted ? shown?.CurrentAction : null, Equipped = shown?.Equipped, ActorBuild = shown?.MercenaryBuild ?? 0,
+                OwnedSkillEffects = m.OwnedSkillEffects?.ToArray(),
+            };
         })];
     }
 }

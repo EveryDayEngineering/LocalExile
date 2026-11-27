@@ -24,6 +24,8 @@ public static partial class Game
     /// A stat rule works them out itself, so the graph records what it read.
     public static IReadOnlyDictionary<uint, int> StatSourceValues(Player player) =>
         !StatGraph.InRule && FrameStatsOf.TryGetValue(player, out var frame) && frame.ByFrame && frame.Outputs.Sources is { } sources
+            && ReferenceEquals(ItemsOfUnread(player), frame.Items)
+            && ItemsOfUnread(player).Changes == frame.ItemChanges
             ? sources : CharacterStatSources(player).Stats;
 
     /// <summary>The player's stats, not to be changed: in an area's frames the graph's last step's values, off them a
@@ -83,6 +85,9 @@ public static partial class Game
         // The items the steps last saw, and their change count (StatInput.Items).
         public PlayerInventories? Items;
         public long ItemChanges;
+        public int WorldRevision;
+        public long StatsEventRevision = -1;
+        public long PlayerStatSourcesEventRevision = -1;
     }
 
     // The pools from what they are built of now (a new Pools marks the steps that read them). Smaller pools hold no more
@@ -92,7 +97,7 @@ public static partial class Game
         player.Pools = PoolsFor(player, player.Pools.Level);
         player.PlayerLife = Math.Min(player.PlayerLife, player.PlayerUnreservedLife);
         player.PlayerMana = Math.Min(player.PlayerMana, (uint)UnreservedMana(player));
-        player.ApplyMovementSpeed();
+        player.ApplyMovementSpeedAt(AreaTime(player));
     }
 
     /// <summary>The area's stat buffs on a player's entity changed (AreaStatBuffs): its pools and sources are built again.</summary>
@@ -158,8 +163,8 @@ public static partial class Game
             PlayerStatStep.SpiritLeadership, PlayerStatStep.TotemAura, PlayerStatStep.AuraRestriction,
         ];
         readers[(int)PlayerStatChange.Flasks] =
-            [PlayerStatStep.Sources, PlayerStatStep.UtilityFlasks, PlayerStatStep.Onslaught, PlayerStatStep.UsingFlask,
-             PlayerStatStep.AuraRestriction];
+            [PlayerStatStep.Sources, PlayerStatStep.UtilityFlasks, PlayerStatStep.SelfVulnerability,
+             PlayerStatStep.Onslaught, PlayerStatStep.UsingFlask, PlayerStatStep.AuraRestriction];
         readers[(int)PlayerStatChange.Minions] = [PlayerStatStep.Sources, PlayerStatStep.Golems, PlayerStatStep.Offerings];
         readers[(int)PlayerStatChange.Leech] =
             [PlayerStatStep.Sources, PlayerStatStep.AttackSpeed, PlayerStatStep.Recovery, PlayerStatStep.LeechingDefences];
@@ -167,6 +172,7 @@ public static partial class Game
         readers[(int)PlayerStatChange.IncomingAilments] = [PlayerStatStep.Sources];
         readers[(int)PlayerStatChange.God] = [PlayerStatStep.Sources, PlayerStatStep.God];
         readers[(int)PlayerStatChange.Panel] = [];
+        readers[(int)PlayerStatChange.Resonance] = [PlayerStatStep.Resonance];
         return readers;
     }
 
@@ -197,7 +203,7 @@ public static partial class Game
         PlayerStatStep.Sources, PlayerStatStep.CryMovement, PlayerStatStep.SpiritLeadership,
         PlayerStatStep.ClassAttributes, PlayerStatStep.Onslaught, PlayerStatStep.VaalPrevention, PlayerStatStep.TotemAura,
         PlayerStatStep.Rage, PlayerStatStep.Blind, PlayerStatStep.Recovery, PlayerStatStep.Rampage,
-        PlayerStatStep.TailPanels, PlayerStatStep.TailOffence, PlayerStatStep.TailCritical,
+        PlayerStatStep.TailPanels, PlayerStatStep.TailOffence, PlayerStatStep.TailCritical, PlayerStatStep.Resonance,
     ];
 
     /// <summary>The framework's hand-over (Player.StatsChanged): marks the steps that read the input.</summary>
@@ -263,7 +269,8 @@ public static partial class Game
         if (!player.PetrifiedBlood.Active || player.PlayerLife == 0) return false;
         var (lifeRegenPerMinute, _) = PanelStats.LifeRegeneration(
             name => name is var key ? stats.GetValueOrDefault(key) : 0, player.Pools.Life);
-        uint margin = PetrifiedBlood.RecoveryMargin(lifeRegenPerMinute / 60);
+        double factor = LifeRegenerationKeystoneFactor(name => stats.GetValueOrDefault(name));
+        uint margin = PetrifiedBlood.RecoveryMargin(lifeRegenPerMinute * factor / 60);
         return (long)player.PlayerLife + margin >= (uint)((long)player.PlayerMaxLife * LowLifeThresholdPct(stats) / 100);
     }
 
@@ -280,6 +287,8 @@ public static partial class Game
         double clock = AreaTime(player);
         frame.Clock = clock;
         var graph = frame.Graph ??= PlayerStatGraph(player, frame);
+        CheckMomentumPresentation(player, clock);
+        RefreshDoubleStrikeMomentum(player, clock);
         if (!ReferenceEquals(frame.Area, player.Frames.Area))
         {
             if (frame.Area is not null) PlayerStatBuffsChanged(player);
@@ -290,15 +299,37 @@ public static partial class Game
                 if (times.Any(t => (t.Now?.Invoke() ?? clock) >= t.At)) { frame.Timed.Remove(step); graph.MarkRule((int)step); }
         if (clock >= frame.MovingCheckAt) PlayerStatInputChanged(player, StatInput.Walk);
         var items = ItemsOfUnread(player);
-        if (!ReferenceEquals(items, frame.Items) || items.Changes != frame.ItemChanges)
+        // A world reload can change granted skills and kill rolls on otherwise identical equipment.
+        int worldRevision = GameData.Current.Revision;
+        if (!ReferenceEquals(items, frame.Items) || items.Changes != frame.ItemChanges || frame.WorldRevision != worldRevision)
         {
             if (frame.Items is not null) graph.MarkInput((int)StatInput.Items);
-            (frame.Items, frame.ItemChanges) = (items, items.Changes);
+            (frame.Items, frame.ItemChanges, frame.WorldRevision) = (items, items.Changes, worldRevision);
+        }
+        long statsRev = GameEvents.Stats.Revision;
+        if (frame.StatsEventRevision != statsRev)
+        {
+            if (frame.StatsEventRevision >= 0) graph.MarkRule((int)PlayerStatStep.Subscribers);
+            frame.StatsEventRevision = statsRev;
+        }
+        long sourcesRev = GameEvents.PlayerStatSources.Revision;
+        if (frame.PlayerStatSourcesEventRevision != sourcesRev)
+        {
+            if (frame.PlayerStatSourcesEventRevision >= 0) graph.MarkRule((int)PlayerStatStep.Sources);
+            frame.PlayerStatSourcesEventRevision = sourcesRev;
         }
         runningFrame = frame;
         bool built;
+        long statProbe = ConnectionPerformance.ProbeStart();
+        long previousRuns = statProbe == 0 ? 0 : graph.RuleRuns;
         try { built = graph.Step(); }
-        finally { runningFrame = null; }
+        finally
+        {
+            runningFrame = null;
+            // Step's result only reports published changes. A recomputation can produce the same values.
+            if (statProbe != 0 && graph.RuleRuns != previousRuns)
+                player.Connection.Performance.StatBuild(statProbe);
+        }
         if (frame.Conditions < 0 || built) CheckConditions(player, frame, graph);
         if (built || frame.Updated)
         {
@@ -368,13 +399,22 @@ public static partial class Game
         // The connection's timed states report their changes; the steps that read them report when they change by
         // themselves (StatsChangeIn, StatsChangeAt).
         void On(PlayerStatStep[] steps, Action<Action> wire) => wire(() => { foreach (var s in steps) MarkPlayerStats(player, s); });
+        On([PlayerStatStep.Sources], a => player.RecentEvents.Changed = a);
+        player.RecentEvents.AmountChanged = key =>
+        {
+            if (key == StatConditions.UsedSkill && MapSkillActionSpeedPerUse(player) != 0)
+                MarkPlayerStats(player, PlayerStatStep.TailCritical);
+            if (player.StatSourcesCache?.Key.Amounts?.WasRead(key) == true
+                || key == StatConditions.ConsumedCorpse
+                    && graph.Values.GetValueOrDefault(Stat.AttackAndCastSpeedPlusPctPerCorpseConsumedRecently) > 0)
+                MarkPlayerStats(player, PlayerStatStep.Sources);
+        };
         On([PlayerStatStep.Rage], a => player.Rage.Changed = a);
         // A soul eaten at the cap changes no stat, but its beam is shown.
         On([PlayerStatStep.SoulEater, PlayerStatStep.AttackSpeed], a => player.SoulEater.Changed = () => { a(); PresentStats(player); });
         On([PlayerStatStep.SpiritLeadership], a => player.SpiritChieftains.Changed = a);
         On([PlayerStatStep.Ward], a => player.Ward.Changed = a);
-        On([PlayerStatStep.Sources, PlayerStatStep.TimedRecovery], a => player.Antiquarian.Changed = a);
-        On([PlayerStatStep.TimedRecovery], a => player.EnduringCryRecovery.Changed = a);
+        On([PlayerStatStep.Sources, PlayerStatStep.TimedRecovery], a => player.WardBreak.Changed = a);
         On([PlayerStatStep.TotemAura], a => player.Totems.Changed = a);
         On([PlayerStatStep.Rampage], a => player.Rampage.Changed = a);
         On(PlayerStatChangeReaders[(int)PlayerStatChange.Leech], a => LeechOf(player).Changed = a);
@@ -416,6 +456,9 @@ public static partial class Game
         if (FrameStatsOf.TryGetValue(player, out var frame) && frame.Graph is { } graph) graph.MarkRule((int)step);
     }
 
+    internal static int PlayerStatStepRuns(Player player, PlayerStatStep step) =>
+        FrameStatsOf.TryGetValue(player, out var frame) ? frame.StepRuns[(int)step] : 0;
+
     // A mark or a timed end waits for the next Stats phase (the verifiers compare only once it ran).
     static bool StatsUnsettled(Player player)
     {
@@ -452,28 +495,67 @@ public static partial class Game
     // The last full skill list (0x2bc, no removals) this client was sent: the Rage, charge, aura, Fortification, Onslaught,
     // Rampage and Antiquarian refreshes resend it whole, about 32 KB, at every change of theirs, also when not one skill
     // changed. An unchanged list is left out. The full refresh (SendCharacterStats) always sends and records it.
-    sealed class SentSkillList { public byte[]? Bytes; public IReadOnlyList<GrantedSkill>? Skills; }
+    // Skills is what the client holds, by reference (the lists the stat graph built): the 0x1b4 gate (SkillStatDeltas)
+    // compares against it. Bytes is null after a 0x1b4 update: the client then holds Skills, not the last whole list.
+    sealed class SentSkillList { public byte[]? Bytes; public IReadOnlyList<GrantedSkill>? Skills; public bool Detonate; }
     static readonly Store<Player, SentSkillList> SentSkillLists = new();
 
-    public static byte[] PlayerSkillsIfChanged(Player player, IReadOnlyList<GrantedSkill> skills)
+    public static byte[] PlayerSkillsIfChanged(Player player, IReadOnlyList<GrantedSkill> skills) =>
+        [.. PlayerSkillsBatchesIfChanged(player, skills).SelectMany(p => p)];
+
+    public static byte[][] PlayerSkillsBatchesIfChanged(Player player, IReadOnlyList<GrantedSkill> skills) =>
+        PlayerSkillsBatchesIfChanged(player, skills, out _);
+
+    /// <summary>As the overload below, forcing the skill-bar restore: a change that can empty a bound slot (an aura
+    /// turning on or off) sends the bar even when it reads the same as the last one.</summary>
+    public static byte[][] PlayerSkillsBatchesIfChanged(Player player, IReadOnlyList<GrantedSkill> skills, bool forceRestore) =>
+        PlayerSkillsBatchesIfChanged(player, skills, out _, forceRestore);
+
+    /// <summary>The skill records to send for a refresh: the changed stats as 0x1b4 records when nothing but stat values
+    /// changed (SkillStatDeltas), otherwise the whole list. <paramref name="wholeList"/> is true when the whole list is
+    /// what goes out, which replaces the client's skill records.</summary>
+    public static byte[][] PlayerSkillsBatchesIfChanged(Player player, IReadOnlyList<GrantedSkill> skills, out bool wholeList) =>
+        PlayerSkillsBatchesIfChanged(player, skills, out wholeList, forceRestore: false);
+
+    public static byte[][] PlayerSkillsBatchesIfChanged(Player player, IReadOnlyList<GrantedSkill> skills, out bool wholeList,
+        bool forceRestore)
     {
-        var bytes = InstanceEntities.PlayerSkillsChange(player.Id, skills, [], canDetonateMines: CanDetonateMines(player));
+        wholeList = false;
+        if (SkillStatDeltasAtGate(player, skills, out bool detonate) is { } deltas)
+        {
+            RecordSkillDeltas(player, skills, detonate);
+            return deltas;
+        }
+        var batches = InstanceEntities.PlayerSkillsChangeBatches(player.Id, skills, [], canDetonateMines: detonate = CanDetonateMines(player));
+        byte[] flat = batches.Length == 1 ? batches[0] : [.. batches.SelectMany(p => p)];
         var sent = SentSkillLists.GetOrCreateValue(player);
         lock (sent)
         {
-            if (sent.Bytes is { } last && last.AsSpan().SequenceEqual(bytes)) return [];
-            (sent.Bytes, sent.Skills) = (bytes, skills);
+            if (sent.Bytes is { } last ? last.AsSpan().SequenceEqual(flat)
+                : ReferenceEquals(sent.Skills, skills) && sent.Detonate == detonate) return [];
+            if (DeferMomentumChannelSkills(player) && player.ClientSkillIds.SetEquals(skills.Select(s => s.Id))) return [];
+            (sent.Bytes, sent.Skills, sent.Detonate) = (flat, skills, detonate);
         }
+        wholeList = true;
         // Any 0x02bc Actor skill-list update can reset client-side skill bar bindings; schedule a coalesced 0x0053 restore.
-        _ = RestoreSkillBarAfterActorUpdate(player);
-        return bytes;
+        // A skill really joining or leaving can empty a bound slot, so that restore goes out even when the bar reads the
+        // same; a list whose skills are all the ones the client holds only changed their stats (live 2026-11-26: those
+        // restores replayed the guard's ring several times a second).
+        bool membershipChanged = !player.ClientSkillIds.SetEquals(skills.Select(s => s.Id));
+        _ = RestoreSkillBarAfterActorUpdate(player, force: forceRestore || membershipChanged);
+        // The replacement also refreshes a held guard's zero-rate entry into counting (0x141ef1573, 11-skills §9), and
+        // a re-held entry a couple of frames later still leaves the ring counting for that gap (live 2026-11-26). The
+        // held entry rides in the same flush, directly behind the list, so the bar never counts during the buff (#1127).
+        return HeldGuardCooldownRefresh(player) is { Length: > 0 } held ? [.. batches, held] : batches;
     }
 
     // What the full refresh sent: the base the next partial refresh compares with.
     public static void RecordPlayerSkills(Player player, IReadOnlyList<GrantedSkill> skills)
     {
+        var batches = InstanceEntities.PlayerSkillsChangeBatches(player.Id, skills, [], canDetonateMines: CanDetonateMines(player));
+        byte[] flat = batches.Length == 1 ? batches[0] : [.. batches.SelectMany(p => p)];
         var sent = SentSkillLists.GetOrCreateValue(player);
-        lock (sent) (sent.Bytes, sent.Skills) = (InstanceEntities.PlayerSkillsChange(player.Id, skills, [], canDetonateMines: CanDetonateMines(player)), skills);
+        lock (sent) (sent.Bytes, sent.Skills, sent.Detonate) = (flat, skills, CanDetonateMines(player));
     }
 
     /// <summary>A stat of the skill as the client last received it in the skill list (0 when the skill went without it),

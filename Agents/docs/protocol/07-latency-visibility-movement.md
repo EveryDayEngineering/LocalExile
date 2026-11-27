@@ -122,10 +122,41 @@ The world handler `0x14218ddf0` looks up `u32 object id` (message `+0x10`) and r
 | 0x51, 0x1ab–0x1b0, 0x1b4–0x1b6, 0x1ce–0x1d2, 0x1f0/0x1f1, 0x261, 0x2c8 | Actor `0x14219aa10` | actions |
 | 0x1b7–0x1c0, 0x2b2 | Positioned `0x141e33fd0` | position / movement |
 | 0x1a9 / 0x1aa | wake zone in / out | |
-| 0x2bc | component update by component index | |
+| 0x2bc | component update by component index (also an Actor's current action, §4.1) | |
 | 0x2bd | remove object | |
 
 Object header (all these messages): `u16 id, u32 object id (+0x10), u32 (+0x14), u16 (+0x18)`, written by `0x141f98850`.
+
+### 4.1 An actor's current action, and S→C 0x2c8
+
+The **current action** is the Actor component's flag f0 `0x04` of its slot-20 part (reader `0x142199c20`). It rides in the monster's
+create (0x2bb) and in a **0x2bc** to the Actor (index 9 for monsters). Little-endian, after the flags `u8 f0, u8 f1` (and the f0 0x40 skill list when present, which comes first):
+
+| Field | Meaning |
+|---|---|
+| u16 skill id | the actor's skill the action is built from (`0x141ef0050`); it must exist on the client's actor (a basic action of a type is `ActionTypes.HASH16 & 0x3fff`) |
+| u16 sequence, u32 target id (0 none), i32 target x, i32 target y, u16 flags | the 16-byte action record (`0x14193e340`) |
+| u8 | action `+0x120` (send 0) |
+| the class's own data | action vtable slot 87 reader, slot 86 writer: for most classes an animation-controller block (u32 n + n UTF-16 units of path, i32 clip, f32 time, f32 speed, f32, i32 queued; `0x141dc0bc0`) and then class data |
+
+**S→C 0x2c8** updates a running action's own data (class slot 96): the **whole message is big-endian**, header included: `u16 0x2c8, u32 object id, u32 0, u16 0`, then
+`u16 action type (HASH16), u16 skill id, u16 sequence, u8 sub-id, u16 n` and `n` raw bytes (the payload: the action class's own bytes, **little-endian**). Reader `0x141fe54d0`,
+handled by the Actor dispatcher `0x14219aa10`: the action type, skill id, sequence and sub-id must equal the current action's (`+0x118`, the skill,
+`+0x11a`, `+0x11c`; a detached action is tried next), else the client logs an error. Server writers: `ActorAction`, `InstanceEntities.ActorCurrentAction`,
+`InstanceProtocol.ActionData`.
+
+Example, `LegionBreakout` (type `0xd8fe`, skill `0x18fe`; Legion monsters): class data after the animation block is `i32 prop count, i8 state, u32 last
+threshold %, f32, f32` and per prop a MiscAnimated row and an animation block. The 0x2c8 payload is `i8 state, u32 life %`. State 0 hides the monster and
+removes its collision; **0 → 2** shows it posed at a random 30-50% of the clip the animation block names (a general also gets its shell); 3 breaks out
+(shards, `breaking_free`, a 3 s speed ramp); 5 ends it. The pose is made only on the change from 0: a monster created in state 2 stands unposed.
+See [Legion](../game/legion.md).
+
+`LegionRevive` (type `0xd59a`, skill `0x159a`; reader `0x1413b0920`, 0x2c8 `0x1413b0fa0`): after the animation block, `i32 state,
+u8 falling, f32 pose, f32 fall speed, f32 fall time, f32 timer, u8 revive, u8 leave` (23 bytes). The 0x2c8 payload is `i32 state` and
+then: 1 `f32 timer, u8 revive`; 3 `u8 falling, f32 pose, f32 fall speed, f32 fall time, f32 timer`; 4 `u8 revive`; 5 `f32 timer,
+u8 revive, u8 leave`. The client's StartReviveTimer (`0x141c4a600`) sets pose = 0.6..0.8 of the clip (`DAT_1436add20`, `DAT_1436ade1c`), speed =
+1.0 / (3.0 / pose) (`DAT_1436adeec`, `DAT_1436ae27c`), fall time 3.0; its FrameMove eases the speed by the remaining fall time squared
+(`DAT_1436ae17c` = 2.0). These are 3.29.3c data addresses.
 
 ## 5. Movement
 
@@ -615,7 +646,7 @@ mode-pure (`0x1421660b0`, `0x1421664c0`, `0x142166660`, `0x142166800`, `0x14216c
 0x18f, 0x192, 0x195, 0x196, 0x197 and 0x198, predictive only 0x24, 0x25 and 0x199.
 
 The Gateway has no mode setting and asks nothing. `ClientPackets` lists every C→S message with the mode that sends it (Shared, Predictive-only, Lockstep-only); the first mode-only message of a connection (one area) is the mode its handlers serve (`Player.NotePacket`). Messages of both modes in one area, which one client never sends, are logged and shown six times in the client's chat with their ids, for the player to report. Nothing else tells the modes apart for certain, so until then a client is served in
-Lockstep, the default (a server-controlled player, which sends predictive messages, in Predictive). Latency adds input delay, not position error: both sides count the
+Lockstep, the default (a player the server drives, in the mode its driver sets: Program.DriveByServer). Latency adds input delay, not position error: both sides count the
 same frames, so a client on a slower link plays the same frames later.
 
 The tick's u8 is no mode test. Only a lockstep world counts frames behind: its only writers are the world's
@@ -757,18 +788,21 @@ attacks in 52 s started at most 3.2 cells off the client's cell, none cancelled.
 Pickup arrival also starts Interaction's default 0.1 s completion (`0x1419478b0`).
 A Move queued inside it starts in `0x141e95f10`, then `0x141e9b860` discards its new path.
 The Gateway holds subsequent lockstep input through that completion, only after arrival; walking up stays interruptible.
-A use on an object uses up the press: the client sends its own 0x195 right after the 0x18f (`0x140123d60`). With the
-button still held, once the object is gone its held path asks for a Move without 0x400. Live 2026-11-16: 3 of 3 pickups,
-77–81 ms later. That Move cannot replace the Interaction (`0x141e941a0`) and loses its path when it starts, so only a
-new press walks again.
+Once the held pickup's object disappears, the client's held path sends a Move `0x18e` without `0x400`, which the Gateway
+accepts and starts once the post-pickup hold finishes (+4 frames) so holding LMB through a ground pickup keeps moving
+and skills or queued clicks right after a pickup are never dropped.
+Lockstep object walk-ups anchor to `LockstepFrame.Start` (`TryBeginObjectWalk`) after `StepWalkers`, skip waiting when
+already in reach at frame start (avoiding a 1-frame delay from `StopAfter`), poll out-of-reach walk-ups per server
+frame, and skip emitting `0x01ab` Interaction for ground items already taken (e.g. auto-looted gold).
 Readiness uses the client frame start: live, a Move at arrival +3 frames (99 ms) lost its path, while +4 frames
 preserved it. The projectile clock can already exceed 100 ms during that third frame and must not release the hold.
 
 A held attack whose target died goes on at the ground. The stationary GGG sample (101 attacks aimed 18–29 cells
 away) does not establish that every ground attack stands still. Actor `0x141e95400` uses flag 1 to force a stationary
-swing; otherwise it starts MoveTo toward the aim. A default melee ground use has the weapon's range minus one,
-tolerance -1 and precision 1 (`0x141e81c20`): live, an aim 17 cells right and 9 up with range 10 walked 8 right and
-5 up before swinging, both near a monster and on empty ground. The swing's hold and repeat timer begin on arrival.
+swing; otherwise it starts MoveTo toward the aim. Default melee attacks and melee attack gems (e.g. `DoubleStrike`,
+vtable `0x143541c70` `+0x168 -> 0x14123fa00`) use the weapon's range minus one, tolerance -1 and precision 1
+(`0x141e81c20`): live, an aim 17 cells right and 9 up with range 10 walked 8 right and 5 up before swinging, both near
+a monster and on empty ground. The swing's hold, cost and repeat timer begin on arrival (`StartLockstepGroundMelee`).
 
 The tutorial support chest's Interaction uses MoveTo max range 6, tolerance 3, precision 1. Its blocking footprint
 is only 1; using that footprint for interaction makes the server walk four cells past the native stopping point.
@@ -895,7 +929,12 @@ all ran at 0.60 s; a bow's 0.40 s into a 0.714 s attack, its clip's `lock_cancel
 contact at 399: Moves 0.37 to 0.40 s in ran at 0.40 to 0.43 s). So the hold after a swing is that keyframe as the
 client plays the clip ([11](11-skills.md) §4: a one-hand sword's contact lands late in the swing, not at the attack1
 keyframe's fraction) plus the client's two frames (`LockstepActionTail`, `LockstepAttackCutIn`), for a swing at a
-monster and at the ground alike. A held attack's next use, at a monster or at
+monster and at the ground alike. In Actor's gate (`0x141e941a0`), once past contact (`+0x1b8` `0x141942e20`), only
+`Move` (`0x2909`) and `MoveSpecial` (`0xc266`) return true immediately (`0x141e944f6`); every non-Move (object
+interactions `0x0266`, spells, attacks) falls through to `0x141e9479e` (`!IsPastContact` -> false), and cancelling a
+swing with a Move writes the remaining duration into Actor `+0x2a0` (`0x141e947d0 -> 0x141e9482d`), which `0x141e947aa`
+still checks for non-Move actions. Accordingly, `StartLockstepActions` gates both `LockstepUse` and skills on
+`NextAttackAt`, while still allowing `Move` to cut in after `LockstepBusyUntil`. A held attack's next use, at a monster or at
 the ground, waits for the attack time of the one before (`NextAttackAt`): one sent as soon as the player was free came
 0.4 s into a 0.645 s swing and was queued to its end, with the server's swing and hit ahead of the client's by as much.
 

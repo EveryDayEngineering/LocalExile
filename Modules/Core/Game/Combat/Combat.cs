@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using GameServer.Core.Accounts;
 using GameServer.Core.Protocol.Instance;
 using GameServer.Core.Protocol.Login;
 using WalkEstimator = GameServer.Core.World.WalkEstimator;
@@ -6,23 +7,49 @@ using Progression = GameServer.Core.World.Progression;
 using DamageModel = GameServer.Core.World.DamageModel;
 using TargetAccuracy = GameServer.Core.World.TargetAccuracy;
 using DamageType = GameServer.Core.World.DamageType;
+using DamageTypes = GameServer.Core.World.DamageTypes;
 using DamagePacket = GameServer.Core.World.DamagePacket;
 using DamageRange = GameServer.Core.World.DamageRange;
 using HitResistances = GameServer.Core.World.HitResistances;
+using RandomRolls = GameServer.Core.World.RandomRolls;
 
 public static partial class Game
 {
     // Record the first paid use of a channel before asynchronous output. Under conn.Monsters.
     public static int BeginPaidChannel(Player player, ushort skill, int effect, int action, ushort sequence)
     {
+        EndCycloneStages(player, player.ChannelGeneration, AreaTime(player));
         int generation = ++player.ChannelGeneration;
         player.ChannelSkill = skill;
         player.ChannelSkillSequence = sequence;
         player.LastChannelUpdateAt = AreaTime(player);
+        ArmChannelCurseRemoval(player, generation, player.LastChannelUpdateAt);
         if (player.Connection.LockstepClient) player.LockstepSkill.Channelling(sequence);
         player.PaidChannel = CombatLifetime is { IsActive: true } rules
-            ? new(skill, effect, action, generation, rules) : null;
+            ? new(skill, effect, action, generation, rules) { StartedAt = player.LastChannelUpdateAt } : null;
         return generation;
+    }
+
+    internal static void AbortStartedChannel(Player player, int? generation)
+    {
+        if (generation is not int started) return;
+        lock (LevelUpdatesFor(player).Gate)
+        {
+            if (player.ChannelGeneration != started) return;
+            double at = AreaTime(player);
+            RetireChargedDashLocked(player, started);
+            RetireBladeFlurry(player, started);
+            if (player.ChannelMovement.Skill != 0 && player.ChannelMovement.Skill == player.ChannelSkill)
+            {
+                var (x, y) = player.Walk.Position(at);
+                player.Walk.Order(x, y, at);
+            }
+            EndCycloneStages(player, started, at);
+            player.ChannelSkill = 0;
+            player.PaidChannel = null;
+            player.ChannelGeneration++;
+            SnipeWakeChannel(player);
+        }
     }
 
     // Sample both moving actors at the hit time, after the approach and contact delay.
@@ -39,7 +66,7 @@ public static partial class Game
     public static int AttackHitChanceAt(Player player, uint id, SpawnedMonster target, double at,
         AttackAccuracyProfile profile, IReadOnlyDictionary<uint, int>? playerStats = null)
     {
-        int evasion = target.Effects.Evasion(Monsters.BaseEvasion(target.Level) ?? 0);
+        int evasion = target.Effects.Evasion(Monsters.BaseEvasion(target.Variety, target.Level) ?? 0);
         evasion = MonsterBlindRating(player, id, target, evasion, at, playerStats);
         bool close = TargetAccuracy.InCloseRange(Dist(player.Walk.Position(at), target.Walk.Position(at)));
         return profile.Chance(evasion, target.Rarity == MonsterRarity.Unique, close);
@@ -80,8 +107,12 @@ public static partial class Game
         // The supported skill's own speed includes its gem/support inputs; the generic fallback is for callers without
         // a skill id (ordinary weapon timing). Keep the gate and the interval CastGemSkill reserves on the same value:
         // both take the use's hand (AttackHands, from its sequence).
-        seconds = skillId != 0 ? SupportedAttackSeconds(player, skillId, sequence) : SkillAttackSeconds(player, effect, level);
-        double now = AreaTime(player);
+        seconds = skillId != 0
+            ? (ShieldWeapon(player, skillId) is { } shieldWeapon
+                ? SupportedOffHandAttackSeconds(player, skillId, shieldWeapon)
+                : StartingAttackSeconds(player, skillId, sequence))
+            : SkillAttackSeconds(player, effect, level);
+        double now = LockstepScheduledAt(player, AreaTime(player));
         return AttackTiming.Ready(now, player.NextAttackAt, seconds);
     }
 
@@ -252,6 +283,52 @@ public static partial class Game
     // The swing's hit still tests the whole range (+ 2).
     static int WalkUpRange(SkillCatalog.Unarmed weapon) => Math.Max(weapon.Range, 1) - 1;
 
+    // Effective melee swing reach in cells: weapon/unarmed base range plus character and skill melee strike range bonuses.
+    public static int MeleeSkillReach(Player player, SkillCatalog.Unarmed weapon, int effect,
+        IReadOnlyDictionary<uint, int>? skillStats = null)
+    {
+        if (!weapon.Melee) return weapon.Range;
+        var ps = CharacterPlayerStats(player);
+        int Val(uint k) => ps.GetValueOrDefault(k) + (skillStats?.GetValueOrDefault(k) ?? 0);
+        int bonus = Val(Stat.MeleeRangePlus) + Val(Stat.MeleeWeaponRangePlus);
+        string cls = weapon.ItemClass ?? "";
+        if (cls is "Staff" or "Warstaff") bonus += Val(Stat.MeleeRangePlusWithStaff);
+        else if (cls is "One Hand Axe" or "Two Hand Axe") bonus += Val(Stat.MeleeRangePlusWithAxe);
+        else if (cls is "One Hand Sword" or "Thrusting One Hand Sword" or "Two Hand Sword") bonus += Val(Stat.MeleeRangePlusWithSword);
+        else if (cls is "One Hand Mace" or "Sceptre" or "Two Hand Mace") bonus += Val(Stat.MeleeRangePlusWithMace);
+        else if (cls is "Dagger" or "Rune Dagger") bonus += Val(Stat.MeleeRangePlusWithDagger);
+        else if (cls is "Claw") bonus += Val(Stat.MeleeRangePlusWithClaw);
+        if (cls.StartsWith("Two Hand", StringComparison.Ordinal) || cls is "Staff" or "Warstaff")
+            bonus += Val(Stat.MeleeRangePlusWithTwoHanded);
+        else if (!string.IsNullOrEmpty(cls))
+            bonus += Val(Stat.MeleeRangePlusWithOneHanded);
+        if (OffhandWeaponFor(player) is not null) bonus += Val(Stat.MeleeRangePlusWhileDualWielding);
+        else if (ActiveOffHand(player)?.Type?.Class == "Shield") bonus += Val(Stat.MeleeRangePlusWhileWieldingShield);
+        return Math.Max(1, weapon.Range + bonus);
+    }
+
+    static double MeleeAreaSwingReach(Player player, SkillCatalog.Unarmed weapon, int effect,
+        IReadOnlyDictionary<uint, int> skillStats, int swingReach, AttackHand hand)
+    {
+        double reach = swingReach + 2;
+        if (!weapon.Melee || !SkillsFor(player).IsArea(effect) || SkillsFor(player).IsStrike(effect)) return reach;
+        string? effectId = SkillsFor(player).EffectId(effect);
+        int radius;
+        if (CleaveAttack(effectId))
+        {
+            double now = AreaTime(player);
+            radius = CleaveRadius(player, effect, skillStats, player.Walk.Position(now), now);
+        }
+        else radius = SkillRadius(player, skillStats, spell: false, effect);
+        double areaReach = SkillsFor(player).ActionHash(effect) == GroundSlamWave.Action
+            ? GroundSlamWave.Length(radius, skillStats.GetValueOrDefault(Stat.ActiveSkillBaseRadiusPlus))
+            : IceCrashUse.Handles(effectId)
+                ? SkillRadius(player, IceCrashUse.BaseRadius(IceCrashUse.Cadence(effectId) ? (hand == AttackHand.Off ? 1 : 0) : 2,
+                    skillStats), skillStats, spell: false, effect) + swingReach
+                : radius + swingReach;
+        return Math.Max(reach, areaReach);
+    }
+
     // A predictive client's walk-up to a monster for a swing at it, from where the estimate has the player at `now`. Swing:
     // the swing starts at once, when MoveTo finds its goal where the player stands (0x141e81c20 → 0x141e81950). A walk-up
     // with steps swings once it is over at a cell in reach. A lockstep client's is PlaceLockstepAttack's.
@@ -322,12 +399,18 @@ public static partial class Game
             if (!AttackReady(player, use.SkillId, gem.Effect, gem.Level, out _, use.Slot)) return;
             (int X, int Y) aim = (use.X, use.Y);
             (int X, int Y) stop = default;
+            var groundHand = IceCrashUse.Handles(SkillsFor(player).EffectId(gem.Effect))
+                ? AttackHandFor(player, use.SkillId, use.Slot) : AttackHand.Main;
+            var groundWeapon = HandWeapon(player, groundHand);
+            var groundStats = SupportedSkill(player, use.SkillId).Stats;
+            int groundSwingReach = MeleeSkillReach(player, groundWeapon, gem.Effect, groundStats);
+            double groundAdmitReach = MeleeAreaSwingReach(player, groundWeapon, gem.Effect, groundStats, groundSwingReach, groundHand);
             // Not in reach of the aim (no path, an aim off the map, a body in the way): the client's action ends without
             // a swing, so nothing is paid or echoed, as CastOn's SwingInReach refuses it for a monster. The reach is the
             // weapon's range plus the same 2 cells of slack CastOn and Attack give; a normal arrival stops at range - 1.
             if (!TryBeginSkillCooldownUse(player, use.SkillId, gem.Effect, CooldownForSkill(player, use.SkillId), false,
                 () => stop = player.Walk.Position(ProjectileWorldTime(player)), out var cooldownUse, actionToken: action,
-                admit: () => !GroundAttackWalks(player.Walk.Position(ProjectileWorldTime(player)), aim, WeaponFor(player).Range + 2)))
+                admit: () => !GroundAttackWalks(player.Walk.Position(ProjectileWorldTime(player)), aim, groundAdmitReach)))
                 return;
             bool projectileRuntime = UsesProjectileRuntime(gem.Effect);
             if (projectileRuntime) _ = CastGemSkill(player, use.SkillId, stop, aim,
@@ -361,9 +444,12 @@ public static partial class Game
         // Dual wielding: this use's hand (AttackHands, from the client's sequence) gives its weapon, time and hit.
         var hand = DefaultAttackHand(player, use.Sequence);
         var weapon = HandWeapon(player, hand);
+        var weaponContactSource = SkeletonWeaponContactSource(player, hand, weapon.LocalSources);
         string handNote = HandNote(player, hand);
         string? ordinaryProjectile = OrdinaryRangedAttack.ProjectileId(WeaponProfileFor(player, activeSet: true));
         bool ranged = ordinaryProjectile is not null;
+        if (weapon.Melee && !ranged)
+            weapon = weapon with { Range = MeleeSkillReach(player, weapon, effect: -1) };
         int precision = ranged ? RangedPrecision : 1;
         double now = AreaTime(player), duration;
         duration = Math.Max(TickSeconds,
@@ -437,10 +523,21 @@ public static partial class Game
             return;
         }
         bool cryExerted;
-        player.RecentEvents.Record(StatConditions.UsedSkill, begun);
-        SiphoningSkillUsedLocked(player, begun);
-        cryExerted = ConsumeIntimidatingCryExertLocked(player, weapon.Melee && !ranged);
+        NotePlayerAttack(player);
+        RecordUsedSkillLocked(player, begun);
+        bool eligibleWarcry = weapon.Melee && !ranged;
+        var warcries = eligibleWarcry ? CryOf(player) : null;
+        bool consumeWarcry = eligibleWarcry && !ExertedAttackKeepsCountLocked(player);
+        cryExerted = warcries is not null && IntimidatingCryExerts(player) > 0;
+        if (cryExerted && consumeWarcry) warcries!.Exerts--;
+        var warcryTriggers = warcries is null ? null : ConsumeMeleeWarcryTriggers(warcries, criticalRoll, consumeWarcry);
+        int ancestralTargets = warcries is null ? 0 : ConsumeAncestralCry(warcries, consumeWarcry);
+        int? defaultRallying = warcries is null ? null : ConsumeRallyingCry(warcries, consumeWarcry);
+        if (eligibleWarcry) SyncExertedAttackBuffsLocked(player);
+        int defaultOtherWarcries = (ancestralTargets > 0 ? 1 : 0) + (warcryTriggers?.Count ?? 0);
+        int defaultTotalWarcries = (cryExerted ? 1 : 0) + defaultOtherWarcries + (defaultRallying.HasValue ? 1 : 0);
         PhaseRunOnSkillUse(player, use.SkillId, duration);
+        SpiritBurstOnSkillUse(player, target, begun);
         // As GGG does for every action but Move: the client counts unanswered actions and would ask for a resync.
         byte[][] actionRecords = [InstanceProtocol.ActionStarted(player.Id, stop.X, stop.Y, target.X, target.Y, use.SkillId, use.Sequence, use.Flags, targetObjectId: use.TargetId), InstanceProtocol.ActionEnded(player.Id)];
         string actionLog = $"0x01ab player skill 0x{use.SkillId:x4} on monster 0x{use.TargetId:x} ({m.Label}, life {m.Life}/{m.MaxLife}), attack time {duration:0.000} s{handNote}";
@@ -462,11 +559,11 @@ public static partial class Game
         var ownPenetration = attackEffect >= 0
             ? SkillsFor(player).EffectStats(attackEffect, 1).ToDictionary(kv => kv.Item1, kv => kv.Item2) : null;
         List<uint> spirit;
-        (int X, int Y)? echo;
+        ((int X, int Y) Player, (int X, int Y) Centre)? echo;
         byte[]? memoryBuff;
         using (ProjectileMutation(player))
             (spirit, echo, memoryBuff) = StrikeExtrasLocked(player, use.SkillId, attackEffect, ownPenetration ?? new Dictionary<uint, int>(), stop, target,
-                use.Sequence, use.TargetId, ProjectileWorldTime(player));
+                use.Sequence, use.TargetId, ProjectileWorldTime(player), exertedTargets: ancestralTargets);
         if (memoryBuff is not null)
             await SendWorldRecord(player, player.Id, memoryBuff, $"0x01c1 player buff skill_location_memory for skill 0x{use.SkillId:x4}");
         // The hit lands at the attack animation's contact keyframe (data/animation-contacts.json), not a fixed half: the
@@ -476,6 +573,7 @@ public static partial class Game
         await WhilePaused(player);
         // One use, one Fortification and one Rage gain (as one AreaSkillHit sweep), whichever of its hits lands first.
         bool fortified = false, raged = false;
+        var splashOrigins = weapon.Melee ? new List<(int X, int Y)>(1) : null;
         if (!await HitTarget(use.TargetId, m, target)) return;
         List<(uint Id, SpawnedMonster M, (int X, int Y) At)> extras;
         double now2 = AreaTime(player);
@@ -483,16 +581,35 @@ public static partial class Game
             .Select(id => (id, player.Area.Monsters[id], player.Area.Monsters[id].Walk.Position(now2)))];
         // The previous location's strike: the monster nearest it within the weapon's reach (a single-target hit, as the
         // default attack's own).
-        if (echo is { } echoAt && player.Area.MonstersNear(echoAt, weapon.Range).Where(e => e.Key != use.TargetId && !spirit.Contains(e.Key) && e.Value.Hostile
+        if (echo?.Centre is { } echoAt && player.Area.MonstersNear(echoAt, weapon.Range).Where(e => e.Key != use.TargetId && !spirit.Contains(e.Key) && e.Value.Hostile
                 && !e.Value.Dead && e.Value.Life > 0 && Dist(e.Value.Walk.Position(now2), echoAt) <= weapon.Range + LivingCollision.Size(e.Value))
             .OrderBy(e => Dist(e.Value.Walk.Position(now2), echoAt)).Select(e => (e.Key, e.Value)).FirstOrDefault() is (var echoId, { } echoed))
             extras.Add((echoId, echoed, echoed.Walk.Position(now2)));
         foreach (var (extraId, extra, at) in extras)
             if (!await HitTarget(extraId, extra, at)) return;
+        if (weapon.Melee && splashOrigins is { Count: > 0 })
+        {
+            var merged = SkillAreaStats(player, ownPenetration ?? new Dictionary<uint, int>(), attackEffect);
+            if (MeleeSplash.Settings(key => merged.GetValueOrDefault(key)) is { } splash)
+            {
+                double splashNow = AreaTime(player);
+                var struck = new HashSet<uint> { use.TargetId };
+                foreach (var (extraId, _, _) in extras) struck.Add(extraId);
+                var splashTargets = new List<(uint Id, SpawnedMonster M, (int X, int Y) At)>();
+                foreach (var splashAt in splashOrigins)
+                    foreach (var (sid, sm) in player.Area.MonstersNear(splashAt, splash.Radius))
+                        if (sm.Hostile && !sm.Dead && sm.Life > 0 && sm.OwnerId is null && !sm.WorldHidden
+                            && sm.Walk.Position(splashNow) is var smAt && Dist(smAt, splashAt) <= splash.Radius && struck.Add(sid))
+                            splashTargets.Add((sid, sm, smAt));
+                foreach (var (sid, sm, smAt) in splashTargets)
+                    if (!await HitTarget(sid, sm, smAt, splash.More, isSplash: true)) return;
+            }
+        }
 
         // One hit of this swing on one monster: accuracy, block, impale, crit and on-hit as the target's own. False when a
         // later action replaced the swing.
-        async Task<bool> HitTarget(uint targetId, SpawnedMonster m, (int X, int Y) target)
+        async Task<bool> HitTarget(uint targetId, SpawnedMonster m, (int X, int Y) target,
+            double splashDamageMore = 1, bool isSplash = false)
         {
             uint life;
             bool stageStarts = false;
@@ -506,6 +623,7 @@ public static partial class Game
             List<byte[]>? ignited = null, bled = null;
             string igniteLog = "", bleedLog = "";
             StunHit stun;
+            SpawnedMonster.NativeKnockback? nativeKnockback = null;
             using (ProjectileMutation(player))
             {
                 if (m.Life == 0) return true;
@@ -519,12 +637,22 @@ public static partial class Game
                 // Settle Rage at accepted contact before this hit's gain. It is a final multiplier on the attack packet,
                 // never on an existing impale bonus or on generic damage/DoT.
                 var playerStats = CharacterPlayerStats(player);
+                long defaultExertedAccuracy = ExertedAttackAccuracyIncrease(defaultTotalWarcries, playerStats, ownPenetration);
                 var accuracy = AttackAccuracyProfile.From(player.Pools, playerStats, Stats, ownPenetration, weapon.LocalSources)
-                    with { Rating = HandAccuracy(player, hand, playerStats) };
+                    with { Rating = HandAccuracy(player, hand, playerStats, defaultExertedAccuracy) };
+                long defaultExertedIncreased = ExertedAttackIncreasedDamage(playerStats, ownPenetration, defaultTotalWarcries,
+                    ancestralExerted: ancestralTargets > 0);
+                var defaultDamageStats = defaultExertedIncreased == 0 ? playerStats
+                    : new Dictionary<uint, int>(playerStats)
+                    {
+                        [Stat.DamagePlusPct] = ActorScale.Saturate((long)playerStats.GetValueOrDefault(Stat.DamagePlusPct) + defaultExertedIncreased),
+                    };
                 IEnumerable<(uint, int)> conversionStats = ownPenetration is null ? [] :
                     ownPenetration.Select(pair => (pair.Key, pair.Value));
-                var conversion = DamageStats.Conversion(playerStats, conversionStats, Stats, attack: true);
-                var prehit = DefaultMeleePrehitProfileLocked(player, targetId, m, playerStats, weapon, conversion,
+                var conversion = SupportedAttackDamage.WithWeaponGains(
+                    DamageStats.Conversion(defaultDamageStats, conversionStats, Stats, attack: true), weapon,
+                    key => defaultDamageStats.GetValueOrDefault(key));
+                var prehit = DefaultMeleePrehitProfileLocked(player, targetId, m, defaultDamageStats, weapon, conversion,
                     ownPenetration, ProjectileWorldTime(player), accuracy.Rating);
                 if (prehit is null)
                 {
@@ -532,7 +660,20 @@ public static partial class Game
                         "the registered living hostile monster");
                     return true;
                 }
+                double exertedMore = ExertedAttackMore(ownPenetration, cryExerted,
+                    defaultOtherWarcries, defaultRallying, playerStats);
+                if (exertedMore != 1)
+                    prehit = prehit with
+                    {
+                        Ignite = RepeatAilment(prehit.Ignite, exertedMore),
+                        Bleed = RepeatAilment(prehit.Bleed, exertedMore),
+                        Poison = RepeatAilment(prehit.Poison, exertedMore)
+                    };
                 double contactAt = AreaTime(player);
+                if (m.Effects[Stat.BaseCannotBeDamaged] > 0
+                    || MapEssences.ProximityShieldBlocksLocked(player, m, null)
+                    || MonsterProximityShieldBlocksLocked(player, m, null))
+                    return true;
                 int hitChance = AttackHitChanceAt(player, targetId, m, contactAt, accuracy, playerStats);
                 if (!accuracy.CannotBeEvaded && !m.AttackEvasion.Hits(hitChance, contactAt, player.AttackAccuracyRandom))
                 {
@@ -544,57 +685,107 @@ public static partial class Game
                     Console.WriteLine($"[gateway] {player.Connection.Remote} attack on 0x{targetId:x} ({m.Label}) blocked");
                     return true;
                 }
+                if (!isSplash) splashOrigins?.Add(m.Walk.Position(contactAt));
                 var pen = Penetration.Of(playerStats, Stats, attack: true, ownPenetration, weapon.LocalSources);
                 var resistanceMods = HitResistMods(playerStats, ownPenetration);
                 var hit = prehit.Hit;
                 if (weapon.Melee)
                     hit = WithMeleeProximityLocked(player, playerStats, ownPenetration, m, hit, contactAt);
-                var gambler = GamblerFor(playerStats);
+                var hitRolls = HitRollsFor(playerStats);
+                var damageRoll = WithExertedAttackRollModifiers(hitRolls with { DamageMorePct = 0 }, cryExerted,
+                    defaultTotalWarcries, playerStats, ownPenetration).ForWeapon(weapon.LocalSources);
+                long criticalDoubleDamage = HitRollModifiers.CriticalDoubleDamageOf(playerStats, ownPenetration);
                 var ownRolled = GameEvents.WithOutgoingDamage(player, playerStats, m,
-                    WithIntimidatingCryExert(gambler with { DamageMorePct = 0 }, cryExerted)
-                        .ForWeapon(weapon.LocalSources).RollOutgoingHit(hit, AreaRng(player)));
-                critical = RollCriticalStrike(player, CriticalChanceOn(player, targetId, HandAttackCriticalChance(player, hand, playerStats),
-                        AttackCriticalChanceVsBlinded(player, playerStats, hand: hand), AttackCriticalChanceVsGround(player, playerStats, hand: hand)),
+                    damageRoll.RollBeforeCritical(hit, AreaRng(player), criticalDoubleDamage));
+                int defaultExertedBaseCrit = ExertedAttackBonusCritPermyriad(defaultTotalWarcries, playerStats, ownPenetration);
+                int defaultCritChance = CriticalChanceOn(player, targetId,
+                    HandAttackCriticalChance(player, hand, playerStats, defaultExertedBaseCrit),
+                    AttackCriticalChanceVsBlinded(player, playerStats, release: false, hand, defaultExertedBaseCrit),
+                    AttackCriticalChanceVsGround(player, playerStats, release: false, hand, defaultExertedBaseCrit));
+                critical = RollCriticalStrike(player, defaultCritChance,
                         ownPenetration, skillRoll: criticalRoll)
                     && GameServer.Core.World.EvasionEntropy.ConfirmsCritical(hitChance, player.AttackAccuracyRandom);
-                int sourceCriticalMultiplier = AttackCriticalMultiplier(player, playerStats);
-                int criticalMultiplier = CriticalMultiplierOn(m, sourceCriticalMultiplier, playerStats, ownPenetration);
+                ownRolled = damageRoll.CompleteCriticalMultiplier(ownRolled, AreaRng(player), critical, criticalDoubleDamage);
+                if (exertedMore != 1) ownRolled = ownRolled.Scale(exertedMore);
+                long weaponMultiplier = (long)AttackCriticalMultiplier(player, playerStats)
+                    + ClawDaggerCriticalBonus(weapon, playerStats, ownPenetration);
+                int sourceCriticalMultiplier = CriticalMultiplierWithWeapon(
+                    CriticalHitMultiplier(weaponMultiplier, playerStats, ownPenetration), m, weapon.LocalSources);
                 double at = ProjectileWorldTime(player);
-                (damage, resistance, var mitigated) = MonsterHitDamage(m, ownRolled, critical, attack: true, at, resistanceMods, pen,
-                    gambler.InvertsResistance(AreaRng(player)));
+                int criticalMultiplier = CriticalMultiplierOn(m, sourceCriticalMultiplier, at, playerStats, ownPenetration);
+                int witheredElemental = WitheredElementalHitTaken(m, player.Id, at, playerStats);
+                (damage, resistance, var mitigated, var takenRules) = ResolveMonsterHit(m, ownRolled, critical, attack: true, at, resistanceMods, pen,
+                    hitRolls.InvertsResistance(AreaRng(player)), AreaRng(player), additionalElementalTakenPct: witheredElemental);
                 hitCode = HitCode(mitigated);
                 if (critical) damage = DamageModel.CriticalDamage(damage, criticalMultiplier);
-                LeechOnHitLocked(player, m, MonsterTakenComponents(m, mitigated, spell: false, at), damage,
-                    HitLeechSources(playerStats, true, ownPenetration, weapon.LocalSources, weapon.Melee));
-                (damage, stored, impaled) = WithImpaleHitLocked(player, m, damage, ownRolled, critical, sourceCriticalMultiplier,
-                    ImpaleStats.From(playerStats, Stats, attack: true, ownPenetration, weapon.LocalSources, critical));
+                if (splashDamageMore != 1) damage = (int)Math.Floor(damage * Math.Max(0, splashDamageMore));
+                int chaosDamage = MonsterHitChaosDamage(m, mitigated, spell: false, at, damage, takenRules);
+                LeechOnHitTargetLocked(player, m, MonsterTakenComponents(m, mitigated, spell: false, at, takenRules), damage,
+                    HitLeechSources(playerStats, true, ownPenetration, weapon.LocalSources, weapon.Melee), targetId);
+                (damage, stored, impaled) = WithImpaleHitLocked(player, m, damage, ownRolled, critical,
+                    sourceCriticalMultiplier + FullLifeCriticalMultiplier(m, playerStats, ownPenetration),
+                    WeaponImpaleSettings(playerStats, Stats, attack: true, ownPenetration, weapon, critical), splashDamageMore);
                 impaleStacks = m.Impale.Stacks;
                 impaleStored = m.Impale.Bonus;
                 var fortificationDamage = RawFortificationDamage(ownRolled, critical, criticalMultiplier);
+                var fortifySkill = WithStrikeFortifySkillStat(playerStats, ownPenetration, weapon.Melee);
                 bool fortifiedThisHit = !fortified && (fortified = FortificationOnHitLocked(player, m, fortificationDamage,
-                    weapon.Melee, playerStats, ownPenetration));
-                stun = OwnerStun(player, m, damage, mitigated, weapon.Melee, spell: false, critical, playerStats, ownPenetration)
+                    weapon.Melee, playerStats, fortifySkill));
+                if (fortifiedThisHit) AfterFortificationGainLocked(player, playerStats);
+                stun = OwnerStun(player, m, damage, mitigated, weapon.Melee, spell: false, critical, playerStats, ownPenetration,
+                    weaponClass: weapon.ItemClass ?? "")
                     with { FortificationDamage = fortificationDamage, Fortified = fortifiedThisHit };
                 uint lifeBefore = m.Life;
                 var rampageSource = RampageOnMeleeHitLocked(player, m, weapon.Melee, playerStats);
-                (m.Life, stageStarts) = TakeOwnerHitLocked(player, m, damage, Cull.Of(playerStats, ownPenetration, critical, spell: false),
-                    rampageSource, playerStats);
-                CaptureUnhingedHitKillLocked(player, m, playerHit: true);
+                int afterShell = AbsorbSomaticShell(m, damage, ref chaosDamage, contactAt, bypassesShell: false);
+                int lifeDamage = AbsorbMonsterEnergyShieldLocked(player.Area, m, afterShell, chaosDamage, contactAt);
+                (m.Life, stageStarts) = TakeOwnerHitLocked(player, m, lifeDamage,
+                    Cull.Of(playerStats, ownPenetration, critical, spell: false).WithWeapon(weapon.LocalSources), rampageSource, playerStats);
+                if (m.Life == 0 && weapon.Melee)
+                    FearsomeWarriorOnMeleeKillLocked(player, m, contactAt,
+                        playerStats.GetValueOrDefault(Stat.ChanceToIntimidateNearbyEnemiesOnMeleeKillPct), AreaRng(player));
+                CaptureHitCorpseDestructionLocked(player, m, directPlayerHit: true, playerStats);
+                CaptureEquippedHitExplosionLocked(m, playerStats);
+                CaptureAttackKillExplosionLocked(m, playerStats);
                 if (stageStarts)
                 {
                     CommitBossStage(player, targetId, m, ProjectileWorldTime(player));
                     stageStarts = false;
                 }
                 life = m.Life;
+                if (weapon.Melee)
+                {
+                    GainValourFromMeleeLocked(player, m, life == 0, at, playerStats);
+                    if (GoreShockwaveForHit(player, playerStats) is { } gore)
+                        TriggerGoreShockwaveLocked(player, gore, m.Walk.Position(at), at);
+                }
                 player.LastEnemyHitAt = m.PlayerHitAt = AreaTime(player);
                 // The "recently" stats (issue #504): hit an enemy, and crit with it when the roll was a critical one.
-                player.RecentEvents.RecordHit(AreaTime(player), critical);
+                player.RecentEvents.RecordHit(m.PlayerHitAt, critical, attack: true);
+                if (m.Hostile) player.RecentEvents.Record(OwnedEnemyHitRecently, m.PlayerHitAt);
+                GainConvergenceOnHitLocked(player, m, ProjectileWorldTime(player), playerStats);
                 if (ElementalOverloadCritLocked(player, SkillCatalog.FirstSkillId, null, playerStats, critical) is { } eoBuff)
                     ProjectilesFor(player).Packet(eoBuff, "elemental overload (default attack)");
-                if (life == 0) { m.Aggro = false; m.Dead = true; CollectVaalSoulAtDeathLocked(player, m); }
+                if (life == 0) { m.Aggro = false; m.Dead = true; CleanupDeadMonsterLocked(player.Area, targetId, m); CollectVaalSoulAtDeathLocked(player, m); }
+                else if (m.Hostile)
+                {
+                    var pos = m.Walk.Position(contactAt);
+                    if (!(m.ReturningHome && m.SpawnAnchor != default && Dist(pos, m.SpawnAnchor) > 2.0 * Math.Max(40, m.AggroRange)))
+                    {
+                        bool wasAggro = m.Aggro;
+                        m.Aggro = true;
+                        m.ReturningHome = false;
+                        if (!wasAggro) AlertPackLocked(player, m, pos, contactAt);
+                    }
+                }
                 AilmentsOnHitLocked(player, targetId, m, mitigated, spell: false, critical, criticalMultiplier, playerStats,
-                    ownPenetration, at, AreaRng(player), poison: prehit.Poison,
-                    blind: BlindHitInput.Capture(playerStats), attackGains: AttackAilmentGains.Capture(playerStats, attack: true));
+                    WithWeaponAilmentStats(ownPenetration, weapon.LocalSources, offHand: hand == AttackHand.Off),
+                    at, AreaRng(player), poison: prehit.Poison,
+                    blind: BlindHitInput.Capture(playerStats), attackGains: AttackAilmentGains.Capture(playerStats, attack: true),
+                    projectileDamage: false, projectileFreezeChance: 0,
+                    weaponWitherChance: weapon.LocalSources?.GetValueOrDefault(Stat.LocalWitheredOnHitFor2SecondsPctChance) ?? 0);
+                if (critical) TryDeathmarkedLocked(player, m, at, playerStats);
+                nativeKnockback = TakeNativeKnockbackLocked(m);
                 if (life > 0 && prehit.Ignite.CanIgnite(ownRolled)
                     && IgniteOnHitLocked(player, targetId, m, prehit.Ignite,
                         critical, at, attackGains: AttackAilmentGains.Capture(playerStats, attack: true)) is { } packets)
@@ -604,8 +795,10 @@ public static partial class Game
                         BleedReflected(playerStats)) is { } cut)
                     (bled, bleedLog) = (cut, BleedingLog(targetId, m, critical, at));
                 TriggerElementalRelicLocked(player, m, hit: damage > 0, killed: life == 0);
-                if (!raged) raged = RageOnHitLocked(player, attack: true, melee: weapon.Melee, critical);
-                if (weapon.ItemClass is not null) player.RecentEvents.Record(StatConditions.HitEnemyWithWeapon, at);
+                if (!isSplash) ExertedMeleeHitLocked(player, warcryTriggers, target, at);
+                if (!raged) raged = RageOnHitWithWeaponLocked(player, attack: true, melee: weapon.Melee, critical, weapon.ItemClass, target: m);
+                if (weapon.ItemClass is not null) RecordWeaponContactLocked(player, at, weaponContactSource);
+                if (critical) ItemMinionsOnWeaponCriticalLocked(player, weaponContactSource, m, at);
                 if (life == 0) RecordTinctureKill(m, TinctureKillBonusFor(player, playerStats, hand));
                 if (player.TinctureEffects.AnyEffective) TinctureOnWeaponHitLocked(player, playerStats, m, lifeBefore, at, AreaRng(player));
             }
@@ -623,9 +816,12 @@ public static partial class Game
             // player-melee hit (bit 0 hit, 0x200 damage, 0x4000 attack), kind 0x03 = action hit with hit data, the angle drives
             // the directional blood.
             var order = HitOrder(player, player.Id);
+            ushort hitFlags = (ushort)(0x4201 | (critical ? 0x0020 : 0));
+            byte hitKind = 0x03, hitAngle = HitAngle(target.X - stop.X, target.Y - stop.Y);
+            ApplyNativeKnockback(nativeKnockback, ref hitFlags, ref hitKind, ref hitAngle, out ushort hitU3c, out ushort hitU3e);
             await SendWorldRecord(player, player.Id, InstanceProtocol.ActionHit(player.Id, use.Sequence, targetId,
-                    flags: (ushort)(0x4201 | (critical ? 0x0020 : 0)), kind: 0x03, code: hitCode,
-                    angle: HitAngle(target.X - stop.X, target.Y - stop.Y), orderKey: order.Key, checkpoint: order.Hit),
+                    flags: hitFlags, kind: hitKind, code: hitCode,
+                    angle: hitAngle, u3c: hitU3c, u3e: hitU3e, orderKey: order.Key, checkpoint: order.Hit),
                 $"0x01af player hit on monster 0x{targetId:x} (sequence 0x{use.Sequence:x4})");
             Note($"0x01b1 monster 0x{targetId:x} hit for {damage}{(critical ? " (critical)" : "")}{handNote}" +
                 (resistance is { } note ? $", {note}" : "") +
@@ -664,14 +860,26 @@ public static partial class Game
         int webs = target.SpiderWebs.Count(at);
         additionalIncreased += SpiderDamageIncrease(n => GolemStat(playerStats, n), webs);
         playerStats = SpiderAttackStats(playerStats, webs);
-        playerStats = TypedTargetDamageStats(playerStats, target.Ignites.Burning, target.Bleeds.Burning, EnemyOnLowLife(target));
+        bool lowLife = EnemyOnLowLife(target);
+        int Get(uint key) => GolemStat(playerStats, key);
+        var contact = ContactDamage(player, target, at, playerStats, weapon.LocalSources);
+        var modifiers = TargetModifiers(Get, lowLife, target.MaimedUntil > at,
+            weapon.Melee && Get(Stat.MeleeDamagePlusPctAtCloseRange) != 0 && InCloseRange(player, target, at),
+            claw: lowLife && WeaponIdentity.CountsAs(weapon.ItemClass, weapon.LocalSources, "Claw"), contact: contact);
+        playerStats = TypedTargetDamageStats(playerStats, target.Ignites.IgnitedAt(at), target.Bleeds.IgnitedAt(at), lowLife);
         playerStats = WithElementalOverload(player, SkillCatalog.FirstSkillId, playerStats);
         int rating = accuracy ?? PlayerAccuracy(player, playerStats);
         // The swinging hand's rating: an off-hand swing uses its own local accuracy (accuracy-scaled added damage).
-        return new(AttackHitConverted(weapon, playerStats, weapon.Melee, conversion, new(rating), additionalIncreased),
-            DefaultAttackIgnite(player, playerStats, weapon, additionalIncreased, conversion, rating),
-            DefaultAttackBleed(player, playerStats, weapon, additionalIncreased, conversion, rating),
-            DefaultAttackPoison(player, playerStats, weapon, additionalIncreased, conversion, rating));
+        var hit = AttackHitConverted(weapon, TargetHitStats(playerStats, contact), weapon.Melee, conversion, new(rating),
+            additionalIncreased + modifiers.HitIncrease);
+        if (modifiers.HitMore != 1) hit = hit.Scale(modifiers.HitMore);
+        long ailmentIncrease = additionalIncreased + modifiers.AilmentIncrease;
+        var ignite = DefaultAttackIgnite(player, playerStats, weapon, ailmentIncrease, conversion, rating);
+        var bleed = DefaultAttackBleed(player, playerStats, weapon, ailmentIncrease, conversion, rating);
+        var poison = DefaultAttackPoison(player, playerStats, weapon, ailmentIncrease, conversion, rating);
+        return modifiers.AilmentMore == 1 ? new(hit, ignite, bleed, poison) : new(hit,
+            RepeatAilment(ignite, modifiers.AilmentMore), RepeatAilment(bleed, modifiers.AilmentMore),
+            RepeatAilment(poison, modifiers.AilmentMore));
     }
 
     // A gem skill used on a monster (C→S 0x24 with a skill id other than the default attack's). A spell stops and casts from
@@ -695,7 +903,10 @@ public static partial class Game
         if (gem.Name is not null && !VaalMinionTargetAvailable(player, use.SkillId, use.TargetId)) return;
         // A movement attack (Flicker Strike, Leap Slam) closes the distance itself, and an attack used with "always attack
         // without moving" (Flags bit 0) swings from where the player stands: both keep the immediate cast.
-        if (gem.Name is not null && !IsTotemSkill(player, use.SkillId) && SkillsFor(player).IsAttack(gem.Effect) && !SkillsFor(player).IsMovement(gem.Effect) && (use.Flags & 0x1) == 0)
+        // A trapped or mined attack is thrown from where the player stands, at the throwing time (Messages.cs).
+        bool thrown = gem.Name is not null && PlacedKind(SupportedSkill(player, use.SkillId)) is not { Trap: false, Mine: false };
+        if (gem.Name is not null && !thrown && !IsTotemSkill(player, use.SkillId)
+            && SkillsFor(player).IsAttack(gem.Effect) && AttackUsesWalkUp(player, gem.Effect) && (use.Flags & 0x1) == 0)
         {
             if (!AttackReady(player, use.SkillId, gem.Effect, gem.Level, out double attackSeconds, use.Sequence))
             {
@@ -703,7 +914,12 @@ public static partial class Game
                 return;
             }
             // The reach of the weapon this use swings (AttackHands): a dual-wielded off hand walks up to its own.
-            var weapon = HandWeapon(player, AttackHandFor(player, use.SkillId, use.Sequence));
+            var swingHand = AttackHandFor(player, use.SkillId, use.Sequence);
+            var weapon = HandWeapon(player, swingHand);
+            var supportedStats = SupportedSkill(player, use.SkillId).Stats;
+            int swingReach = MeleeSkillReach(player, weapon, gem.Effect, supportedStats);
+            weapon = weapon with { Range = swingReach };
+            double admitReach = MeleeAreaSwingReach(player, weapon, gem.Effect, supportedStats, swingReach, swingHand);
             int precision = AttackPrecision(player);
             double now = AreaTime(player);
             int action = 0;
@@ -744,9 +960,9 @@ public static partial class Game
             now = AreaTime(player);
             // A lockstep client's swing began at the start of its goal frame, tested against the monster's cell then.
             target = m.Walk.Position(started ? begun : now);
-            if (!SwingInReach(player, m, stop, target, weapon.Range + 2))
+            if (!SwingInReach(player, m, stop, target, admitReach))
             {
-                Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{use.SkillId:x4} {gem.Name} on 0x{use.TargetId:x} out of reach: {Dist(stop, target):0.0} > {weapon.Range}");
+                Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{use.SkillId:x4} {gem.Name} on 0x{use.TargetId:x} out of reach: {Dist(stop, target):0.0} > {admitReach:0.#}");
                 LockstepAttackOver(player, action);
                 return;
             }
@@ -780,8 +996,11 @@ public static partial class Game
             return;
         }
         bool leapSkill = gem.Name is not null && !IsTotemSkill(player, use.SkillId) && IsLeapSlam(player, gem.Effect);
-        bool immediateAttack = gem.Name is not null && !IsTotemSkill(player, use.SkillId)
-            && SkillsFor(player).IsAttack(gem.Effect) && !SkillsFor(player).IsMovement(gem.Effect);
+        int chargeBonus = gem.Name is null ? 0 : ShieldChargeBonusPct(player, use.SkillId, gem.Effect);
+        bool shieldCharge = chargeBonus != 0;
+        bool immediateAttack = gem.Name is not null && !thrown && !IsTotemSkill(player, use.SkillId)
+            && SkillsFor(player).IsAttack(gem.Effect) && (!SkillsFor(player).IsMovement(gem.Effect)
+                || shieldCharge || IsConsecratedPath(SkillsFor(player).EffectId(gem.Effect)));
         if (immediateAttack && !AttackReady(player, use.SkillId, gem.Effect, gem.Level, out double immediateAttackSeconds, use.Sequence))
         {
             Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{use.SkillId:x4} {gem.Name} on 0x{use.TargetId:x}: ignored, the previous attack is still running (attack time {immediateAttackSeconds:0.00} s) (t={AreaTime(player):0.000})");
@@ -790,8 +1009,7 @@ public static partial class Game
         double castAt = AreaTime(player);
         int castAction = 0;
         (int X, int Y) aim = default, stand = default, landing = default;
-        int chargeBonus = gem.Name is null ? 0 : ShieldChargeBonusPct(player, use.SkillId, gem.Effect), chargeToken = 0;
-        bool moves = gem.Name is not null && chargeBonus == 0 && LandsAtAim(player, gem.Effect);
+        bool moves = gem.Name is not null && !shieldCharge && LandsAtAim(player, gem.Effect);
         if (gem.Name is not null && IsDashEffect(SkillsFor(player).EffectId(gem.Effect)))
         {
             (int X, int Y) dashAim;
@@ -817,6 +1035,10 @@ public static partial class Game
         }
         // Flicker Strike's client action strikes without moving the player: the server teleports it (FlickerStrike).
         bool flicker = moves && SkillsFor(player).ActionHash(gem.Effect) == FlickerStrike.Action, flickers = false;
+        var moveEffect = moves ? SkillsFor(player).EffectId(gem.Effect) : null;
+        bool flameDash = IsFlameDashEffect(moveEffect);
+        ((int X, int Y) Aim, (int X, int Y) Landing)? flameDashTo = null;
+        double? flameDashAt = null;
         // The monster Flicker Strike goes to, which may not be the clicked one (FlickerStrike.Pick): its strike's target.
         uint struckId = use.TargetId;
         (uint Id, (int X, int Y) At, (int X, int Y) Landing)? flickerTo = null;
@@ -834,23 +1056,32 @@ public static partial class Game
         void StartCast()
         {
             bool lockstep = player.Connection.LockstepClient;
-            castAt = leap?.At ?? ProjectileWorldTime(player);
+            castAt = flameDashAt ?? leap?.At ?? ProjectileWorldTime(player);
             double actionAt = lockstep && player.Connection.LockstepFrame is { } frame ? frame.Start : castAt;
             if (lockstep) StepWalkers(player, actionAt);
+            AdvanceShieldChargeForUse(player, actionAt, immediateAttack);
+            if (chargeBonus == 0) EndShieldChargeIfInterrupted(player);
             castAction = Interlocked.Increment(ref player.ActionCount);
             aim = m.Walk.Position(actionAt);
             stand = player.Walk.Position(actionAt);
-            if (lockstep) player.Walk.Cancel(actionAt);
-            else player.Walk.Order(stand.X, stand.Y, castAt);
+            if (chargeBonus == 0)
+            {
+                if (lockstep) player.Walk.Cancel(actionAt);
+                else player.Walk.Order(stand.X, stand.Y, castAt);
+            }
             // A movement skill aimed at a monster travels as one aimed at the ground does.
             if (leap is not null) CommitLeapSlam(player, leap);
-            else if (chargeBonus != 0) chargeToken = BeginShieldCharge(player, use.SkillId, chargeBonus, aim.X, aim.Y, castAt);
             else if (flicker && flickerTo is { } to)
             {
                 (aim, landing, flickers, struckId) = (to.At, to.Landing, true, to.Id);
                 player.Walk.Teleport(landing.X, landing.Y, castAt);
             }
-            else if (moves)
+            else if (flameDash && flameDashTo is { } fd)
+            {
+                (aim, landing) = fd;
+                player.Walk.Teleport(landing.X, landing.Y, castAt);
+            }
+            else if (moves && chargeBonus == 0)
             {
                 landing = MovementLanding(player, gem.Effect, stand, aim, use.SkillId, use.Flags);
                 player.Walk.Teleport(landing.X, landing.Y, castAt);
@@ -862,6 +1093,15 @@ public static partial class Game
             admitted = TryBeginAttackUse(player, use.SkillId, gem.Effect, requestedAt,
                 _ => StartCast(), out spellUse,
                 at => (leap = PlanLeapSlam(player, use.SkillId, gem.Effect, m.Walk.Position(at), at)) is not null);
+        else if (flameDash)
+            admitted = TryBeginFlameDashUse(player, use.SkillId, gem.Effect, use.Flags, requestedAt,
+                t => m.Walk.Position(t),
+                (acceptedAt, _, resolvedAim, resolvedLanding) =>
+                {
+                    flameDashAt = acceptedAt;
+                    flameDashTo = (resolvedAim, resolvedLanding);
+                    StartCast();
+                }, out spellUse);
         else admitted = TryBeginSkillCooldownUse(player, use.SkillId, gem.Effect,
             gem.Name is null ? null : CooldownForSkill(player, use.SkillId), false,
             StartCast, out spellUse, requestedAt: requestedAt, admit: flicker ? FlickerAdmit : null);
@@ -870,17 +1110,24 @@ public static partial class Game
             if (noFlickerTarget) await FlickerRefused(player, gem.Name!);
             return;
         }
-        if (chargeToken != 0) _ = RunShieldCharge(player, chargeToken, player.Walk.ArrivesAt,
-            use.SkillId, use.Sequence, spellUse?.ActionToken ?? castAction, spellUse);
+        Action? startCharge = null;
         bool spellAcknowledged = false;
-        bool spellProjectileRuntime = UsesProjectileRuntime(gem.Effect) || leapSkill;
-        double? immediateSwingAt = leap?.At ?? (immediateAttack ? castAt : null);
-        Task<bool>? spellTask = spellProjectileRuntime ? CastGemSkill(player, use.SkillId, stand, aim,
+        bool spellProjectileRuntime = UsesProjectileRuntime(gem.Effect) || leapSkill || shieldCharge;
+        double? immediateSwingAt = leap?.At ?? (immediateAttack || player.Connection.LockstepClient
+            ? LockstepScheduledAt(player, castAt) : null);
+        bool movedByCast = flickers && landing != stand || moves && chargeBonus == 0 && landing != stand;
+        Task<bool>? spellTask = spellProjectileRuntime ? CastGemSkillWithAdmission(player,
+            shieldCharge ? start => startCharge = start : null, use.SkillId, stand, aim,
             use.TargetId, sequence: use.Sequence, actionToken: spellUse?.ActionToken ?? castAction, cooldownUse: spellUse,
-            swingAt: immediateSwingAt, leap: leap) : null;
+            swingAt: immediateSwingAt, leap: leap, movedByCast: movedByCast) : null;
+        if (shieldCharge && !await spellTask!) return;
         if (spellTask is { IsCompletedSuccessfully: true, Result: false }) return;
-        byte[][] ActionRecords() => [InstanceProtocol.ActionStarted(player.Id, stand.X, stand.Y, aim.X, aim.Y,
-            use.SkillId, use.Sequence, use.Flags, targetObjectId: use.TargetId), InstanceProtocol.ActionEnded(player.Id)];
+        byte[][] ActionRecords()
+        {
+            Interlocked.Exchange(ref startCharge, null)?.Invoke();
+            return [InstanceProtocol.ActionStarted(player.Id, stand.X, stand.Y, aim.X, aim.Y,
+                use.SkillId, use.Sequence, use.Flags, targetObjectId: use.TargetId), InstanceProtocol.ActionEnded(player.Id)];
+        }
         bool Acknowledge() => spellAcknowledged = SkillAcknowledgementAllowed(player, gem.Effect, use.SkillId,
             () => spellUse?.CommitNativeUse(player, use.SkillId) ?? PlayerActionCurrent(player, castAction));
         bool predictedLeap = PredictsLeapSlam(player, SkillsFor(player).EffectId(gem.Effect), use.Sequence);
@@ -890,6 +1137,7 @@ public static partial class Game
                 atGate: () => LeapSlamAcknowledgement(player, [.. ActionRecords().SelectMany(p => p)]));
         else
             await SendWorldRecords(player, player.Id, ActionRecords, acknowledgement, still: Acknowledge);
+        if (shieldCharge && !spellAcknowledged) return;
         if (flickers && spellAcknowledged)
         {
             await FlickerArt(player, gem.Gem, stand, landing);
@@ -897,6 +1145,13 @@ public static partial class Game
                 $"0x01b7 {gem.Name} to ({landing.X}, {landing.Y}) for the monster at ({aim.X}, {aim.Y}) (t={castAt:0.000})");
         }
         if (flicker && spellAcknowledged) await GrantFlickerSpeed(player, use.SkillId);
+        if (spellAcknowledged && movedByCast && flameDash)
+        {
+            await SendWorldRecord(player, player.Id,
+                FlameDashGroundSegment(player, use.SkillId, gem.Effect, use.Sequence, stand, landing),
+                $"0x02c8 Flame Dash burning ground ({stand.X}, {stand.Y}) -> ({landing.X}, {landing.Y})");
+            PlaceFlameDashGround(player, stand, landing, use.SkillId, gem.Effect, castAt);
+        }
         if (spellAcknowledged) await SendNativeCooldownRefresh(player);
         if (leap is { } jump)
             ResyncAfter(player,
@@ -904,8 +1159,10 @@ public static partial class Game
         else if (moves) ResyncAfter(player,
             MovementSeconds(player, gem.Effect, gem.Level, use.SkillId), gem.Name!);
         if (!spellProjectileRuntime && !spellAcknowledged) return;
-        if (!spellProjectileRuntime) _ = CastGemSkill(player, use.SkillId, flicker ? landing : stand, aim, struckId,
-            sequence: use.Sequence, actionToken: spellUse?.ActionToken ?? castAction, cooldownUse: spellUse, swingAt: immediateSwingAt);
+        if (!spellProjectileRuntime && (!flameDash || movedByCast)) _ = CastGemSkill(player, use.SkillId,
+            flicker ? landing : stand, flameDash || IsWhirlingBlades(moveEffect) ? landing : aim, struckId,
+            sequence: use.Sequence, actionToken: spellUse?.ActionToken ?? castAction, cooldownUse: spellUse, swingAt: immediateSwingAt,
+            movedByCast: movedByCast);
     }
 
     /// <summary>One Dash whose source, resources, cooldown, displacement and recent events committed together. The past
@@ -918,6 +1175,8 @@ public static partial class Game
     {
         bool paymentPublished, completed, nativeCommitted;
         public IReadOnlyList<(SingleUseCooldownState State, int Version, ushort Skill)> SharedUses { get; init; } = [];
+        public bool CooldownReset { get; init; }
+        public int ResetBaseMilliseconds { get; init; }
 
         public bool Matches(ushort skillId, int effect) => SkillId == skillId && Effect == effect;
 
@@ -939,7 +1198,10 @@ public static partial class Game
         {
             if (!ReferenceEquals(Player, player)) return false;
             if (nativeCommitted || !CurrentLocked(player)) return false;
-            Cooldown.ConfirmNativeUse(UseVersion, SkillId, synchronizeProgress: false);
+            if (CooldownReset)
+                Cooldown.SynchronizeNativeReset(SkillId, ResetBaseMilliseconds);
+            else
+                Cooldown.ConfirmNativeUse(UseVersion, SkillId, synchronizeProgress: false);
             foreach (var (state, version, skill) in SharedUses)
                 state.ConfirmNativeUse(version, skill, synchronizeProgress: true);
             nativeCommitted = true;
@@ -1010,15 +1272,25 @@ public static partial class Game
             if (!PayMana(player, skillId, out uint manaCost, out uint lifeCost)) return false;
 
             // Nothing below can refuse: payment, cooldown use, action, displacement and recents are one commit.
-            _ = state.TryUse(acceptedAt, plan);
+            state.Refresh(acceptedAt, plan.RecoveryRate);
+            state.Capacity(plan.Uses);
+            bool cooldownReset = CooldownResetTriggered(player, effect, skillId, AreaRng(player));
+            if (!cooldownReset) _ = state.TryUse(acceptedAt, plan);
             player.SkillReadyAt[key] = acceptedAt + state.RemainingSeconds;
-            var sharedUses = SpendSharedCooldownPeers(player, key, effect, skillId, plan, acceptedAt, peers);
+            var sharedUses = cooldownReset ? [] : SpendSharedCooldownPeers(player, key, effect, skillId, plan, acceptedAt, peers);
             int action = beginAction ? Interlocked.Increment(ref player.ActionCount) : player.ActionCount;
             if (beginAction) player.Walk.Order(from.X, from.Y, acceptedAt);
             player.Walk.Teleport(to.X, to.Y, acceptedAt);
-            RecordAcceptedGemUseAt(player, effect, acceptedAt);
+            RecordAcceptedGemUseAt(player, effect, to, acceptedAt);
+            if (CastingSpell(player, effect) && !SkillsFor(player).IsInstant(effect))
+                RecordNonInstantSpellUseLocked(player, effect, acceptedAt);
             receipt = new(player, CombatLifetime!, skillId, effect, source.Identity, action, player.ProjectileEpoch,
-                acceptedAt, from, to, state, state.UseVersion, manaCost, lifeCost) { SharedUses = sharedUses };
+                acceptedAt, from, to, state, state.UseVersion, manaCost, lifeCost)
+            {
+                SharedUses = sharedUses,
+                CooldownReset = cooldownReset,
+                ResetBaseMilliseconds = cooldownReset ? plan.BaseMilliseconds : 0,
+            };
             return true;
         }
     }
@@ -1049,10 +1321,19 @@ public static partial class Game
     // A gem skill's cast: Righteous Fire puts its buff on, any other skill launches its projectile (if it has one). False when
     // it was refused (cooldown, mana), so its use is not confirmed to the client. An attack's timer, hit and release
     // count from swingAt when its swing began before now (a lockstep walk-up's goal frame, CastOn), else from now.
-    public static async Task<bool> CastGemSkill(Player player,
+    public static Task<bool> CastGemSkill(Player player,
         ushort skillId, (int X, int Y) from, (int X, int Y) to, uint targetId = 0, ushort sequence = 0,
         int? actionToken = null, CooldownUseTicket? cooldownUse = null, bool locationInstant = false,
-        DashUseReceipt? dashReceipt = null, double? swingAt = null, LeapSlam.Use? leap = null, Action? guardStart = null)
+        DashUseReceipt? dashReceipt = null, double? swingAt = null, LeapSlam.Use? leap = null, Action? guardStart = null,
+        bool movedByCast = false) =>
+        CastGemSkillWithAdmission(player, null, skillId, from, to, targetId, sequence, actionToken, cooldownUse,
+            locationInstant, dashReceipt, swingAt, leap, guardStart, movedByCast);
+
+    static async Task<bool> CastGemSkillWithAdmission(Player player, Action<Action>? onShieldChargeReady,
+        ushort skillId, (int X, int Y) from, (int X, int Y) to, uint targetId = 0, ushort sequence = 0,
+        int? actionToken = null, CooldownUseTicket? cooldownUse = null, bool locationInstant = false,
+        DashUseReceipt? dashReceipt = null, double? swingAt = null, LeapSlam.Use? leap = null, Action? guardStart = null,
+        bool movedByCast = false)
     {
         int action = actionToken ?? player.ActionCount;
         int recoveryGeneration = 0;
@@ -1060,13 +1341,29 @@ public static partial class Game
         VaalUseReservation? vaalUse = null;
         SupportedGem? beastCompanion = null;
         PlacedCastAdmission? placedAdmission = null;
-        if (SkillsFor(player).EffectId(SupportedSkill(player, skillId).Effect) is TwisterEffect or CatStealthCryEffect) return false;
+        SupportedGem? paidIntensity = null, paidMomentum = null;
+        GhorrCast? pactSpell = null;
+        BeidatCast? beidatSpell = null;
+        var momentumTravel = player.Walk.ObserveTravel(AreaTime(player));
+        var baseSkill = BaseSupportedSkill(player, skillId);
+        if (SkillsFor(player).EffectId(baseSkill.Effect) is TwisterEffect or CatStealthCryEffect or KineticAnomalyEffect or ThunderburstEffect or FleshrendEffect) return false;
         if (actionToken is not null && (player.ActionCount != action || player.ElementalAilments.ActionFactor(AreaTime(player)) == 0 || player.HitRecovery.Active(AreaTime(player)))) return false;
+        if (VaalArcticArmourActive(player, AreaTime(player)) && cooldownUse?.Instant != true && !locationInstant
+            && !SkillsFor(player).IsInstant(baseSkill.Effect)) return false;
         if (!TryCapturePlacedCastAdmissionLocked(player, skillId, out placedAdmission)) return false;
         if (InTown(player) || player.PlayerLife == 0) return false;
+        // Direct callers do not go through the action handler that already reserves placed-skill cooldowns.
+        if (actionToken is null && cooldownUse is null && !locationInstant && placedAdmission is { } placement
+            && CooldownForSkill(player, skillId) is { } placedCooldown
+            && !TryBeginSkillCooldownUse(player, skillId, placement.Effect, placedCooldown, false, () => { },
+                out cooldownUse, requestedAt: AreaTime(player),
+                admit: () => PlacedCastAdmissionCurrent(player, placement) && GemSkillInstanceDisabled(player, placement.Effect, skillId) is null))
+            return false;
         await EndGracePeriod(player, action: true);
         var gem = GemSkillEffects(player).FirstOrDefault(g => g.Id == skillId);
         if (gem.Name is null) return false;
+        if (VaalArcticArmourActive(player, AreaTime(player)) && cooldownUse?.Instant != true && !locationInstant
+            && !SkillsFor(player).IsInstant(gem.Effect)) return false;
         if (!PlacedCastFamilyCurrent(player, skillId, placedAdmission)) return false;
         if (IsDashEffect(SkillsFor(player).EffectId(gem.Effect)))
         {
@@ -1098,15 +1395,16 @@ public static partial class Game
         bool TotemPlacementCurrent()
         {
             return !player.Closed && !player.LeavingArea && !player.RageRetired
-                && (cooldownUse?.Current(player) ?? true)
+                && (cooldownUse?.Current(player, ignoreAction: true) ?? true)
                 && (vaalUse is null || VaalAdmissionCurrent(player, vaalUse))
                 && (channelGeneration is not int generation || ChannelCurrent(player, skillId, action, generation));
         }
         if (!Current()) return false;
         if (gem.Name is not null && !ProjectilePathAvailable(player, skillId, gem.Effect)) return false;
         if (locationInstant && (gem.Name is null || !InstantLocationSkill.Supported(SkillsFor(player), gem.Effect))) return false;
-        if (gem.Name is not null && SkillsFor(player).IsSpell(gem.Effect) && !SkillsFor(player).IsAttack(gem.Effect)
-            && CastMs(player, gem.Effect, skillId) is null)
+        bool spell = CastingSpell(player, gem.Effect);
+        int? spellCastMs = spell ? CastMs(player, gem.Effect, skillId) : null;
+        if (spell && spellCastMs is null)
         {
             Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: invalid cast duration (no effect or mana cost)");
             await SendPlayerMana(player, $"0x01b1 player mana {player.PlayerMana} (invalid cast duration, cost back)");
@@ -1124,6 +1422,16 @@ public static partial class Game
             Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: {refused}");
             return false;
         }
+        // A placed cast (trap, mine) looks for its corpse at the trigger point, and a cost paid when the cooldown use was
+        // accepted is already spent: both keep the release's own check.
+        SpawnedMonster? plannedCorpse = null;
+        if (gem.Name is not null && placedAdmission is null && cooldownUse?.Paid is null
+            && !TryPlanSummonCorpse(player, skillId, gem.Effect, to, targetId, out plannedCorpse))
+        {
+            Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: no corpse in reach");
+            await SendPlayerMana(player, $"0x01b1 player mana {player.PlayerMana} (no corpse, nothing paid)");
+            return false;
+        }
         if (IsSummonBeastialCompanionEffect(SkillsFor(player).EffectId(gem.Effect)))
         {
             beastCompanion = SupportedSkill(player, skillId);
@@ -1139,13 +1447,21 @@ public static partial class Game
             Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: no executable paid Vaal admission");
             return false;
         }
+        if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == ApproachingFlamesEffect
+            && (InTown(player) || SupportedSkill(player, skillId).WornGrant is not { EffectId: ApproachingFlamesEffect } flameSource
+                || !FlameSourceCurrent(player, flameSource)))
+            return false;
+        bool shieldCharge = gem.Name is not null && ShieldChargeBonusPct(player, skillId, gem.Effect) != 0;
+        if (cooldownUse is null && RetaliationOpportunity(SkillsFor(player).EffectId(gem.Effect)) is not null
+            && !TryBeginSkillCooldownUse(player, skillId, gem.Effect, CooldownForSkill(player, skillId),
+                instant: false, () => { }, out cooldownUse, actionToken)) return false;
         // Eligible uses arrive with their one original preflight reservation. Never reserve again after an await.
         if (cooldownUse is not null)
         {
             if (!cooldownUse.TryExecute(player, gem.Effect)) return false;
             if (!cooldownUse.Instant)
             {
-                if (UsesProjectileRuntime(gem.Effect) || leap is not null) ProjectilesFor(player)
+                if (UsesProjectileRuntime(gem.Effect) || leap is not null || shieldCharge) ProjectilesFor(player)
                     .Enqueue(() => SendNativeCooldownRefresh(player));
                 else await SendNativeCooldownRefresh(player);
             }
@@ -1170,12 +1486,30 @@ public static partial class Game
                 return false;
             }
         }
+        if (gem.Name is not null && BannerAuraRow(SkillsFor(player).EffectId(gem.Effect)) != 0)
+        {
+            var (accepted, activated) = await ToggleBanner(player, skillId, Current);
+            if (accepted) RecordAcceptedGemUse(player, gem.Effect, to, activated);
+            return accepted;
+        }
+        if (gem.Name is not null && CooldownTriggerController(SkillsFor(player).EffectId(gem.Effect)) != 0)
+        {
+            var (accepted, activated) = await ToggleCooldownTrigger(player, skillId, Current);
+            if (accepted) RecordAcceptedGemUse(player, gem.Effect, to, activated);
+            return accepted;
+        }
+        if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == ApproachingFlamesEffect)
+        {
+            var (accepted, activated) = await ToggleApproachingFlames(player, skillId, Current);
+            if (accepted) RecordAcceptedGemUse(player, gem.Effect, to, activated);
+            return accepted;
+        }
         if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == UnhingeEffect)
             return await ToggleUnhinged(player, skillId, gem.Effect, Current);
         if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == MadnessEffect)
         {
-            bool accepted = await ToggleMadness(player, skillId, gem.Effect, Current, cooldownUse);
-            if (accepted) RecordAcceptedGemUse(player, gem.Effect);
+            var (accepted, activated) = await ToggleMadnessWithActivation(player, skillId, gem.Effect, Current, cooldownUse);
+            if (accepted) RecordAcceptedGemUse(player, gem.Effect, to, activated);
             return accepted;
         }
         // An attack gem swings with the weapon's attack time, like the default attack (see Attack): while the button is held
@@ -1186,10 +1520,15 @@ public static partial class Game
         if (cooldownUse?.Attack is { } admittedAttack
             && (admittedAttack.Skill != skillId || cooldownUse.Effect != gem.Effect)) return false;
         double? reservedNextAttackAt = null;
+        DoubleStrikePairs? doubleStrikePairs = null;
+        // A trapped or mined attack is a throw: it neither waits for the weapon's attack time nor reserves it.
         if (vaalUse is null && cooldownUse?.Attack is null && gem.Name is not null
-            && !IsTotemSkill(player, skillId) && SkillsFor(player).IsAttack(gem.Effect))
+            && !IsTotemSkill(player, skillId) && SkillsFor(player).IsAttack(gem.Effect)
+            && PlacedKind(SupportedSkill(player, skillId)) is { Trap: false, Mine: false })
         {
-            double duration = SupportedAttackSeconds(player, skillId, sequence);
+            double duration = ShieldWeapon(player, skillId) is { } shieldWeapon
+                ? SupportedOffHandAttackSeconds(player, skillId, shieldWeapon)
+                : StartingAttackSeconds(player, skillId, sequence);
             double now = swingAt ?? AreaTime(player), next;
             bool ready;
             next = player.NextAttackAt;
@@ -1206,25 +1545,47 @@ public static partial class Game
             }
         }
         // A link gem (Soul Link …) links its target at the end of its cast; it has no upfront cost, only its cost over time.
+        void RecordSpellWindup()
+        {
+            if (actionToken is null || locationInstant || placedAdmission is not null || spellCastMs is not > 0
+                || SkillsFor(player).IsInstant(gem.Effect) || SkillsFor(player).IsChannelled(gem.Effect)
+                || IsTotemSkill(player, skillId)) return;
+            if (CharacterPlayerStats(player).GetValueOrDefault(Stat.AvoidInterruptionWhileCastingPct) <= 0) return;
+
+            double duration = spellCastMs.Value / 1000d * (1d + SpellRepeats(player, skillId, gem.Effect));
+            SpellWindups.AddOrUpdate(player, new(action, player.ActionInterruptionGeneration, player.ProjectileEpoch,
+                AreaTime(player) + duration));
+        }
         if (gem.Name is not null && IsLinkSkill(player, gem.Effect))
+        {
+            RecordSpellWindup();
             return await CastLink(player, skillId, gem.Effect, targetId, Current);
+        }
         if (placedAdmission is null && !vaalCast && gem.Name is not null && PlacedKind(SupportedSkill(player, skillId)) is { Trap: false, Mine: false }
             && SupportedReservationCost(player, skillId) is { } reservation)
         {
             if (!Current()) return false;
             bool accepted;
-            if (StanceCatalog.IsSource(SkillsFor(player).EffectId(gem.Effect)))
+            bool activated = true;
+            string? effectId = SkillsFor(player).EffectId(gem.Effect);
+            if (StanceCatalog.IsSource(effectId))
             {
                 if (cooldownUse?.Stance is not { } stanceUse) return false;
                 accepted = await PublishStanceUse(player, stanceUse, gem.Name);
             }
-            else if (SkillsFor(player).EffectId(gem.Effect) == PetrifiedBlood.EffectId)
+            else if (effectId == PetrifiedBlood.EffectId)
+            {
+                activated = !player.PetrifiedBlood.Active;
                 accepted = await TogglePetrifiedBlood(player, skillId, gem.Effect, gem.Name, reservation,
                     SupportedSkill(player, skillId).Level, SupportedSkill(player, skillId).Quality);
+            }
             else
+            {
+                activated = effectId == "TemporalRift" || !player.Auras.ContainsKey(skillId);
                 accepted = await ToggleAura(player, skillId, gem.Effect, gem.Name, reservation,
                     SupportedSkill(player, skillId).Level, SupportedSkill(player, skillId).Quality);
-            if (accepted) RecordAcceptedGemUse(player, gem.Effect);
+            }
+            if (accepted) RecordAcceptedGemUse(player, gem.Effect, to, activated);
             return accepted;
         }
         (int X, int Y) dashFrom = default, dashTo = default;
@@ -1259,22 +1620,59 @@ public static partial class Game
                 if (paid && dash) player.Walk.Teleport(dashTo.X, dashTo.Y, ProjectileWorldTime(player));
                 if (paid)
                 {
+                    RecordSpellWindup();
+                    if (!locationInstant && placedAdmission is null)
+                    {
+                        if (spell)
+                        {
+                            pactSpell = TakeGhorrSpell(player, skillId, paymentGem);
+                            beidatSpell = TakeBeidatSpell(player, skillId, paymentGem);
+                        }
+                        if (paymentGem.Stats.GetValueOrDefault(Stat.VirtualSkillGainsIntensity) != 0) paidIntensity = paymentGem;
+                        if (paymentGem.Stats.GetValueOrDefault(Stat.SupportMomentumMaxStacks) > 0
+                            && !IsTotemSkill(player, skillId)) paidMomentum = paymentGem;
+                    }
                     criticalRoll = CaptureSkillCriticalRoll(player, skillId);
                     // Reserve the whole paid use before cost publication can yield to another held input.
-                    if (!IsTotemSkill(player, skillId) && SkillsFor(player).IsAttack(gem.Effect)
-                        && !SkillsFor(player).IsChannelled(gem.Effect))
-                        ReserveMeleeRepeats(player, skillId, SupportedAttackSeconds(player, skillId, sequence));
+                    if (placedAdmission is null && !IsTotemSkill(player, skillId) && SkillsFor(player).IsAttack(gem.Effect)
+                        && !SkillsFor(player).IsChannelled(gem.Effect) && !shieldCharge)
+                    {
+                        double? pairBase = reservedNextAttackAt ?? cooldownUse?.Attack?.At;
+                        if (pairBase is double previous && SkillsFor(player).EffectId(gem.Effect) == "DoubleStrikeAltY")
+                            doubleStrikePairs = BeginDoubleStrikeUse(player, skillId, paymentGem, sequence,
+                                cooldownUse?.Attack?.At ?? swingAt ?? AreaTime(player), previous);
+                        if (doubleStrikePairs is null)
+                            ReserveMeleeRepeats(player, skillId, SupportedAttackSeconds(player, skillId, sequence));
+                    }
                 }
+                if (paid && cost > 0 && placedAdmission is null)
+                    RecordPaidBowAttackLocked(player, skillId, paymentGem, cost, to);
                 if (paid && beastCompanion is { } beast)
                     QueueBeastCompanionLocked(player, beast, skillId, actionToken);
                 // The native Holy Flame skill is tagged Channel for the totem's payload. Its owner places it with a
                 // single cast. Starting an owner channel would tie the placement to the input that movement clears.
                 if (paid && Supports.Of(gem.Effect)?.Types.Contains(47) == true && !IsTotemSkill(player, skillId))
                 {
-                    channelGeneration = BeginPaidChannel(player, skillId, gem.Effect, action, sequence);
-                    bool walkChanges = channelWalk is not null || player.ChannelMovement.Skill != 0;
-                    player.ChannelMovement = channelWalk is int walkPercent ? (skillId, walkPercent) : default;
-                    if (walkChanges) player.ApplyMovementSpeed();
+                    lock (LevelUpdatesFor(player).Gate)
+                    {
+                        channelGeneration = BeginPaidChannel(player, skillId, gem.Effect, action, sequence);
+                        if (IsBladeFlurry(player, gem.Effect))
+                            BeginBladeFlurry(player, paymentGem, skillId, action, channelGeneration.Value, sequence, to);
+                        if (IsChargedDash(player, gem.Effect))
+                            BeginChargedDash(player, paymentGem, skillId, sequence, action, channelGeneration.Value,
+                                player.Walk.Position(AreaTime(player)), to, AreaTime(player));
+                        if (paidMomentum is { } channelMomentum)
+                        {
+                            GainMomentumOnUse(player, skillId, channelMomentum, action, channelGeneration, AreaTime(player));
+                            paidMomentum = null;
+                        }
+                        bool walkChanges = channelWalk is not null || player.ChannelMovement.Skill != 0;
+                        player.ChannelMovement = channelWalk is int walkPercent ? (skillId, walkPercent) : default;
+                        BeginCycloneStages(player, skillId, paymentGem, action, channelGeneration.Value, AreaTime(player));
+                        if (walkChanges) player.ApplyMovementSpeed();
+                    }
+                    player.LastLockstepChannelAim = null;
+                    player.LockstepChannelAimPending = HeldLockstepAimedChannel(player);
                     if (GolemStat(SupportedSkill(player, skillId).Stats, Stat.CastWhileChannellingTimeMs) > 0)
                         BeginChannelTriggers(player, ProjectilesFor(player), skillId,
                             action, player.ChannelGeneration, to, AreaTime(player));
@@ -1291,7 +1689,7 @@ public static partial class Game
             }
             if (cost > 0 || lifeCost > 0)
             {
-                if (UsesProjectileRuntime(gem.Effect) || leap is not null) ProjectilesFor(player)
+                if (UsesProjectileRuntime(gem.Effect) || leap is not null || shieldCharge) ProjectilesFor(player)
                     .Enqueue(() => SendSkillCost(player, lifeCost, $"skill cost paid: {gem.Name}"));
                 else await SendSkillCost(player, lifeCost,
                     $"0x01b1 player cost {player.PlayerMana} mana, {player.PlayerLife} life (-{cost} mana, -{lifeCost} life for {gem.Name}) (t={AreaTime(player):0.000})");
@@ -1301,26 +1699,66 @@ public static partial class Game
         if (vaalCast)
         {
             recoveryGeneration = vaalUse!.RecoveryGeneration;
+            if (Current()) RecordSpellWindup();
             await PublishVaalUse(player, vaalUse);
         }
         if (!Current() || gem.Name is not null && GemSkillInstanceDisabled(player, gem.Effect, skillId) is not null)
+        {
+            AbortStartedChannel(player, channelGeneration);
             return false;
+        }
         if (!PlacedCastFamilyCurrent(player, skillId, placedAdmission))
+        {
+            AbortStartedChannel(player, channelGeneration);
             return false;
-        if (!locationInstant && gem.Name is not null && placedAdmission is null) RecordAcceptedGemUse(player, gem.Effect);
+        }
+        if (!locationInstant && gem.Name is not null && placedAdmission is null)
+        {
+            RecordAcceptedGemUse(player, gem.Effect, to);
+            if (spell && cooldownUse?.Instant != true && !SkillsFor(player).IsInstant(gem.Effect)
+                && !IsTotemSkill(player, skillId))
+                RecordNonInstantSpellUseLocked(player, gem.Effect, AreaTime(player));
+            NoteGemAttackUse(player, skillId, gem.Effect);
+        }
         if (gem.Name is not null) PhaseRunOnSkillUse(player, skillId);
+        using var pactScope = pactSpell is null ? null : new GhorrCastScope(pactSpell);
+        using var beidatScope = beidatSpell is null ? null : new BeidatCastScope(beidatSpell);
+        var intensity = CaptureIntensityCast(player, skillId, paidIntensity);
+        using var intensityScope = intensity is null ? null : new IntensityScope(intensity);
+        bool CompleteSupportedUse(bool accepted)
+        {
+            if (!accepted) return false;
+            intensity?.Complete();
+            if (paidMomentum is { } momentum)
+            {
+                double now = AreaTime(player);
+                bool movedDuringUse = movedByCast || (leap is not null && leap.Landing != leap.From)
+                    || player.Walk.ObserveTravel(now) != momentumTravel;
+                GainMomentumOnUse(player, skillId, momentum, action, channelGeneration, now, movedDuringUse);
+            }
+            return true;
+        }
         if (beastCompanion is not null) return true;
         if (channelGeneration is not null)
         {
-            if (!Current()) return false;
+            if (!Current()) { AbortStartedChannel(player, channelGeneration); return false; }
             if (SupportedChannelSeconds(player, skillId) is not double interval)
-            { player.ChannelSkill = 0; player.ChannelGeneration++; player.PaidChannel = null; return false; }
+            { AbortStartedChannel(player, channelGeneration); return false; }
             player.NextChannelHitAt = AreaTime(player) + (IsSnipe(gem.Effect) ? interval / 2 : interval);
-            _ = RunChannel(player, skillId, gem, action, to);
+            _ = RunChannel(player, skillId, gem, action, to, initialCostPaid: true);
+            if (IsChargedDash(player, gem.Effect))
+            {
+                if (SkillsFor(player).IsTravel(gem.Effect))
+                {
+                    QueueFlaskTrigger(player, FlaskEnchantments.Trigger.Travel);
+                    LoyaltyTravelSkillTriggered(player);
+                }
+                return CompleteSupportedUse(true);
+            }
         }
         // The instant's two areas are resolved at the endpoints accepted by the outgoing movement record.
         if (locationInstant) return true;
-        if (gem.Name is not null && (SkillsFor(player).EffectId(gem.Effect) is "DetonateMines" or "GemDetonateMines" or "TriggeredDetonateMines"))
+        if (gem.Name is not null && IsMineDetonation(SkillsFor(player).EffectId(gem.Effect)))
         { DetonateMinesLocked(player, AreaTime(player)); return true; }
         if (placedAdmission is { } placed)
             return await PlaceSkill(player, from, to, placed, recoveryGeneration, Current);
@@ -1334,11 +1772,12 @@ public static partial class Game
         if (gem.Name is not null)
             foreach (var handler in GameEvents.SkillCastAt.For(player))
                 if (handler(player, SkillsFor(player).EffectId(gem.Effect), skillId, to,
-                    () => !player.Closed && PlayerActionCurrent(player, action) && Current()) is { } accepted) return accepted;
+                    () => !player.Closed && PlayerActionCurrent(player, action) && Current()) is { } accepted) return CompleteSupportedUse(accepted);
         if (gem.Name is not null && GameEvents.RunSkillCast(player, SkillsFor(player).EffectId(gem.Effect), skillId, from,
-                () => !player.Closed && PlayerActionCurrent(player, action) && Current()) is { } taken) return taken;
-        if (gem.Name is not null && CurseCatalog.All.ContainsKey(SkillsFor(player).EffectId(gem.Effect) ?? ""))
-            return await CastCurse(player, skillId, to, targetId, recoveryGeneration, Current);
+                () => !player.Closed && PlayerActionCurrent(player, action) && Current()) is { } taken) return CompleteSupportedUse(taken);
+        if (gem.Name is not null && CurseCatalog.All.ContainsKey(SkillsFor(player).EffectId(gem.Effect) ?? "")
+            && !IsTotemSkill(player, skillId))
+            return CompleteSupportedUse(await CastCurse(player, skillId, to, targetId, recoveryGeneration, Current));
         if (gem.Name is not null && IsVaalMinion(SkillsFor(player).EffectId(gem.Effect)))
             return await RepeatSummonCast(player, skillId, recoveryGeneration, Current, false,
                 () => ReleaseVaalMinions(player, skillId, to, Current, targetId));
@@ -1346,36 +1785,56 @@ public static partial class Game
             return await CastMinionUtility(player, skillId, to, targetId, recoveryGeneration, Current);
         if (gem.Name is not null && !IsTotemSkill(player, skillId) && GolemData.Find(SkillsFor(player).EffectId(gem.Effect)) is { } golem)
             return await CastGolem(player, skillId, golem, to, recoveryGeneration, Current);
-        if (gem.Name is not null && !IsTotemSkill(player, skillId) && SkillsFor(player).EffectId(gem.Effect) == "LightningWarp")
-            return ScheduleLightningWarp(player, gem, to, Current, criticalRoll);
+        if (gem.Name is not null && !IsTotemSkill(player, skillId)
+            && IsLightningWarpEffect(SkillsFor(player).EffectId(gem.Effect)))
+            return CompleteSupportedUse(ScheduleLightningWarp(player, gem, to, Current, criticalRoll, vaalUse?.PactDamageMore ?? 1));
+        if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == ShaperMemoryEffect)
+            return CompleteSupportedUse(await CastShaperMemory(player, skillId, to, Current));
+        // A summon's mana is paid at the cast's start and its minion arrives after the cast time, as a totem placement's does: the
+        // next action (the held key's next cast, a walk) must not cancel it, so it takes the placement's gate, not the action token.
         if (gem.Name is not null && !IsTotemSkill(player, skillId) && SummonData.Find(SkillsFor(player).EffectId(gem.Effect)) is { } summon)
-            return await CastSummon(player, skillId, summon, to, targetId, recoveryGeneration, Current);
-        if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == "Desecrate")
-            return await Desecrate(player, skillId, to, Current);
-        if (gem.Name is not null && IsTotemSkill(player, skillId) && TotemVariety(player, gem.Effect) is { } totem)
+            return await CastSummon(player, skillId, summon, to, targetId, recoveryGeneration, TotemPlacementCurrent,
+                plannedCorpse: plannedCorpse);
+        if (gem.Name is not null && IsDesecrateEffect(SkillsFor(player).EffectId(gem.Effect)))
+            return CompleteSupportedUse(await Desecrate(player, skillId, to, Current));
+        if (gem.Name is not null && IsTotemSkill(player, skillId)
+            && TotemVariety(player, gem.Effect, SupportedSkill(player, skillId).Stats) is { } totem)
         {
-            _ = PlaceTotem(player, skillId, gem.Effect, gem.Level, totem, to, TotemPlacementCurrent);
+            _ = PlaceTotem(player, skillId, gem.Effect, gem.Level, totem,
+                TotemPlacementPoint(player, skillId, from, to), TotemPlacementCurrent,
+                vaalUse?.TotemPlacements ?? cooldownUse?.TotemPlacements ?? TotemsPerUse(player, skillId));
             return true;
         }
         if (gem.Name is not null && UseWarcryInstance(player, skillId, gem.Effect)) return true;
         if (gem.Name is not null && IsBrandSkill(player, gem.Effect))
-            return await CastBrand(player, skillId, gem, from, to, recoveryGeneration, Current, criticalRoll);
+            return CompleteSupportedUse(await CastBrand(player, skillId, gem, from, to, recoveryGeneration, Current, criticalRoll));
         if (gem.Name is not null && IsBrandRecall(player, gem.Effect))
-            return await CastBrandRecall(player, skillId, gem, Current);
+            return CompleteSupportedUse(await CastBrandRecall(player, skillId, gem, Current));
         if (gem.Name is not null && IsBrandsurge(player, gem.Effect))
-            return await CastBrandsurge(player, skillId, gem, from, to, recoveryGeneration, Current, criticalRoll);
+            return CompleteSupportedUse(await CastBrandsurge(player, skillId, gem, from, to, recoveryGeneration, Current, criticalRoll));
+        if (gem.Name is not null && SkillsFor(player).EffectId(gem.Effect) == CallOfSteelEffect)
+            return CompleteSupportedUse(ScheduleCallOfSteel(player, skillId, recoveryGeneration, Current));
         if (gem.Name is not null && IsBladefallTrarthus(gem.Effect))
-            return await ActivateBladefallTrarthus(player, skillId);
+            return CompleteSupportedUse(await ActivateBladefallTrarthus(player, skillId));
+        if (vaalUse is not null && SkillsFor(player).EffectId(gem.Effect) == VaalArcticArmourEffect)
+        {
+            StartVaalArcticArmour(player, skillId, CastMs(player, gem.Effect, skillId) ?? SkillsFor(player).CastTimeMs(gem.Effect), AreaTime(player));
+            return true;
+        }
+        if (vaalUse is not null && spellCastMs is int arcCast && SkillsFor(player).EffectId(gem.Effect) == VaalArcEffect)
+        {
+            ScheduleVaalArc(player, gem, to, targetId, sequence, arcCast, swingAt ?? AreaTime(player), vaalUse, Current);
+            return CompleteSupportedUse(true);
+        }
         if (gem.Name is not null && vaalUse is not null && VaalImmortalCallSpell(player, gem.Effect))
         {
             var session = ProjectilesFor(player);
             StartVaalImmortalCall(player, session, skillId, AreaTime(player));
             return true;
         }
-        if (gem.Name is not null && vaalUse is not null && VaalAuras.ContainsKey(SkillsFor(player).EffectId(gem.Effect) ?? ""))
-            return await ActivateVaalAura(player, skillId, Current);
-        if (gem.Name is not null && vaalUse is not null && SkillsFor(player).EffectId(gem.Effect) == "VaalHaste")
-            return await ActivateVaalHaste(player, skillId, Current);
+        if (gem.Name is not null && vaalUse is not null && SkillsFor(player).EffectId(gem.Effect) is { } auraEffect
+            && TimedVaalAuraBuffRows.TryGetValue(auraEffect, out ushort auraRow))
+            return await ActivateTimedVaalAura(player, skillId, auraEffect, auraRow, Current);
         if (gem.Name is not null && IsBlessing(SupportedSkill(player, skillId)))
             return ScheduleBlessing(player, skillId, recoveryGeneration, Current);
         // A guard skill cast from the skill bar starts its buff in CastSelfBuff. An instant cast passes guardStart, and
@@ -1383,36 +1842,62 @@ public static partial class Game
         // the send gate first. Its readiness was admitted before any cost or cooldown use was spent (Cooldowns.cs).
         if (gem.Name is not null && guardStart is not null && GuardSpellEffect(SkillsFor(player).EffectId(gem.Effect)))
             return true;
+        if (spellCastMs is int pactCast && IsPactSkill(player, gem.Effect))
+            return CompleteSupportedUse(SchedulePact(player, skillId, to == from ? null : to, pactCast,
+                recoveryGeneration, swingAt, Current));
+        if (spellCastMs is int frozenCast && IsFrozenLegionEffect(SkillsFor(player).EffectId(gem.Effect)))
+            return CompleteSupportedUse(ScheduleFrozenLegion(player, gem, from, to, sequence, frozenCast,
+                recoveryGeneration, swingAt, cooldownUse, Current));
         // The self buffs a player casts by hand: the guards, Phase Run, Blood Rage.
         if (gem.Name is not null && await CastSelfBuff(player, skillId, gem.Effect)) return true;
         if (gem.Name is not null && IsRighteousFire(gem.Effect))
             await ActivateRighteousFire(player, skillId, gem.Effect, gem.Level, gem.Quality, gem.Gem);
         else
-            await LaunchProjectile(player, skillId, from, to, recoveryGeneration, targetId, sequence: sequence,
+            await LaunchProjectileForUse(player, onShieldChargeReady, skillId, from, to, recoveryGeneration, targetId, sequence: sequence,
                 actionToken: actionToken, cooldownUse: cooldownUse, criticalRoll: criticalRoll, channelGeneration: channelGeneration,
-                swingAt: cooldownUse?.Attack?.At ?? swingAt, leap: leap);
-        return true;
+                swingAt: cooldownUse?.Attack?.At ?? swingAt, leap: leap, previousNextAttackAt: reservedNextAttackAt,
+                doubleStrikePairs: doubleStrikePairs, useDamageMore: vaalUse?.PactDamageMore
+                    ?? LyciaDamageMore(player, skillId, channelGeneration));
+        return CompleteSupportedUse(true);
     }
 
     // Record only after payment/cooldown/effect admission. The instant-location path calls this after its own
     // final 0x1ce at-gate commit, so a stale or cancelled Frostblink cannot activate a recent event.
-    static void RecordAcceptedGemUse(Player player, int effect) =>
-        RecordAcceptedGemUseAt(player, effect, AreaTime(player));
+    static void RecordAcceptedGemUse(Player player, int effect, (int X, int Y) aim, bool activated = true) =>
+        RecordAcceptedGemUseAt(player, effect, aim, AreaTime(player), activated);
 
-    static void RecordAcceptedGemUseAt(Player player, int effect, double acceptedAt)
+    const string UsedTravelSkillRecently = "used_travel_skill";
+
+    const string NonInstantCastHistory = "non_instant_cast_history";
+    internal static readonly uint NonInstantAttackMore = Stat.Of("virtual_attack_hit_damage_+%_final");
+
+    static void RecordNonInstantSpellUseLocked(Player player, int effect, double now)
     {
-        player.RecentEvents.Record(StatConditions.UsedSkill, acceptedAt);
-        SiphoningSkillUsedLocked(player, acceptedAt);
+        player.RecentEvents.RecordIndexed(NonInstantCastHistory, effect, now, RecentEvents.EightSecondWindow);
+        if (player.StatSourcesCache?.Sources is { } sources
+            && (sources.GetValueOrDefault(Stat.CastSpeedPlusPctPerNumUniqueSpellsCastRecently) != 0
+                || sources.GetValueOrDefault(Stat.InquisitorAttackDamagePlusPctFinalPerNonInstantSpellCastIn8SecondsMax30Pct) != 0))
+            MarkPlayerStats(player, PlayerStatStep.Sources);
+    }
+
+    internal static void RecordAcceptedGemUseAt(Player player, int effect, (int X, int Y) aim, double acceptedAt, bool activated = true)
+    {
+        RecordUsedSkillLocked(player, acceptedAt, effect, activated);
         bool movement = SkillsFor(player).IsMovement(effect);
         if (movement) player.RecentEvents.Record(StatConditions.UsedMovementSkill, acceptedAt);
+        if (SkillsFor(player).IsTravel(effect)) player.RecentEvents.Record(UsedTravelSkillRecently, acceptedAt);
         if (movement && IsDashEffect(SkillsFor(player).EffectId(effect)))
             player.RecentEvents.Record(StatConditions.UsedDash, acceptedAt);
         if (SkillsFor(player).HasType(effect, "Fire"))
             player.RecentEvents.Record(StatConditions.UsedFireSkill, acceptedAt);
         if (SkillsFor(player).HasType(effect, "Cold"))
             player.RecentEvents.Record(StatConditions.UsedColdSkill, acceptedAt);
+        if (SkillsFor(player).HasType(effect, "Minion"))
+            player.RecentEvents.Record(UsedMinionSkillRecently, acceptedAt);
         if (SkillsFor(player).IsBrand(effect))
             RecordBrandSkillUsedLocked(player, acceptedAt);
+        SpiritBurstOnSkillUse(player, aim, acceptedAt);
+        TriggerCraftedWeaponSpells(player, aim, acceptedAt);
     }
 
     // Lockstep instant replies join the ordinary action sequence. At 0x14219c1f0, flag 0x100 reaches
@@ -1437,14 +1922,23 @@ public static partial class Game
             await UseInstantSkillAtLocation(player, skillId, default, targetId);
             return;
         }
-        if (gem.Name is null || !ObjectInstantSupported(player, gem.Effect)) return;
+        if (gem.Name is null || !ObjectInstantSupported(player, gem.Effect, skillId)) return;
         var cooldownPlan = CooldownForSkill(player, skillId);
         int epoch;
         epoch = player.ProjectileEpoch;
         if (!player.ProjectileActive(epoch) || player.Paused || !player.Connection.PlayerSent || player.PendingTransfer is not null) return;
         if (!TryBeginSkillCooldownUse(player, skillId, gem.Effect,
             cooldownPlan,
-            true, () => { }, out var cooldownUse)) return;
+            true, () => { }, out var cooldownUse))
+        {
+            // A press the running guard refuses still made the client predict a sweep of its own; a zero-rate entry
+            // that follows it freezes it, as the accepted path's does behind the instant action (issue #1127).
+            if (guard)
+                _ = player.Frames.Run(() => Send(player, [],
+                    "0x02bc guard cooldown re-held after a refused press",
+                    atGate: () => HeldGuardCooldownRefresh(player)));
+            return;
+        }
         // The guard starts after the instant action, so the action's record carries no guard work before it and the
         // guard's one lock entry goes out right behind it (StartGuard publishes it).
         Action? guardStart = guard
@@ -1464,6 +1958,7 @@ public static partial class Game
             // it freezes again; the remaining time stays full throughout, so neither flicker moves the ring.
             if (guard && GuardCooldownPreEntry(player, skillId, gem.Effect) is { Length: > 0 } preEntry)
                 await Send(player, preEntry, "0x02bc guard cooldown held before its instant action");
+            bool committed = false;
             await SendWorldRecord(player, player.Id, [],
                 $"0x01ce player skill 0x{skillId:x4}: instant action (its use and cooldown)",
                 atGate: () =>
@@ -1471,15 +1966,32 @@ public static partial class Game
                     if (!player.ProjectileActive(epoch) || player.PlayerLife <= 0 || player.Paused
                         || ActorSkillInstanceDisabled(player, gem.Effect, skillId) is not null
                         || cooldownUse?.CommitNativeUse(player, skillId) == false) return null;
+                    committed = true;
                     return PlayerInstantAction(player, skillId, at, targetId);
                 });
-            guardStart?.Invoke();
+            if (committed) guardStart?.Invoke();
             await SendNativeCooldownRefresh(player);
+            // The client's own use refresh may run after the guard's held entry: S→C 0x1ce waits for the area frame
+            // while the held send goes out at once, so the action consumes that entry and starts its sweeping
+            // prediction with nothing left to freeze it (live 2026-11-25: the ring swept through a whole buff and
+            // restarted when it ended). Publish the held entry again once that refresh has run; a zero-rate entry
+            // that follows the prediction freezes it without restarting its animation (#1127).
+            if (guard && committed)
+                _ = Task.Delay(4 * FrameMs + 16).ContinueWith(_ =>
+                {
+                    if (player.Closed || player.LeavingArea || !player.ProjectileActive(epoch)) return;
+                    _ = player.Frames.Run(() => Send(player, [],
+                        "0x02bc guard cooldown re-held after its instant action",
+                        atGate: () => HeldGuardCooldownRefresh(player)));
+                });
         }
     }
 
-    static bool ObjectInstantSupported(Player player, int effect) =>
+    static bool ObjectInstantSupported(Player player, int effect, ushort skillId) =>
         InstantLocationSkill.ObjectTargetSupported(SkillsFor(player), effect) || InPlaceSelfBuff(player, effect)
+        // Blasphemy makes its linked hex an instant reservation without changing the base effect's types.
+        || CurseCatalog.Hex(SkillsFor(player).EffectId(effect))
+            && SupportedSkill(player, skillId).Supports.Any(s => IsBlasphemySupport(s.Effect.Id))
         // The client's 0x2064 (skill_is_instant) is what EffectStats publishes from IsInstant; reading the type here
         // skips a full supported-skill stat build (51 ms on a live press, measured 2026-11-18).
         || !SkillsFor(player).IsMovement(effect) && (SkillsFor(player).IsInstant(effect)
@@ -1494,7 +2006,7 @@ public static partial class Game
         if (!InstantLocationSkill.Supported(SkillsFor(player), gem.Effect))
         {
             // A self buff aimed at empty ground uses 0x190 too; it still applies at its caster.
-            if (ObjectInstantSupported(player, gem.Effect))
+            if (ObjectInstantSupported(player, gem.Effect, skillId))
                 await UseInstantSkill(player, skillId, player.Id, player.Walk.Position(AreaTime(player)));
             return;
         }
@@ -1547,7 +2059,7 @@ public static partial class Game
             });
         if (accepted)
         {
-            RecordAcceptedGemUse(player, gem.Effect);
+            RecordAcceptedGemUse(player, gem.Effect, to);
             if (SkillsFor(player).IsTravel(gem.Effect)) { QueueFlaskTrigger(player, FlaskEnchantments.Trigger.Travel); LoyaltyTravelSkillTriggered(player); }
             await FrostblinkAreas(player, gem, from, to, cooldownUse);
             await SendNativeCooldownRefresh(player);
@@ -1576,6 +2088,52 @@ public static partial class Game
                 immediate: true, cooldownUse: use, criticalRoll: crit, sacrifice: sacrifice);
     }
 
+    static async Task FrostblinkWintryBlastCast(Player player, ushort skillId,
+        (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, (int X, int Y) aim, uint? targetId,
+        int repeat, int? actionToken, CooldownUseTicket? cooldownUse, SkillCriticalRoll? criticalRoll,
+        SacrificeUse sacrifice, double repeatDelay, double damageMore, double? swingAt)
+    {
+        int? castDuration = CastMs(player, gem.Effect, skillId);
+        if (castDuration is null) return;
+        double delay = castDuration.Value / 1000.0
+            * (repeat + Animations.SpellAreaRelease(SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject))
+            + repeatDelay;
+        if (swingAt is { } swung) delay -= AreaTime(player) - swung;
+        await AreaDelay(player, Math.Max(0.05, delay));
+        await WhilePaused(player);
+        (int X, int Y) origin, landing;
+        using (ProjectileMutation(player))
+        {
+            if (player.Closed || player.LeavingArea || player.PlayerLife <= 0 || InTown(player)) return;
+            if (cooldownUse is not null ? !cooldownUse.Current(player) : actionToken is int token && player.ActionCount != token)
+                return;
+            double now = ProjectileWorldTime(player);
+            origin = player.Walk.Position(now);
+            var own = SupportedSkill(player, skillId).Stats;
+            var playerStats = CharacterPlayerStats(player);
+            int travelPct = GolemStat(own, Stat.SkillMaximumTravelDistancePlusPct)
+                + GolemStat(playerStats, Stat.SkillMaximumTravelDistancePlusPct);
+            var resolvedAim = aim;
+            if (targetId is uint tid && player.Area.Monsters.TryGetValue(tid, out var target)
+                && !target.Dead && target.Life > 0 && target.Variety is { ObjectSize: >= 1 and <= 128 } variety)
+            {
+                var targetPos = target.Walk.Position(now);
+                if (InstantLocationSkill.ObjectAim(origin, targetPos, 1, variety.ObjectSize - 1) is { } trace)
+                    resolvedAim = trace.End;
+                else
+                    resolvedAim = targetPos;
+            }
+            if (!InstantLocationSkill.TryResolveLanding(player, origin, resolvedAim, travelPct, allowTerrainFallback: true, out landing))
+                landing = origin;
+            if (landing != origin)
+                player.Walk.Teleport(landing.X, landing.Y, now);
+        }
+        foreach (var centre in landing != origin ? new[] { origin, landing } : new[] { origin })
+            await AreaSkillHit(player, skillId, gem, centre, centre, immediate: true,
+                actionToken: actionToken, cooldownUse: cooldownUse, criticalRoll: criticalRoll,
+                repeat: repeat, sacrifice: sacrifice, damageMore: damageMore);
+    }
+
     // Aura skills toggle: the first cast reserves their mana and puts their buff on the player, the next cast turns them
     // off. The reserved mana is sent in the Life pool and in every later 0x1b1 mana update; the client does not derive it.
     public static async Task<bool> ToggleAura(Player player,
@@ -1593,16 +2151,22 @@ public static partial class Game
         AuraCatalog.Aura? started = null;
         // Locked commit backstop: a source may have changed after dispatch/cooldown preflight.
         if (player.Closed || player.LeavingArea || player.PlayerLife == 0 || InTown(player)
-            || OwnAuraSkillRestricted(player, effect, skillId) || CastingSpell(player, effect) && SpellsDisabled(player)) return false;
+            || EternalBlessingDisables(player, skillId) || OwnAuraSkillRestricted(player, effect, skillId)
+            || CastingSpell(player, effect) && SpellsDisabled(player)) return false;
+        var supported = SupportedSkill(player, skillId);
         if (effectId == "TemporalRift" && player.Auras.ContainsKey(skillId))
         {
             var packets = RecallTemporalRiftLocked(player);
-            if (packets.Length > 0) player.Minions.OutputQueue.Add(new(packets, "Temporal Rift recalls resources and position"));
+            if (packets.Length == 0) return false;
+            player.Minions.OutputQueue.Add(new(packets, "Temporal Rift recalls resources and position"));
             started = player.Auras[skillId];
         }
         else if (player.Auras.Remove(skillId, out var old))
         { ended = old; EndReservationRuntimeLocked(player, old); }
-        else if (player.Auras.Values.FirstOrDefault(a => a.EffectId == effectId) is { } same)
+        else if (player.Auras.Values.FirstOrDefault(a => a.EffectId == effectId) is { } same
+            && !(IsBlessingSkill(supported) && IsBlessingAura(same))
+            && !(supported.Stats.GetValueOrDefault(Stat.SkillAuraAlsoDisablesNonBlessingManaReservationSkills) != 0
+                && AuraSupport(player, skillId).AffectsSelf && OrdinaryManaAura(same)))
         {
             // One aura of a kind at a time: a second gem of the same aura can't start it.
             Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {name}: refused, {same.Name} already runs (skill 0x{same.SkillId:x4})");
@@ -1612,7 +2176,7 @@ public static partial class Game
             return false;
         else
         {
-            var supported = SupportedSkill(player, skillId);
+            if (!GuardianBlessingAvailableLocked(player, supported)) return false;
             var (supportEffect, affectsSelf) = AuraSupport(player, skillId);
             var context = ReservationContext(player, skillId);
             string? stance = AuraCatalog.IsStance(effectId) ? player.Stance : null;
@@ -1627,11 +2191,17 @@ public static partial class Game
                 SkillStats: [.. supported.Stats.Select(kv => (kv.Key, kv.Value))],
                 SupportEffectPct: supportEffect, AffectsSelf: affectsSelf, Stance: stance,
                 ReservesLife: context.Life, ReservationEfficiencyPct: context.Efficiency, IsHerald: IsHeraldAura(effectId),
-                ArtVariation: artVariation, HideVisual: hideVisual, SourceVisual: sourceVisual, BuffVisual: buffVisual);
-            var proposedAuras = player.Auras.Values.Append(aura).ToArray();
+                ArtVariation: artVariation, HideVisual: hideVisual, SourceVisual: sourceVisual, BuffVisual: buffVisual)
+                { FixedManaReservation = reservation.FixedMana };
+            aura = WithCasterAuraStamps(player, aura, CharacterStatSources(player).Stats);
+            bool blessing = IsBlessingAura(aura);
+            bool eternal = EternalBlessingAura(aura);
+            var proposedAuras = player.Auras.Values.Where(a => (!blessing || !IsBlessingAura(a))
+                && (!eternal || !OrdinaryManaAura(a))).Append(aura).ToArray();
             long reserved = (long)AuraCatalog.RequiredMana(player.Pools, proposedAuras)
-                + PetrifiedBlood.RequiredMana(player.Pools, player.PetrifiedBlood)
-                + PlacedSkills.Reserved(player.Pools, player.Placed.All.Values, false);
+                + (eternal ? 0 : PetrifiedBlood.RequiredMana(player.Pools, player.PetrifiedBlood))
+                + PlacedSkills.Reserved(player.Pools, player.Placed.All.Values, false)
+                + CooldownTriggerReservation(player, life: false);
             var lifeReservation = LifeReservationFor(player, proposedAuras);
             int requiredLife = lifeReservation.Required;
             if (reserved > player.Pools.Mana || requiredLife >= player.Pools.Life)
@@ -1640,11 +2210,16 @@ public static partial class Game
                     $"{requiredLife} life reserved, maximum is {player.Pools.Mana} mana and {player.Pools.Life} life");
                 return false;
             }
+            if (blessing) EndOtherBlessingsLocked(player);
             player.Auras[skillId] = aura;
+            StartGuardianBlessingLocked(player, aura, supported);
+            if (eternal) SuspendManaReservedAurasLocked(player);
             started = aura;
             ClampReservedResources(player);
+            PhaseRunOnSkillUse(player, skillId);
         }
         player.Pools = PoolsFor(player, player.Pools.Level);
+        player.EnergyShield.SetMaximum(player.Pools.EnergyShield);
         player.ApplyMovementSpeed();
         player.AuraStatsDirty = true;
         CharacterSaves.SetAuraActive(CharacterName(player), effectId, started is not null);
@@ -1653,22 +2228,33 @@ public static partial class Game
         await SendCharacterStats(player, PlayerStatChange.Auras);
         await SendPlayerMana(player,
             $"0x01b1 player mana {player.PlayerMana}/{player.Pools.Mana}, {ReservedMana(player)} reserved");
+        await SendPlayerEnergyShield(player);
+        // The toggle's skill refresh can empty the aura's own bound slot (live 2026-11-22: Malevolence with Eternal
+        // Blessing left Q), and the full refresh above resends the skill list without the bar, so the saved bar goes out
+        // again after it — forced, because the bar can read the same while a slot still has to be restored.
+        await RestoreSkillBarAfterActorUpdate(player, force: true);
         return true;
     }
 
+    static ushort OwnAuraBuffTag(AuraCatalog.Aura aura) =>
+        aura.EffectId == "VaalDiscipline" ? (ushort)BuffTag.VaalAura :
+        StanceCatalog.SourceFamily(aura.EffectId) == StanceCatalog.BloodAndSand
+            ? (ushort)BuffTag.BloodAndSand : (ushort)0;
+
     public static IEnumerable<Buff> AuraBuffs(uint id, AuraCatalog.Aura aura, double? seconds = null)
     {
+        ushort tag = OwnAuraBuffTag(aura);
         if (seconds is not double duration)
         {
-            foreach (var buff in AuraCatalog.Buffs(aura, id, Skills.ActionHash(aura.Effect), aura.AffectsSelf ? null : (byte?)0))
+            foreach (var buff in AuraCatalog.Buffs(aura, id, Skills.ActionHash(aura.Effect), aura.AffectsSelf ? null : (byte?)0, tag))
                 yield return buff;
             yield break;
         }
         if (aura.SourceBuff is not null)
-            yield return new(aura.BuffRow, id, aura.SkillId, AuraSource: true, DisplayState: 0, Visual: aura.SourceVisual);
+            yield return new(aura.BuffRow, id, aura.SkillId, AuraSource: true, DisplayState: 0, Visual: aura.SourceVisual, Tag: tag);
         yield return new(aura.BuffRow, id, aura.SkillId, U68: Buff.Seconds(duration),
-            ActiveSkill: Skills.ActionHash(aura.Effect) is ushort hash ? (aura.SkillId, hash) : null,
-            Visual: aura.BuffVisual);
+            ActiveSkill: tag != (ushort)BuffTag.VaalAura && Skills.ActionHash(aura.Effect) is ushort hash ? (aura.SkillId, hash) : null,
+            Visual: aura.BuffVisual, Tag: tag);
     }
 
     public static async Task DisableReservations(Player player, string name)
@@ -1717,7 +2303,15 @@ public static partial class Game
     public static Task LaunchProjectile(Player player,
         ushort skillId, (int X, int Y) from, (int X, int Y) to, int recoveryGeneration, uint targetId = 0, ushort sequence = 0,
         int? actionToken = null, CooldownUseTicket? cooldownUse = null, SkillCriticalRoll? criticalRoll = null,
-        int? channelGeneration = null, double? swingAt = null, LeapSlam.Use? leap = null)
+        int? channelGeneration = null, double? swingAt = null, LeapSlam.Use? leap = null) =>
+        LaunchProjectileForUse(player, null, skillId, from, to, recoveryGeneration, targetId, sequence, actionToken,
+            cooldownUse, criticalRoll, channelGeneration, swingAt, leap);
+
+    static Task LaunchProjectileForUse(Player player, Action<Action>? onShieldChargeReady,
+        ushort skillId, (int X, int Y) from, (int X, int Y) to, int recoveryGeneration, uint targetId = 0, ushort sequence = 0,
+        int? actionToken = null, CooldownUseTicket? cooldownUse = null, SkillCriticalRoll? criticalRoll = null,
+        int? channelGeneration = null, double? swingAt = null, LeapSlam.Use? leap = null, double? previousNextAttackAt = null,
+        DoubleStrikePairs? doubleStrikePairs = null, double useDamageMore = 1)
     {
         var gem = GemSkillEffects(player).FirstOrDefault(g => g.Id == skillId);
         if (gem.Name is null) return Task.CompletedTask;
@@ -1727,54 +2321,88 @@ public static partial class Game
         OverheatConsumeLocked(player, skillId,
             name => name is var key ? overheatStats.GetValueOrDefault(key) : 0,
             AreaTime(player));
-        if (ArrowRain(SkillsFor(player).EffectId(gem.Effect)))
+        var effectId = SkillsFor(player).EffectId(gem.Effect);
+        if (ArrowRain(effectId))
         {
             var rainCritical = criticalRoll ?? CaptureSkillCriticalRoll(player, skillId);
             var session = ProjectilesFor(player);
             session.Advance();
             var source = SupportedSkill(player, skillId);
-            double release = (swingAt ?? AreaTime(player)) + AttackReleaseDelay(AttackContactDelay(player, SupportedAttackSeconds(player, skillId), false));
+            double start = swingAt ?? AreaTime(player);
+            double release = start + AttackReleaseDelay(AttackContactDelay(player, SupportedAttackSeconds(player, skillId), false));
             session.Runtime.Schedule(Math.Max(session.Runtime.Now, GameServer.Core.Projectiles.ProjectileRuntime.Time(release)), () =>
             {
                 if (session.Active && player.PlayerLife > 0 && player.ActionInterruptionGeneration == recoveryGeneration
                     && SameTriggerSource(source, SupportedSkill(player, skillId)) && GemSkillInstanceDisabled(player, gem.Effect, skillId) is null)
-                    ReleaseArrowRain(session, skillId, gem, to, rainCritical, sequence);
+                    ReleaseArrowRain(session, skillId, gem, to, rainCritical, sequence, actionStart: start);
             });
             return Task.CompletedTask;
         }
-        // Shield Charge hits along its own walk and where it ends (RunShieldCharge), not once where it started.
-        if (ShieldChargeBonusPct(player, skillId, gem.Effect) != 0) return Task.CompletedTask;
         // Winter Orb's orb fires its own volleys while the channel runs (WinterOrb.cs), not once at the cast.
         if (IsWinterOrb(gem.Effect)) return Task.CompletedTask;
         // Snipe charges stages while channelling and fires on release (Snipe.cs), not at channel start.
         if (IsSnipe(gem.Effect)) return Task.CompletedTask;
-        bool cryExerted;
-        cryExerted = ConsumeIntimidatingCryExertLocked(player,
-            channelGeneration is null && IntimidatingCryCanExert(player, skillId, gem.Effect));
+        if (IsChannelledScourgeArrow(gem.Effect)) return Task.CompletedTask;
         criticalRoll ??= CaptureSkillCriticalRoll(player, skillId);
+        var (cryExerted, seismicArea, ancestralTargets, rallyingDamage) = ConsumeMeleeWarcryExertsLocked(player, skillId, gem.Effect, criticalRoll,
+            eligible: channelGeneration is null);
+        // The paid charge owns one exertion decision for every path hit and its landing.
+        int chargeBonus = ShieldChargeBonusPct(player, skillId, gem.Effect);
+        if (chargeBonus != 0)
+        {
+            void StartCharge()
+            {
+                int chargeAction = actionToken ?? player.ActionCount;
+                int token = BeginShieldCharge(player, skillId, chargeBonus, to.X, to.Y, AreaTime(player), chargeAction,
+                    out bool charged, targetObjectId: targetId, previousNextAttackAt: previousNextAttackAt);
+                _ = RunShieldChargeHits(player, token, charged, skillId, sequence, chargeAction, cooldownUse, cryExerted, criticalRoll, rallyingDamage);
+            }
+            if (onShieldChargeReady is null) StartCharge();
+            else onShieldChargeReady(StartCharge);
+            return Task.CompletedTask;
+        }
+        if (IsWhirlingBlades(effectId))
+        {
+            ScheduleWhirlingBlades(player, gem, from, to, sequence, actionToken ?? player.ActionCount,
+                recoveryGeneration, cooldownUse, swingAt, criticalRoll, cryExerted, rallyingDamage);
+            return Task.CompletedTask;
+        }
+        if (IsBaseChainHook(effectId))
+            return ScheduleBaseChainHook(player, skillId, gem, to, targetId, recoveryGeneration,
+                actionToken ?? player.ActionCount, sequence, swingAt, cooldownUse, criticalRoll, cryExerted, rallyingDamage);
+        var supported = SupportedSkill(player, skillId);
+        var traumaUse = channelGeneration is null ? TraumaUseFor(player, supported) : null;
         if (GatewayProjectileSkillProfiles.IsMoltenStrike(SkillsFor(player).EffectId(gem.Effect)))
             return ScheduleMoltenStrike(player, skillId, gem, from, to, recoveryGeneration,
-                targetId, sequence, actionToken, cooldownUse, criticalRoll, swingAt);
-        if (IsLightningStrike(gem.Effect))
-            return ScheduleLightningStrike(player, skillId, gem, from, to, targetId,
+                targetId, sequence, actionToken, cooldownUse, criticalRoll, swingAt, cryExerted, ancestralTargets, rallyingDamage, traumaUse);
+        if (IsLightningStrike(gem.Effect) || IsFrostBlades(gem.Effect) || IsWildStrike(gem.Effect))
+            return ScheduleProjectileStrike(player, skillId, gem, from, to, targetId,
                 recoveryGeneration, cooldownUse, criticalRoll,
-                sequence, swingAt, cryExerted);
+                sequence, swingAt, cryExerted, ancestralTargets, rallyingDamage, traumaUse);
         if (IsSmite(gem.Effect))
             return ScheduleSmite(player, skillId, gem, from, to, targetId,
-                recoveryGeneration, cooldownUse, criticalRoll, sequence, swingAt, cryExerted);
-        var supported = SupportedSkill(player, skillId);
+                recoveryGeneration, cooldownUse, criticalRoll, sequence, swingAt, cryExerted, ancestralTargets, rallyingDamage, traumaUse);
+        if (IsStaticStrike(gem.Effect))
+            return ScheduleStaticStrike(player, skillId, gem, from, to, targetId,
+                recoveryGeneration, cooldownUse, criticalRoll, sequence, swingAt, cryExerted, ancestralTargets, rallyingDamage, traumaUse);
+        if (IsBoneshatter(gem.Effect))
+            return ScheduleBoneshatter(player, skillId, gem, from, to, targetId,
+                recoveryGeneration, cooldownUse, criticalRoll, sequence, swingAt, cryExerted, ancestralTargets, rallyingDamage, traumaUse);
+        var beidat = CastingBeidatSpell(player, skillId);
         int seals = UnleashSeals(player, skillId, supported, ProjectileWorldTime(player), spend: true);
         double reoccurrenceMore = Math.Max(0, 1 + GolemStat(supported.Stats, Stat.SupportSpellRapidFireRepeatUseDamagePlusPctFinal) / 100d);
-        if (UsesProjectileRuntime(gem.Effect) && !IsVolcanicFissure(gem.Effect))
+        if (UsesProjectileRuntime(gem.Effect) && !IsVolcanicFissure(gem.Effect)
+            && !CremationEffect(SkillsFor(player).EffectId(gem.Effect)))
             return ScheduleGemProjectile(player, skillId, gem, to,
                 actionToken ?? cooldownUse?.ActionToken ?? player.ActionCount, recoveryGeneration, cooldownUse, criticalRoll,
-                sequence, swingAt, cryExerted, seals, reoccurrenceMore);
+                sequence, swingAt, cryExerted, seals, reoccurrenceMore, rallyingDamage);
         // A channelled skill (Cyclone, ActiveSkillType 47) hits as it starts: its spin is already in motion, and the later
         // sweeps follow on the attack timer (RunChannel).
         bool channelled = Supports.Of(gem.Effect)?.Types.Contains(47) == true;
         // A spell's repeats (SpellRepeats) land again a cast time apart, with the use's critical roll; a melee attack's
         // Multistrike repeats are swings of the same paid use, each a full attack time apart.
-        int spellRepeats = SpellRepeats(player, skillId, gem.Effect);
+        int spellRepeats = Math.Max(0, SpellRepeats(player, skillId, gem.Effect)
+            - ShockNovaProcessionRepeats(player, gem.Effect, gem.Level, gem.Quality));
         int meleeRepeats = channelled || spellRepeats > 0 ? 0 : MeleeAttackRepeats(player, skillId);
         double repeatInterval = meleeRepeats > 0 ? SupportedAttackSeconds(player, skillId, sequence) : 0;
         if (meleeRepeats > 0) actionToken ??= player.ActionCount;
@@ -1782,7 +2410,8 @@ public static partial class Game
         double? repeatRuthless = repeatStats is null ? null : RuthlessBlowMore(player, skillId,
             key => repeatStats.GetValueOrDefault(key));
         // Fist of War: every ancestral_slam_interval_duration the next slam use is the big hit (more damage and area).
-        double fistMore = 1, fistRadius = 1;
+        double fistMore = 1;
+        double radiusMore = seismicArea is int extraArea ? SkillArea.RadiusMultiplier(extraArea) : 1;
         bool spell = SkillsFor(player).IsSpell(gem.Effect);
         if (!spell && !channelled)
         {
@@ -1798,56 +2427,100 @@ public static partial class Game
                 if (ready)
                 {
                     fistMore = 1 + Fist(Stat.SupportAncestralSlamBigHitDamageWithHitsAndAilmentsPlusPctFinal) / 100.0;
-                    fistRadius = SkillArea.RadiusMultiplier(Fist(Stat.SupportAncestralSlamBigHitAreaPlusPct));
+                    radiusMore *= SkillArea.RadiusMultiplier(Fist(Stat.SupportAncestralSlamBigHitAreaPlusPct));
                 }
             }
         }
         if (leap is not null && IsLeapSlam(player, gem.Effect))
             return ScheduleLeapSlam(player, skillId, gem, leap, criticalRoll,
-                sequence, fistMore, fistRadius);
+                sequence, fistMore, radiusMore, cryExerted, seismicArea.HasValue, rallyingDamage);
         var sacrifice = new SacrificeUse(player, skillId, gem.Effect, gem.Gem);
         // Spell Cascade: the spell also lands in the areas beside the target, one per side along the aim and, with
         // support_spell_cascade_sideways, one per side across it. Each centre is one effective radius from the aim
         // (live 2026-11-04: Reap at the character's area of effect had radius 28.5 and repeats 28-29 cells apart; the
         // client draws each effect half a radius toward the caster, so the hit centre is the aim +- one radius).
-        var cascadeAreas = new List<(int X, int Y)>();
-        {
-            var cascadeStats = SupportedSkill(player, skillId).Stats;
-            int Cascade(uint key) => cascadeStats.GetValueOrDefault(key);
-            int sides = spell ? Cascade(Stat.SupportSpellCascadeNumberOfCascadesPerSide) : 0;
-            double dx = to.X - from.X, dy = to.Y - from.Y;
-            double length = Math.Sqrt(dx * dx + dy * dy);
-            if (sides > 0 && length > 0)
-            {
-                int radius = SkillRadius(player, cascadeStats, spell, gem.Effect);
-                bool sideways = Cascade(Stat.SupportSpellCascadeSideways) != 0;
-                double ax = dx / length, ay = dy / length;
-                for (int side = 1; side <= sides && radius > 0; side++)
-                {
-                    int alongX = (int)Math.Round(ax * radius * side), alongY = (int)Math.Round(ay * radius * side);
-                    cascadeAreas.Add((to.X + alongX, to.Y + alongY));
-                    cascadeAreas.Add((to.X - alongX, to.Y - alongY));
-                    if (sideways)
-                    {
-                        cascadeAreas.Add((to.X - alongY, to.Y + alongX));
-                        cascadeAreas.Add((to.X + alongY, to.Y - alongX));
-                    }
-                }
-            }
-        }
+        List<(int X, int Y)> cascadeAreas = spell ? SpellCascadeAreas(player, gem.Effect, supported.Stats, from, to) : [];
+        if (beidat is { ExtraAreas: > 0 })
+            AppendBeidatAreas(player, gem.Effect, supported.Stats, from, to, beidat.ExtraAreas, cascadeAreas);
         var jobs = new List<Task>();
         // Discharge: one use, one count of its charges, for every repeat and cascade area (DischargeUse).
         var discharge = DischargeUseFor(player, gem.Effect, gem.Level, gem.Quality);
         bool darkBargain = IsDarkBargain(player, gem.Effect);
+        bool arc = PlacedArcPayload(SkillsFor(player).EffectId(gem.Effect));
+        bool wintryBlast = SkillsFor(player).EffectId(gem.Effect) == "FrostblinkAltX";
         // Storm Call sets a marker at every landing (each repeat and cascade area) that strikes later (StormCall.cs).
         bool stormCall = IsStormCall(SkillsFor(player).EffectId(gem.Effect));
+        var timedAreaCast = TimedAreaSpellEffect(SkillsFor(player).EffectId(gem.Effect)) ? CastMs(player, gem.Effect, skillId) : null;
+        var firestorm = IsFirestorm(player, gem.Effect) && CastMs(player, gem.Effect, skillId) is int stormCast
+            ? (Session: ProjectilesFor(player), Cast: stormCast) : ((ProjectileSession Session, int Cast)?)null;
+        bool CanReleaseTimedSpell() => cooldownUse?.Current(player) ?? (actionToken is null || player.ActionCount == actionToken);
+        if (doubleStrikePairs is { } pairs) return PlayDoubleStrikePairs(pairs);
+
+        async Task PlayDoubleStrikePairs(DoubleStrikePairs use)
+        {
+            double pairAt = use.Start;
+            for (int pair = 0; pair < use.Durations.Length; pair++)
+            {
+                double duration = use.Durations[pair];
+                if (pair > 0)
+                {
+                    await AreaDelay(player, Math.Max(0, pairAt - AreaTime(player)));
+                    await WhilePaused(player);
+                    if (!CanReleaseTimedSpell() || player.ActionInterruptionGeneration != recoveryGeneration
+                        || !PlayerStateAllowsAction(player)) break;
+                    if (CurrentPlayerSkillSourceLocked(player, skillId) is not { Active: true } source
+                        || source.Effect != gem.Effect || source.Gem != gem.Gem) break;
+                    BeginDoubleStrikePair(player, use.Maximum, AreaTime(player));
+                }
+                jobs.Add(AreaSkillHitForUse(repeatRuthless, player, skillId, gem, from, to,
+                    sequence: sequence, actionToken: actionToken, cooldownUse: cooldownUse, criticalRoll: criticalRoll,
+                    targetId: targetId, repeat: pair, swingAt: pairAt, sacrifice: sacrifice, cryExerted: cryExerted,
+                    damageMore: MeleeRepeatDamageMore(player, skillId, pair), strikeSeconds: duration, ancestralTargets: ancestralTargets,
+                    rallyingDamage: rallyingDamage, traumaUse: traumaUse));
+                pairAt += duration;
+            }
+            await Task.WhenAll(jobs);
+        }
+        if (SkillsFor(player).EffectId(gem.Effect) == VaalReaveEffect)
+            StartVaalReave(player, supported.Stats);
         double sealGap = seals == 0 ? 0 : (CastMs(player, gem.Effect, skillId) ?? 0) / 10000d;
         for (int release = 0; release <= Math.Max(spellRepeats, meleeRepeats) + seals; release++)
         {
             int repeat = Math.Max(0, release - seals);
             bool reoccurrence = release > 0 && release <= seals;
             double sealDelay = Math.Min(release, seals) * sealGap;
-            double more = reoccurrence ? reoccurrenceMore : 1;
+            double more = useDamageMore * (reoccurrence ? reoccurrenceMore : 1);
+            if (arc && CastMs(player, gem.Effect, skillId) is int arcMs)
+            {
+                double windup = sealDelay + arcMs / 1000d
+                    * (repeat + Animations.SpellAreaRelease(SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject));
+                var session = ProjectilesFor(player);
+                long due = GameServer.Core.Projectiles.ProjectileRuntime.Time(Math.Max(AreaTime(player),
+                    session.Runtime.Now / (double)GameServer.Core.Projectiles.ProjectileRuntime.QuantaPerSecond) + windup);
+                ScheduleArcContact(player, session, gem, to, null, () => CanReleaseTimedSpell()
+                    && player.ActionInterruptionGeneration == recoveryGeneration
+                    && SameTriggerSource(supported, SupportedSkill(player, skillId)), targetId, due, sequence,
+                    criticalRoll ?? CaptureSkillCriticalRoll(player, skillId), sacrifice, more, beidat?.Chains ?? 0, beidat?.More ?? 1, repeat: repeat);
+                continue;
+            }
+            if (timedAreaCast is int timedAreaWindup)
+            {
+                double windup = sealDelay + timedAreaWindup / 1000d
+                    * (repeat + Animations.SpellAreaRelease(SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject));
+                var session = ProjectilesFor(player);
+                session.ScheduleTimedAreaSpell(gem, to, targetId, windup, sequence, CanReleaseTimedSpell, criticalRoll, sacrifice, more, repeat);
+                foreach (var area in cascadeAreas)
+                    session.ScheduleTimedAreaSpell(gem, area, 0, windup, sequence, CanReleaseTimedSpell, criticalRoll, sacrifice, more, repeat);
+                continue;
+            }
+            if (firestorm is { } storm)
+            {
+                double windup = sealDelay + storm.Cast / 1000d
+                    * (repeat + Animations.SpellAreaRelease(SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject));
+                foreach (var area in cascadeAreas.Prepend(to))
+                    storm.Session.ScheduleFirestorm(gem, area, windup, CanReleaseTimedSpell, sacrifice, criticalRoll, repeat, more);
+                continue;
+            }
             if (stormCall)
             {
                 foreach (var area in cascadeAreas.Prepend(to))
@@ -1861,11 +2534,33 @@ public static partial class Game
                 jobs.Add(DarkBargainCast(player, skillId, gem, to, repeat, actionToken, cooldownUse, criticalRoll, sacrifice, sealDelay, more));
                 continue;
             }
+            // Frostblink of Wintry Blast (IceDash, 850 ms cast): teleports at the cast contact frame using the native
+            // 32/42-cell IceDash landing and hits both ends without creating chilled ground.
+            if (wintryBlast)
+            {
+                jobs.Add(FrostblinkWintryBlastCast(player, skillId, gem, to, targetId, repeat, actionToken, cooldownUse,
+                    criticalRoll, sacrifice, repeat * repeatInterval + sealDelay, more, swingAt));
+                continue;
+            }
+            if (SpatialSpellEffect(SkillsFor(player).EffectId(gem.Effect)) && CastMs(player, gem.Effect, skillId) is int spatialCast)
+            {
+                bool Current() => cooldownUse?.Current(player) ?? (actionToken is null || player.ActionCount == actionToken);
+                double windup = sealDelay + spatialCast / 1000d
+                    * (repeat + Animations.SpellAreaRelease(SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject));
+                var session = ProjectilesFor(player);
+                foreach (var area in cascadeAreas.Prepend(to))
+                    session.ScheduleSpatialSpell(gem, from, area, windup, Current, sacrifice, criticalRoll, sequence, repeat, more,
+                        targetId: area == to ? targetId : 0);
+                continue;
+            }
             void Hit((int X, int Y) centre) => jobs.Add(AreaSkillHitForUse(repeatRuthless, player, skillId, gem, from,
                 centre, immediate: channelled, sequence: sequence, actionToken: actionToken, cooldownUse: cooldownUse,
                 criticalRoll: criticalRoll, channelGeneration: channelGeneration, targetId: targetId, repeat: repeat, swingAt: swingAt,
-                repeatDelay: repeat * repeatInterval + sealDelay, radiusMore: fistRadius, sacrifice: sacrifice,
-                damageMore: fistMore * more * (meleeRepeats > 0 ? MeleeRepeatDamageMore(player, skillId, repeat) : 1), discharge: discharge, cryExerted: cryExerted));
+                repeatDelay: repeat * repeatInterval + sealDelay, radiusMore: radiusMore, sacrifice: sacrifice,
+                damageMore: fistMore * (reoccurrence ? reoccurrenceMore : 1) * (meleeRepeats > 0 ? MeleeRepeatDamageMore(player, skillId, repeat) : 1),
+                discharge: discharge, cryExerted: cryExerted, hitAndAilmentMore: (beidat?.More ?? 1) * useDamageMore,
+                seismicExerted: seismicArea.HasValue, ancestralTargets: ancestralTargets, rallyingDamage: rallyingDamage,
+                traumaUse: traumaUse));
             Hit(to);
             foreach (var area in cascadeAreas) Hit(area);
         }
@@ -1884,24 +2579,83 @@ public static partial class Game
 
     public const double ChannelSilenceSeconds = 1.0;
 
-    public static async Task RunChannel(Player player,
+    sealed class ChannelEndTracker { public int FinishedGeneration = -1; }
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Player, ChannelEndTracker> ChannelEnds = new();
+
+    public static bool IsDivineIre(Player player, int effect) =>
+        SkillsFor(player).EffectId(effect) is "DivineIre" or "DivineIreAltX" or "DivineIreAltY" or "DivineIreRoyale";
+
+    public static Task EmitPredictiveChannelFinished(Player player, int generation, ushort sequence) =>
+        EmitPredictiveChannelFinished(player, generation, sequence, null);
+
+    static async Task EmitPredictiveChannelFinished(Player player, int generation, ushort sequence, (int X, int Y)? landing)
+    {
+        if (player.Closed || player.LeavingArea || player.Connection.LockstepClient) return;
+        var tracker = ChannelEnds.GetOrCreateValue(player);
+        lock (tracker)
+        {
+            if (generation <= tracker.FinishedGeneration) return;
+            tracker.FinishedGeneration = generation;
+        }
+        await SendWorldRecord(player, player.Id, ChannelFinishedRecord(player, sequence, landing),
+            $"0x01ae channel 0x{sequence:x4} ended");
+    }
+
+    public static Task RunChannel(Player player,
         ushort skillId, (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, int action,
-        (int X, int Y) initialAim = default)
+        (int X, int Y) initialAim = default) => RunChannel(player, skillId, gem, action, initialAim, initialCostPaid: false);
+
+    static async Task RunChannel(Player player,
+        ushort skillId, (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, int action,
+        (int X, int Y) initialAim, bool initialCostPaid)
     {
         int generation = player.ChannelGeneration;
+        ushort channelSequence = player.ChannelSkillSequence;
         double channelStarted = AreaTime(player);
+        var lycia = initialCostPaid ? StartLyciaChannel(player, skillId, gem.Effect, action, generation, initialAim, channelStarted) : null;
         bool Running() => ChannelCurrent(player, skillId, action, generation);
         // Winter Orb's orb and its firing loop live in WinterOrb.cs: the loop starts with the channel and outlives it,
         // while this channel's cast ticks only build the orb's stages.
         uint orbEffect = 0;
         bool snipe = IsSnipe(gem.Effect);
-        bool firstSnipeStage = snipe;
+        bool scourge = IsChannelledScourgeArrow(gem.Effect);
+        bool firstStagePaid = snipe;
+        ChargedDashChannel? dash;
+        lock (LevelUpdatesFor(player).Gate) dash = CurrentChargedDash(player);
+        bool OwnsChannel() => player.ChannelGeneration == generation && player.ChannelSkill == skillId && player.ActionCount == action;
+        async Task EndPaidDash(double now)
+        {
+            (int X, int Y)? dashLanding;
+            lock (LevelUpdatesFor(player).Gate)
+            {
+                if (!OwnsChannel()) return;
+                dashLanding = EndChannel(player, now);
+                player.PaidChannel = null;
+                if (!player.Connection.LockstepClient) return;
+                player.LockstepSkill.Clear();
+            }
+            await SendWorldRecord(player, player.Id, ChannelFinishedRecord(player, channelSequence, dashLanding),
+                $"0x01ae Charged Dash 0x{channelSequence:x4} ended");
+        }
+        bool divineIre = IsDivineIre(player, gem.Effect);
+        int divineIreMaxStages = divineIre && SkillsFor(player).EffectId(gem.Effect) == "DivineIreRoyale" ? 20 : 10;
+        int divineIreStages = 0;
         try
         {
+            if (dash is not null) StartChargedDashWave(player, dash, channelStarted);
             if (IsWinterOrb(gem.Effect))
                 orbEffect = await WinterOrbStart(player, skillId, gem, action);
             else if (snipe)
                 await SnipeStart(player, skillId, gem, action, initialAim);
+            else if (scourge)
+                StartScourgeChannel(player, gem, action, generation, channelSequence, initialAim, initialCostPaid);
+            else if (divineIre)
+            {
+                divineIreStages = 1;
+                await SendWorldRecord(player, player.Id,
+                    InstanceEntities.StatsUpdate(player.Id, [(Stat.DivineTempestCurrentNumberOfStages, divineIreStages)]),
+                    $"0x01b3 Divine Ire stage {divineIreStages}");
+            }
             // Overheat's per-3 value, read once for the channel rather than a skill build on every tick.
             const uint overheatStat = Stat.SupportOverheatAilmentDamagePlusPctFinalPer3FortificationConsumed;
             int overheatPerThree = overheatStat is var overheatKey
@@ -1914,9 +2668,11 @@ public static partial class Game
                 {
                     if (snipe)
                     {
-                        try { await Task.Delay(TimeSpan.FromSeconds(wait), SnipeWaitToken(player, generation, action)); }
+                        try { await AreaDelay(player, wait, SnipeWaitToken(player, generation, action)); }
                         catch (OperationCanceledException) { }
                     }
+                    else if (!player.Frames.Running && AreaUpdateContext.Value is { Schedule: { } schedule })
+                        await schedule.Wait((int)Math.Ceiling(wait * 1000), CancellationToken.None);
                     else await AreaDelay(player, wait);
                 }
                 await WhilePaused(player);
@@ -1926,7 +2682,13 @@ public static partial class Game
                 if (!Running() || player.Paused || now < player.NextChannelHitAt) continue;
                 // A freeze or a stun's hit recovery interrupts the channelled action: no stage is paid or swept until it
                 // ends. The client's updates are dropped meanwhile, so a longer one ends the channel by silence.
-                if (PlayerActionBlocked(player, now, now)) { player.NextChannelHitAt = now + TickSeconds; continue; }
+                bool blocked = PlayerActionBlocked(player, now, now);
+                if (dash is not null && (blocked || dash.Interruption != player.ActionInterruptionGeneration))
+                {
+                    await EndPaidDash(now);
+                    return;
+                }
+                if (blocked) { player.NextChannelHitAt = now + TickSeconds; continue; }
                 var activeGem = GemSkillEffects(player).FirstOrDefault(g => g.Id == skillId);
                 if (activeGem.Name is null || activeGem.Effect != gem.Effect
                     || GemSkillInstanceDisabled(player, activeGem.Effect, skillId) is not null)
@@ -1937,18 +2699,46 @@ public static partial class Game
                 { player.ChannelSkill = 0; player.ChannelGeneration++; player.PaidChannel = null; return; }
                 player.NextChannelHitAt = Math.Max(player.NextChannelHitAt, now - 0.05) + interval;
                 // Payment and admission share the channel's generation check.
-                if (firstSnipeStage)
+                if (firstStagePaid)
                 {
                     // The cast already paid for the first stage.
                     cost = lifeCost = 0;
-                    firstSnipeStage = false;
+                    firstStagePaid = false;
                 }
-                else if (!PayMana(player, skillId, out cost, out lifeCost))
-                { player.ChannelSkill = 0; player.ChannelGeneration++; player.PaidChannel = null; }
+                else if (!PayMana(player, skillId, out cost, out lifeCost, 100, useSpell: false))
+                {
+                    if (dash is not null) await EndPaidDash(now);
+                    else
+                    {
+                        lock (LevelUpdatesFor(player).Gate)
+                        {
+                            if (!OwnsChannel()) return;
+                            SnipeReleasedByInput(player, now);
+                            _ = ReleaseBladeFlurry(player, now);
+                            player.ChannelSkill = 0;
+                            player.ChannelGeneration++;
+                            player.PaidChannel = null;
+                        }
+                    }
+                }
                 else
                 {
-                    player.PaidChannel = CombatLifetime is { IsActive: true } rules
-                        ? new(skillId, gem.Effect, action, generation, rules) : null;
+                    if (CombatLifetime is not { IsActive: true } rules) player.PaidChannel = null;
+                    else
+                    {
+                        double started = player.PaidChannel is { } prior && prior.Generation == generation
+                            && prior.Action == action && prior.Skill == skillId && ReferenceEquals(prior.Rules, rules)
+                            && double.IsFinite(prior.StartedAt) ? prior.StartedAt : now;
+                        player.PaidChannel = new(skillId, gem.Effect, action, generation, rules) { StartedAt = started };
+                    }
+                    if (cost > 0 && SkillsFor(player).IsAttack(gem.Effect) && WeaponProfileFor(player, activeSet: true).Bow)
+                    {
+                        var channelAim = snipe && SnipeRuntimes.TryGetValue(player, out var snipeState)
+                            ? snipeState.Aim
+                            : scourge && ScourgeChannels.TryGetValue(player, out var scourgeState)
+                                ? scourgeState.Aim : initialAim;
+                        RecordPaidBowAttackLocked(player, skillId, SupportedSkill(player, skillId), cost, channelAim);
+                    }
                     // Overheat: every paid channel tick is a use, so it consumes the Fortification gained since the
                     // last one; the first tick's use already consumed in LaunchProjectile.
                     if (overheatPerThree > 0)
@@ -1971,21 +2761,60 @@ public static partial class Game
                     await SnipePresentStages(player);
                     continue;
                 }
+                if (scourge)
+                {
+                    GainScourgeStage(player, generation, action);
+                    continue;
+                }
+                if (divineIre && divineIreStages < divineIreMaxStages)
+                {
+                    divineIreStages++;
+                    await SendWorldRecord(player, player.Id,
+                        InstanceEntities.StatsUpdate(player.Id, [(Stat.DivineTempestCurrentNumberOfStages, divineIreStages)]),
+                        $"0x01b3 Divine Ire stage {divineIreStages}");
+                }
+                double focusedMore = FocusedChannelMore(now - channelStarted,
+                    GolemStat(SupportedSkill(player, skillId).Stats, Stat.SupportFocusChannelDamagePlusPctFinalPerSecondChannellingUpTo60Pct));
+                if (dash is not null)
+                {
+                    StepChargedDash(player, dash, now, focusedMore);
+                    continue;
+                }
                 var at = player.Walk.Position(AreaTime(player));
-                await AreaSkillHit(player, skillId, gem, at, at,
+                await AreaSkillHitForUse(null, player, skillId, gem, at, at,
                     immediate: true, sequence: player.ChannelSkillSequence, actionToken: action, channelGeneration: generation,
-                    damageMore: FocusedChannelMore(now - channelStarted,
-                        GolemStat(SupportedSkill(player, skillId).Stats, Stat.SupportFocusChannelDamagePlusPctFinalPerSecondChannellingUpTo60Pct)));
+                    damageMore: focusedMore,
+                    hitAndAilmentMore: lycia?.Pact.DamageMore ?? 1);
             }
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException) { }
         finally
         {
+            if (lycia is not null && player.ProjectileRuntime is ProjectileSession lyciaSession)
+                using (ProjectileMutation(player, advance: false))
+                    FinishLyciaChannel(lyciaSession, lycia, GameServer.Core.Projectiles.ProjectileRuntime.Time(AreaTime(player)));
             // Winter Orb's orb outlives its channel (WinterOrb.cs): it keeps firing on its decaying stages until the
             // duration they leave runs out, and death or an area change retires it with the connection. It has no object
             // of its own to remove: the client draws the orb from the stage buff.
             if (orbEffect != 0) WinterOrbRelease(player, generation, action);
-            if (snipe) await SnipeRelease(player, generation, action);
+            if (snipe) await FinishSnipe(player, generation, action);
+            if (scourge) RetireScourgeChannel(player, generation, action);
+            EndCycloneStages(player, generation, AreaTime(player));
+            RetireBladeFlurry(player, generation);
+            (int X, int Y)? dashLanding = null;
+            if (dash is not null)
+                lock (LevelUpdatesFor(player).Gate)
+                {
+                    RetireChargedDashLocked(player, generation);
+                    dashLanding = dash.Landing;
+                }
+            if (!player.Connection.LockstepClient)
+                await EmitPredictiveChannelFinished(player, generation, channelSequence, dashLanding);
+            if (divineIreStages > 0 && !player.Closed && !player.LeavingArea
+                && (player.ChannelSkill == 0 || player.ChannelGeneration == generation))
+                await SendWorldRecord(player, player.Id,
+                    InstanceEntities.StatsUpdate(player.Id, [(Stat.DivineTempestCurrentNumberOfStages, 0)]),
+                    "0x01b3 Divine Ire stages cleared");
         }
     }
 
@@ -1999,11 +2828,18 @@ public static partial class Game
     // whole screen away the moment the channel starts. The client walks Cyclone's player toward it at the movement speed
     // with the skill's final modifier, as an order re-aimed on every update; the sweeps follow that walk (RunChannel).
     // A channel that stands keeps the player where it is.
-    public static void ChannelAimedAt(Player player, int x, int y, double at)
+    public static void ChannelAimedAt(Player player, int x, int y, double at) => ApplyChannelAim(player, x, y, at);
+
+    static bool ApplyChannelAim(Player player, int x, int y, double at)
     {
+        bool dashAimed = AimChargedDash(player, (x, y), at);
         AimChannelTriggers(player, (x, y));
+        if (player.ProjectileRuntime is ProjectileSession { LyciaChannel: { } lycia }
+            && lycia.Generation == player.ChannelGeneration && lycia.Action == player.ActionCount) lycia.Aim = (x, y);
         SnipeAimedAt(player, (x, y));
+        ScourgeAimedAt(player, (x, y));
         if (player.ChannelMovement.Skill != 0 && player.ChannelMovement.Skill == player.ChannelSkill) player.Walk.Order(x, y, at);
+        return AimBladeFlurry(player, (x, y)) || dashAimed;
     }
 
     // C→S 0x193 (class 0x1431767e8, writer 0x140911210, sender 0x14011ecb0): retarget an active held or channelled
@@ -2021,6 +2857,7 @@ public static partial class Game
         }
 
         bool aimLockstepChannel = false;
+        (ushort Sequence, (int X, int Y) Aim)? predictiveAim = null;
         {
             double now = AreaTime(player);
             double at = Math.Max(player.ClockAt(readAt), player.ProjectileRuntime?.Runtime.Now / 120000d ?? 0);
@@ -2053,32 +2890,53 @@ public static partial class Game
                     {
                         ChannelAimedAt(player, aim.X, aim.Y, at);
                         player.LastChannelUpdateAt = now;
+                        if (HeldLockstepAimedChannel(player))
+                        {
+                            player.LastLockstepChannelAim = (aim, at);
+                            player.LockstepChannelAimPending = false;
+                        }
                     }
                     aimLockstepChannel = player.LockstepSkill.Channel is not null;
                 }
             }
             else if (player.ChannelSkill != 0)
             {
-                ChannelAimedAt(player, aim.X, aim.Y, at);
+                if (ApplyChannelAim(player, aim.X, aim.Y, at)) predictiveAim = (player.ChannelSkillSequence, aim);
                 player.LastChannelUpdateAt = now;
             }
         }
         if (aimLockstepChannel)
             await AimLockstepChannel(player);
+        else if (predictiveAim is { } changed)
+            await SendChannelAim(player, changed.Sequence, changed.Aim);
     }
 
     // C→S 0x199: the button let go. The channel ends, and a walking one stops where the player is (it was walking only
     // as part of the channel); the walk gets its usual speed back.
-    public static void ChannelReleased(Player player, double at)
+    public static void ChannelReleased(Player player, double at) => EndChannel(player, at);
+
+    static (int X, int Y)? EndChannel(Player player, double at)
     {
-        if (player.ChannelMovement.Skill != 0 && player.ChannelMovement.Skill == player.ChannelSkill)
+        if (player.ProjectileRuntime is ProjectileSession { LyciaChannel: { } lycia } session)
+            using (ProjectileMutation(player, advance: false))
+                FinishLyciaChannel(session, lycia, GameServer.Core.Projectiles.ProjectileRuntime.Time(at));
+        lock (LevelUpdatesFor(player).Gate)
         {
-            var (x, y) = player.Walk.Position(at);
-            player.Walk.Order(x, y, at);
+            var landing = ReleaseChargedDashLocked(player, at);
+            SnipeReleasedByInput(player, at);
+            ReleaseScourgeChannel(player, at);
+            _ = ReleaseBladeFlurry(player, at);
+            if (player.ChannelMovement.Skill != 0 && player.ChannelMovement.Skill == player.ChannelSkill)
+            {
+                var (x, y) = player.Walk.Position(at);
+                player.Walk.Order(x, y, at);
+            }
+            player.ChannelSkill = 0;
+            EndCycloneStages(player, player.ChannelGeneration, at);
+            player.ChannelGeneration++;
+            SnipeWakeChannel(player);
+            return landing;
         }
-        player.ChannelSkill = 0;
-        player.ChannelGeneration++;
-        SnipeWakeChannel(player);
     }
 
     public static bool ChannelCurrent(Player player, ushort skill, int action, int generation)
@@ -2089,9 +2947,16 @@ public static partial class Game
             // client sends no 0x198, so the aim silence must not release an orb the player is still charging. Before
             // this a still hold released at five stages while the bar kept counting (live 2026-11-10).
             && (player.OrbRuntime is { Channelling: true } orb && orb.SkillId == skill
+                // Lockstep records the held button and its release. A stationary aim can be silent for the whole hold.
+                || player.Connection.LockstepClient && player.LockstepSkill.Held && player.LockstepSkill.Skill == skill
+                    && player.LockstepSkill.Channel == player.ChannelSkillSequence
                 || IsSnipeChannelling(player, skill)
+                || IsScourgeChannelling(player, skill, generation, action)
+                || IsBladeFlurryChannelling(player, skill, generation, action)
+                || CurrentChargedDash(player) is not null
                 || player.PaidChannel is { } paid && paid.Skill == skill
-                    && SkillsFor(player).EffectId(paid.Effect) is "LightningTendrils" or "LightningTendrilsAltX" or "LightningTendrilsAltY" or "LightningTendrilsRoyale"
+                    && (SkillsFor(player).EffectId(paid.Effect) is "LightningTendrils" or "LightningTendrilsAltX" or "LightningTendrilsAltY" or "LightningTendrilsRoyale"
+                        || IsDivineIre(player, paid.Effect))
                 || AreaTime(player) - player.LastChannelUpdateAt <= ChannelSilenceSeconds);
     }
 
@@ -2105,6 +2970,33 @@ public static partial class Game
         return gem.Name is not null && gem.Effect == receipt.Effect
             && Supports.Of(gem.Effect)?.Types.Contains(47) == true
             && GemSkillInstanceDisabled(player, gem.Effect, receipt.Skill) is null;
+    }
+
+    static List<(int X, int Y)> SpellCascadeAreas(Player player, int effect, IReadOnlyDictionary<uint, int> stats,
+        (int X, int Y) from, (int X, int Y) to, int? resolvedRadius = null)
+    {
+        var areas = new List<(int X, int Y)>();
+        int sides = stats.GetValueOrDefault(Stat.SupportSpellCascadeNumberOfCascadesPerSide);
+        if (sides <= 0 || from == to) return areas;
+        int radius = resolvedRadius ?? SkillRadius(player, stats, spell: true, effect);
+        if (radius <= 0) return areas;
+        bool sideways = stats.GetValueOrDefault(Stat.SupportSpellCascadeSideways) != 0;
+        double dx = to.X - from.X, dy = to.Y - from.Y;
+        double length = Math.Sqrt(dx * dx + dy * dy);
+        double ax = dx / length, ay = dy / length;
+        for (int side = 1; side <= sides; side++)
+        {
+            int alongX = (int)Math.Round(ax * radius * side);
+            int alongY = (int)Math.Round(ay * radius * side);
+            areas.Add((to.X + alongX, to.Y + alongY));
+            areas.Add((to.X - alongX, to.Y - alongY));
+            if (sideways)
+            {
+                areas.Add((to.X - alongY, to.Y + alongX));
+                areas.Add((to.X + alongY, to.Y - alongX));
+            }
+        }
+        return areas;
     }
 
     // The radius in cells of a gem skill's hit around its aimed point (AreaSkillHit): its own
@@ -2151,11 +3043,12 @@ public static partial class Game
         uint targetId = 0, int repeat = 0, int? radiusOverride = null, ISet<uint>? once = null, double repeatDelay = 0,
         double radiusMore = 1, SacrificeUse? sacrifice = null, double? swingAt = null, Func<bool>? triggeredCurrent = null,
         DischargeUse? discharge = null, int scaledBlastChaos = 0, uint? singleStrikeTarget = null, Action<uint>? onHit = null,
-        ProjectileSession? scheduledSession = null, bool? cryExerted = null, long addedChaos = 0, long baseChaos = 0, HolySweepHammers.Settings? hammer = null) =>
+        ProjectileSession? scheduledSession = null, bool? cryExerted = null, long addedChaos = 0, long baseChaos = 0, HolySweepHammers.Settings? hammer = null,
+        bool seismicExerted = false, int? rallyingDamage = null) =>
         AreaSkillHitForUse(null, player, skillId, gem, from, to, immediate, sequence, actionToken,
             cooldownUse, melee, damageMore, excludeMonster, criticalRoll, channelGeneration, targetId, repeat,
             radiusOverride, once, repeatDelay, radiusMore, sacrifice, swingAt, triggeredCurrent, discharge, scaledBlastChaos,
-            singleStrikeTarget, onHit, scheduledSession, cryExerted, addedChaos, baseChaos, hammer);
+            singleStrikeTarget, onHit, scheduledSession, cryExerted, addedChaos, baseChaos, hammer, seismicExerted: seismicExerted, rallyingDamage: rallyingDamage);
 
     static Task AreaSkillHitForUse(double? ruthlessMore, Player player,
         ushort skillId, (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, (int X, int Y) from, (int X, int Y) to,
@@ -2164,11 +3057,27 @@ public static partial class Game
         uint targetId = 0, int repeat = 0, int? radiusOverride = null, ISet<uint>? once = null, double repeatDelay = 0,
         double radiusMore = 1, SacrificeUse? sacrifice = null, double? swingAt = null, Func<bool>? triggeredCurrent = null,
         DischargeUse? discharge = null, int scaledBlastChaos = 0, uint? singleStrikeTarget = null, Action<uint>? onHit = null,
-        ProjectileSession? scheduledSession = null, bool? cryExerted = null, long addedChaos = 0, long baseChaos = 0, HolySweepHammers.Settings? hammer = null, SpawnedMonster? brandedTarget = null) =>
+        ProjectileSession? scheduledSession = null, bool? cryExerted = null, long addedChaos = 0, long baseChaos = 0, HolySweepHammers.Settings? hammer = null, SpawnedMonster? brandedTarget = null,
+        Func<uint, (int X, int Y), bool>? targetFilter = null, int extraStunThresholdReduction = 0, int extraStunDurationPct = 0,
+        int extraKnockbackDistancePct = 0, bool removeStunAndKnockback = false, bool offHandWeapon = false,
+        int extraCriticalIncrease = 0, IReadOnlyList<uint>? additionalStrikeTargets = null,
+        double hitAndAilmentMore = 1, Action<uint>? onDirectHit = null, bool allowMeleeSplash = true,
+        BoneshatterContact? boneshatter = null, InfernalBlowUse? infernalBlast = null,
+        double? strikeSeconds = null, int extraShockChance = 0, CascadeBurst cascadeBurst = CascadeBurst.None,
+        BladeFlurryChannel? flurryRelease = null, bool nearbyOnly = false, bool seismicExerted = false, int ancestralTargets = 0,
+        int? rallyingDamage = null, RetainedAreaAttack? retainedAttack = null, IReadOnlyList<uint>? contactTargets = null,
+        TraumaUse? traumaUse = null) =>
         AreaSkillHitStrike(player, skillId, gem, from, to, immediate, sequence, actionToken, cooldownUse,
             melee, damageMore, excludeMonster, criticalRoll, channelGeneration, targetId, repeat, radiusOverride, once,
             repeatDelay, radiusMore, sacrifice, swingAt, triggeredCurrent, discharge, 0, null, ruthlessMore, null, scaledBlastChaos,
-            singleStrikeTarget, onHit, scheduledSession, cryExerted, addedChaos, baseChaos, hammer, brandedTarget);
+            singleStrikeTarget, onHit, scheduledSession, cryExerted, addedChaos, baseChaos, hammer, brandedTarget,
+            extraCriticalIncrease, targetFilter, extraStunThresholdReduction, extraStunDurationPct, extraKnockbackDistancePct,
+            removeStunAndKnockback, offHandWeapon, retainedAttack: retainedAttack, additionalStrikeTargets: additionalStrikeTargets,
+            hitAndAilmentMore: hitAndAilmentMore, onDirectHit: onDirectHit, allowMeleeSplash: allowMeleeSplash,
+            boneshatter: boneshatter, infernalBlast: infernalBlast, strikeSeconds: strikeSeconds,
+            extraShockChance: extraShockChance, cascadeBurst: cascadeBurst,
+            flurryRelease: flurryRelease, nearbyOnly: nearbyOnly, seismicExerted: seismicExerted, ancestralTargets: ancestralTargets,
+            rallyingDamage: rallyingDamage, contactTargets: contactTargets, traumaUse: traumaUse);
 
     private static async Task AreaSkillHitStrike(Player player,
         ushort skillId, (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, (int X, int Y) from, (int X, int Y) to,
@@ -2177,36 +3086,84 @@ public static partial class Game
         uint targetId, int repeat, int? radiusOverride, ISet<uint>? once, double repeatDelay,
         double radiusMore, SacrificeUse? sacrifice, double? swingAt, Func<bool>? triggeredCurrent, DischargeUse? discharge,
         int strikeIndex, double? firstContactAt, double? ruthlessMore, ISet<uint>? priorTargets, int scaledBlastChaos,
-        uint? singleStrikeTarget, Action<uint>? onHit, ProjectileSession? scheduledSession, bool? cryExerted, long prepaidRawExtra, long baseChaos, HolySweepHammers.Settings? hammer, SpawnedMonster? brandedTarget = null)
+        uint? singleStrikeTarget, Action<uint>? onHit, ProjectileSession? scheduledSession, bool? cryExerted, long prepaidRawExtra, long baseChaos, HolySweepHammers.Settings? hammer,
+        SpawnedMonster? brandedTarget = null, int extraCriticalIncrease = 0,
+        Func<uint, (int X, int Y), bool>? targetFilter = null, int extraStunThresholdReduction = 0, int extraStunDurationPct = 0,
+        int extraKnockbackDistancePct = 0, bool removeStunAndKnockback = false, bool offHandWeapon = false,
+        RetainedAreaAttack? retainedAttack = null, ShieldCrushUse? shieldUse = null,
+        IReadOnlyList<uint>? additionalStrikeTargets = null,
+        double hitAndAilmentMore = 1, Action<uint>? onDirectHit = null, bool allowMeleeSplash = true,
+        BoneshatterContact? boneshatter = null, InfernalBlowUse? infernalBlast = null,
+        double? strikeSeconds = null, int extraShockChance = 0, CascadeBurst cascadeBurst = CascadeBurst.None,
+        IReadOnlyList<uint>? contactTargets = null, BladeFlurryChannel? flurryRelease = null, bool nearbyOnly = false,
+        LacerateUse? lacerate = null, SupportedGem? triggeredSpellSource = null, bool seismicExerted = false,
+        int ancestralTargets = 0, int? rallyingDamage = null, TraumaUse? traumaUse = null, int extraOtherWarcries = 0)
     {
         var paidVaal = SkillsFor(player).VaalBudget(gem.Effect, gem.Level) is null ? null : player.VaalUse;
         var hitPlan = SkillHitPlan.ForSkill(SkillsFor(player), gem.Effect, gem.Level, gem.Quality);
         bool spell = hitPlan.Kind == SkillHitKind.Spell;
+        bool attack = hitPlan.Kind == SkillHitKind.Attack;
         // A gem melee swing keeps its hit when the player only walks on: the client queues a Move until its clip's
         // cut-in instead of running it (Lockstep.cs, measured live 2026-11-03), so the Move the server hears first is a
         // queued order, not a replacement of the swing. Everything else keeps the action-token rule (a Move cancels the
         // swing), and a real interruption (death, area change, pause, freeze, stun recovery) still ends this one.
         bool holdsItsSwing = repeat == 0 && !spell && !immediate && channelGeneration is null && SkillsFor(player).IsMelee(gem.Effect);
-        bool preservesSwing = repeat == 0 && strikeIndex > 0 && !spell && channelGeneration is null && SkillsFor(player).IsMelee(gem.Effect);
+        bool preservesSwing = repeat == 0 && (strikeIndex > 0 || shieldUse is not null || lacerate is not null)
+            && !spell && channelGeneration is null && SkillsFor(player).IsMelee(gem.Effect);
         int interruption = player.ActionInterruptionGeneration;
         bool TokenCurrent() => holdsItsSwing || preservesSwing
             ? PlayerStateAllowsAction(player)
             : cooldownUse?.Current(player) ?? (actionToken is null || player.ActionCount == actionToken);
         bool Current() => (triggeredCurrent?.Invoke() ?? true) && TokenCurrent()
+            && (lacerate?.Current(player) ?? true)
             && (repeat == 0 || spell || player.ActionInterruptionGeneration == interruption)
             && (SkillsFor(player).VaalBudget(gem.Effect, gem.Level) is null
                 || paidVaal is not null && VaalAdmissionCurrent(player, paidVaal))
             && (channelGeneration is not int generation || ChannelCurrent(player, skillId, actionToken ?? player.ActionCount, generation));
         if (!Current()) return;
-        var criticalTrigger = spell ? null : CaptureCriticalTriggerSource(player, skillId);
-        var meleeKillTrigger = spell ? null : CaptureMeleeKillTriggerSource(player, skillId);
-        sacrifice ??= new SacrificeUse(player, skillId, gem.Effect, gem.Gem, triggered: triggeredCurrent is not null);
-        var admittedGem = SupportedSkill(player, skillId);
+        var currentGem = SupportedSkill(player, skillId);
+        var admittedGem = lacerate?.Source ?? flurryRelease?.Source ?? infernalBlast?.Source ?? retainedAttack?.Gem
+            ?? triggeredSpellSource ?? currentGem;
+        bool ownerContact = retainedAttack?.ProxyActor is null;
+        bool linkedSource = ownerContact && (retainedAttack is null && infernalBlast is null && flurryRelease is null && lacerate is null
+            || currentGem.Effect == admittedGem.Effect
+            && currentGem.Host == admittedGem.Host && ReferenceEquals(currentGem.SourceGem, admittedGem.SourceGem));
+        var criticalTrigger = spell || !linkedSource ? null : CaptureCriticalTriggerSource(player, skillId);
+        var meleeKillTrigger = spell || !linkedSource ? null : CaptureMeleeKillTriggerSource(player, skillId);
+        if (retainedAttack is null && infernalBlast is null)
+            sacrifice ??= new SacrificeUse(player, skillId, gem.Effect, gem.Gem, triggered: triggeredCurrent is not null);
         var skillStats = admittedGem.Stats;
+        bool shockwaveSupport = linkedSource && !spell
+            && skillStats.GetValueOrDefault(global::Stat.SupportBluntChanceToTriggerShockwaveOnHitPct) > 0;
+        bool pyreSupport = linkedSource && !spell && skillStats.GetValueOrDefault(PyreTriggerChance) > 0;
+        bool wildStrike = IsWildStrike(gem.Effect);
+        if (wildStrike && WildStrikeElements.TryGetValue(player, out var choices)
+            && choices.TryGetValue(gem.Effect, out var strikeElement))
+        {
+            admittedGem = WildStrikeDamageSource(admittedGem, strikeElement, followup: false);
+            skillStats = admittedGem.Stats;
+        }
+        // Vaal Heavy Strike's action knocks back its target on contact.
+        if (SkillsFor(player).EffectId(gem.Effect) == "VaalHeavyStrike")
+            skillStats = new Dictionary<uint, int>(skillStats) { [global::Stat.GlobalKnockback] = 1 };
+        bool retaliation = SkillsFor(player).IsRetaliation(gem.Effect);
         // An attack gem's share of the weapon's damage ("Deals 177.3% of base Attack Damage"): the hit below uses it.
         int effectiveness = SkillsFor(player).DamageEffectiveness(gem.Effect, gem.Level);
         int Stat(uint k) => skillStats.GetValueOrDefault(k);
+        int inversionChance = Stat(global::Stat.TreatEnemyResistancesAsNegatedOnElementalDamageHitPctChance);
+        var dualStrikeBonuses = DualStrikeBonuses.From(skillStats);
         if (Stat(global::Stat.BaseDealNoDamage) != 0) return;
+        double chargeAttackMore = 1, chargeRadius = 1;
+        int perChargeDamage = Stat(global::Stat.ActiveSkillAttackDamagePlusPctFinalPerEnduranceCharge);
+        // Normal Tectonic Slam resolves its per-Endurance-Charge area in CommitTectonicSlamLocked before spending on every 3rd slam.
+        int perChargeArea = SkillsFor(player).EffectId(gem.Effect) == "TectonicSlam" ? 0
+            : Stat(global::Stat.ActiveSkillAreaOfEffectPlusPctFinalPerEnduranceCharge);
+        if (!spell && (perChargeDamage != 0 || perChargeArea != 0))
+        {
+            int charges = cooldownUse?.EnduranceChargesAfterCost ?? EffectiveEnduranceCharges(player);
+            chargeAttackMore = Math.Max(0, 1 + perChargeDamage * (double)charges / 100);
+            chargeRadius = SkillArea.RadiusMultiplier(ActorScale.Saturate((long)perChargeArea * charges));
+        }
         if (!hitPlan.CanHit)
         {
             if (IsBane(player, gem.Effect))
@@ -2215,11 +3172,22 @@ public static partial class Game
                 await CastContagion(player, gem.Effect, skillId, from, to,
                     contagion with { SpreadAo = ContagionSkinAo(player, gem.Gem) }, repeat, radiusMore,
                     actionToken ?? cooldownUse?.ActionToken ?? player.ActionCount, cooldownUse?.Instant == true, Current);
+            if (Current()) CastingIntensity(player, skillId)?.Complete();
             return;
         }
-        cryExerted ??= ConsumeIntimidatingCryExertLocked(player,
-            !immediate && triggeredCurrent is null && repeat == 0 && channelGeneration is null
-                && IntimidatingCryCanExert(player, skillId, gem.Effect));
+        criticalRoll ??= CaptureSkillCriticalRoll(player, skillId);
+        if (cryExerted is null)
+        {
+            var (intimidating, seismicArea, extraStrikes, rallying) = ConsumeMeleeWarcryExertsLocked(player, skillId, gem.Effect, criticalRoll,
+                eligible: !immediate && triggeredCurrent is null && repeat == 0 && channelGeneration is null);
+            cryExerted = intimidating;
+            seismicExerted = seismicArea.HasValue;
+            ancestralTargets = extraStrikes;
+            rallyingDamage = rallying;
+            if (seismicArea is int area) radiusMore *= SkillArea.RadiusMultiplier(area);
+        }
+        var warcryTriggers = !attack ? null : MeleeWarcryTriggersFor(criticalRoll);
+        int otherWarcries = (seismicExerted ? 1 : 0) + (ancestralTargets > 0 ? 1 : 0) + (warcryTriggers?.Count ?? 0) + extraOtherWarcries;
         // Discharge: the charges it spends are counted as the use starts; with none it deals nothing.
         if (hitPlan.SpendsCharges) discharge ??= new(RemovableCharges(player));
         if (discharge is not null && discharge.Total == 0)
@@ -2227,10 +3195,15 @@ public static partial class Game
             Console.WriteLine($"[gateway] {player.Connection.Remote} {gem.Name}: no removable charges, nothing discharged");
             return;
         }
-        criticalRoll ??= CaptureSkillCriticalRoll(player, skillId);
         // A dual-wielded attack's hand for this use (AttackHands): its weapon, time, hit, chance and local modifiers.
-        var hand = spell ? AttackHand.Main : AttackHandFor(player, skillId, sequence);
-        var weapon = HandWeapon(player, hand);
+        var swingHands = lacerate?.Hand ?? retainedAttack?.Hand
+            ?? (spell ? AttackHand.Main : AttackHandFor(player, skillId, sequence));
+        if (lacerate is null && !immediate && !spell && LacerateEffect(SkillsFor(player).EffectId(gem.Effect)))
+            lacerate = StartLacerate(player, admittedGem, skillId, from, to, swingHands,
+                (swingAt ?? AreaTime(player)) + repeatDelay, radiusMore);
+        var hand = lacerate?.Hand ?? swingHands;
+        var itemCriticalTrigger = spell || !ownerContact ? null : CaptureItemCriticalTriggerSource(player, skillId, hand);
+        var weapon = retainedAttack?.Weapon ?? HandWeapon(player, hand);
         // Read once per use: the per-victim hit log and the target-conditional critical chances reuse them.
         string handNote = spell ? "" : HandNote(player, hand);
         int? offCritical = hand != AttackHand.Main && OffhandWeaponFor(player) is not null
@@ -2242,39 +3215,121 @@ public static partial class Game
         // A holy hammer (hammer: RunHolyHammers) is a hit of its sweep's use, not a use of its own.
         ruthlessMore ??= spell || hammer is not null ? 1 : RuthlessBlowMore(player, skillId, Stat);
         double ruthless = ruthlessMore.Value;
+        ushort? areaAction = SkillsFor(player).ActionHash(gem.Effect);
+        var effectId = SkillsFor(player).EffectId(gem.Effect);
+        bool bladestorm = !spell && IsBladestorm(effectId);
+        bool swordstorm = !spell && IsSwordstorm(effectId);
+        bool crushingFist = areaAction == CrushingFistAction && retainedAttack is null;
+        double? fistStartedAt = crushingFist ? swingAt ?? AreaTime(player) : null;
+        double fistPlacementDelay = 0;
+        double? stormPeriod = bladestorm && retainedAttack is null
+            ? strikeSeconds ?? SupportedAttackSeconds(player, skillId, hand) : null;
+        bool ownSlam = !spell && (triggeredCurrent is null || IsLeapSlam(player, gem.Effect)
+            || retainedAttack is not null)
+            && (Stat(global::Stat.SupportFissureTriggerFissureOnSlamSkillImpactChancePct) != 0
+                || Stat(global::Stat.SupportCrystalfallChanceToTriggerCrystalfallOnHitPct) != 0)
+            && SkillsFor(player).HasType(gem.Effect, "Slam");
         double delay;
         // A spell lands at its area cast clip's contact keyframe (a repeat a whole cast later each), an attack at its
         // swing's own clip (GemAttackContactDelay; the player swings where it stands, so without the walk-in offset).
         string? contactClip = null;
         double contactFraction = 0;
-        delay = spell
+        if (lacerate is not null)
+        {
+            contactClip = lacerate.Clip;
+            contactFraction = lacerate.Fraction;
+            delay = lacerate.DueAt - (swingAt ?? AreaTime(player));
+        }
+        else if (crushingFist)
+        {
+            delay = CrushingFistContactDelay(player, hand, strikeSeconds ?? SupportedAttackSeconds(player, skillId, hand),
+                out fistPlacementDelay, out contactClip, out contactFraction) + repeatDelay;
+        }
+        else delay = retainedAttack is not null ? 0 : spell
             ? castDuration.Value / 1000.0 * (repeat + Animations.SpellAreaRelease(SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject)) + repeatDelay
-            : GemAttackContactDelay(player, gem.Effect, SupportedAttackSeconds(player, skillId, hand), out contactClip, out contactFraction)
+            : (areaAction == HolyHammersAction
+                ? HolyHammersContactDelay(player, strikeSeconds ?? SupportedAttackSeconds(player, skillId, hand),
+                    out contactClip, out contactFraction)
+                : GemAttackContactDelay(player, gem.Effect, stormPeriod ?? strikeSeconds ?? SupportedAttackSeconds(player, skillId, hand),
+                    out contactClip, out contactFraction))
                 + repeatDelay;
         // A caller's own shape (Shield Charge's path and end, ShieldCharge.cs) replaces the skill's area radius.
         // Greater Spell Echo: each repeat of the spell has more increased area than the one before.
         var areaStats = skillStats;
         if (spell && repeat > 0 && Stat(SkillArea.IncreasedPerRepeat) is int perRepeat and not 0)
             areaStats = new Dictionary<uint, int>(skillStats) { [SkillArea.BaseIncreased] = skillStats.GetValueOrDefault(SkillArea.BaseIncreased) + perRepeat * repeat };
-        int radius = (int)Math.Round((radiusOverride ?? SkillRadius(player, areaStats, spell, gem.Effect)) * radiusMore);
+        int flameSurgeBurningMore = effectId == "FlameSurge" ? Stat(global::Stat.FlameWhipDamagePlusPctFinalVsBurningEnemies) : 0;
+        int flameSurgeExistingIgnite = effectId == "FlameSurge" ? Stat(global::Stat.FlameSurgeIgniteDamageAsBurningGroundDamagePct) : 0;
+        int flameSurgeNewIgnite = effectId == "FlameSurgeAltX" ? Stat(global::Stat.FlameSurgeBurningGroundOnIgniteDamagePct) : 0;
+        bool divineBlast = effectId is "DivineBlast" or "DivineBlastAltX";
+        bool reave = IsReave(effectId);
+        bool infernalStrike = infernalBlast is null && IsInfernalBlow(effectId);
+        bool immolation = effectId == "InfernalBlowAltX";
+        bool pestilentStrike = IsPestilentStrike(effectId);
+        bool katabasisStrike = effectId == "FrostBladesAltX";
+        bool holyPath = !spell && !immediate && strikeIndex == 0 && IsConsecratedPath(effectId);
+        double phaseDamageMore = divineBlast && immediate && scheduledSession is not null
+            ? Math.Max(0, 1 + Stat(global::Stat.DiscusSlamDamagePlusPctFinalForShockwave) / 100d)
+            : infernalBlast is not null ? damageMore : 1;
+        if (shieldUse is null && !spell && areaAction == ShieldCrushWaves.Action)
+        {
+            var shieldStats = SkillAreaStats(player, areaStats, gem.Effect);
+            var waves = ShieldCrushWaves.At(from, to, key => shieldStats.GetValueOrDefault(key), radiusMore);
+            var actor = SkillsFor(player).ClassFor(player.Character.ClassRow);
+            string ao = Environment.GetEnvironmentVariable("Game_PLAYER_AO") ?? actor.AnimatedObject;
+            var animation = Animations.ActAnimationEvents(ao, AnimationWeaponProfileFor(player), "ShieldBash", "wave");
+            double attackSeconds = SupportedAttackSeconds(player, skillId, hand);
+            double start = swingAt ?? AreaTime(player);
+            shieldUse = new(waves, reversed: actor.IntegerId == (int)CharacterClass.Templar, start + repeatDelay, attackSeconds, animation);
+            contactFraction = shieldUse.Fraction(contactFraction);
+            contactClip = shieldUse.Clip ?? contactClip;
+            delay = AttackTiming.ContactDelay(attackSeconds, contactFraction, 0) + repeatDelay;
+        }
+        var shieldWaves = shieldUse?.Waves;
+        CleaveArc? cleave = null;
+        bool cleaveAttack = !spell && CleaveAttack(effectId);
+        bool tumultContact = channelGeneration is not null && effectId == "CycloneAltX" && radiusOverride is null;
+        int radius = tumultContact || cleaveAttack ? 0 : lacerate?.Waves.Radius ?? shieldWaves?.CentreRadius
+            ?? (int)Math.Round((radiusOverride ?? (divineBlast && !immediate
+            ? SkillRadius(player, Stat(global::Stat.ActiveSkillBaseSecondaryAreaOfEffectRadius), areaStats, spell: false, gem.Effect)
+            : SkillRadius(player, areaStats, spell, gem.Effect))) * radiusMore * chargeRadius);
         // Ground Slam's wave: the skills whose action is the data's "DistanceScaledGroundSlam" travel forward from where
         // the player stands instead of landing one circle (GroundSlamWave; its length, half angle and direction are read
-        // once here, so the log after the sweep can report them). Vaal Ground Slam's own skill is a different action, so
-        // the Vaal blast keeps its radial hit.
-        bool wave = !immediate && !spell && SkillsFor(player).ActionHash(gem.Effect) == GroundSlamWave.Action;
+        // once here, so the log after the sweep can report them). Vaal Ground Slam has a radial wave of its own.
+        bool wave = !immediate && !spell && areaAction == GroundSlamWave.Action;
+        bool vaalSlam = SkillsFor(player).EffectId(gem.Effect) == "VaalGroundSlam";
+        bool vaalWave = !immediate && !spell && vaalSlam;
         bool fissure = !immediate && IsVolcanicFissure(gem.Effect);
-        double waveLength = wave ? GroundSlamWave.Length(radius) : 0;
+        double waveLength = wave ? GroundSlamWave.Length(radius, skillStats.GetValueOrDefault(global::Stat.ActiveSkillBaseRadiusPlus)) : 0;
         int waveCloseDamage = wave ? Stat(global::Stat.GroundslamDamageToCloseTargetsPlusPctFinal) : 0;
         double waveHalfAngle = wave ? GroundSlamWave.HalfAngle(Stat) : 0;
         (double X, double Y) waveDir = wave ? GroundSlamWave.Direction(from, to) : (0, 0);
+        var cascadePush = spell && GlacialCascadeHasFinalBurst(effectId)
+            ? GroundSlamWave.Direction(from, to) : default;
         // A wave starts where the player stands and only takes its direction from the aim; a melee skill aimed far away
         // still lands in front of the player, and a sweep around it (MeleeAreaCentre); a self-targeted spell goes off
         // around the caster.
-        var centre = IsSmite(gem.Effect) && singleStrikeTarget is null ? to
-            : wave || SkillsFor(player).EffectId(gem.Effect) == "VaalGroundSlam" ? from
+        var centre = shieldWaves is { } shieldArea ? shieldArea.Origin
+            : katabasisStrike || contactTargets is not null || infernalBlast is not null
+                || swordstorm && retainedAttack is not null || IsSmite(gem.Effect) && singleStrikeTarget is null ? to
+            : wave || vaalSlam || bladestorm || effectId == "VaalSweep" ? from
             : spell ? SpellCentre(player, gem.Effect, from, to)
-            : MeleeAreaCentre.Of(SkillsFor(player).ActionHash(gem.Effect), from, to, radius + weapon.Range);
+            : MeleeAreaCentre.Of(SkillsFor(player).ActionHash(gem.Effect), from, to, radius + MeleeSkillReach(player, weapon, gem.Effect, skillStats));
         int action = actionToken ?? cooldownUse?.ActionToken ?? player.ActionCount;
+        ConsecratedPathUse holyPathUse = default;
+        if (holyPath)
+        {
+            using (ProjectileMutation(player, advance: scheduledSession is null))
+            {
+                const uint range = global::Stat.HolyPathTeleportRangePlusPct;
+                int increased = ActorScale.Saturate((long)Stat(range) + CharacterPlayerStats(player).GetValueOrDefault(range));
+                holyPathUse = PlanConsecratedPath(player, from, to, targetId, radius, increased, ProjectileWorldTime(player));
+            }
+            centre = holyPathUse.Impact;
+        }
+        if (divineBlast) centre = to;
+        if (lacerate is not null) centre = lacerate.Waves.Origin;
+        if (cleaveAttack) centre = from;
         // A later action (a Move, another use) replaces the swing; nothing of it lands from then on. The ordinary attack
         // says so at its own contact (Attack's HitTarget); this says so for a gem skill's sweep, whose drop was otherwise
         // invisible in the log (the live tests cannot count what a swing did without it).
@@ -2296,27 +3351,51 @@ public static partial class Game
         if (Replaced()) return;
         // A Strike's spirit strikes and previous-location strike, chosen as it starts, as the client chooses them
         // (StrikeTargets). Each monster takes one hit of the use, whichever of them reaches it.
-        List<uint> spirit = [];
-        (int X, int Y)? echo = null;
+        IReadOnlyList<uint> spirit = additionalStrikeTargets ?? [];
+        ((int X, int Y) Player, (int X, int Y) Centre)? echo = null;
         byte[]? memoryBuff = null;
-        if (!spell && channelGeneration is null && singleStrikeTarget is null && strikeIndex == 0 && hammer is null && !IsSmite(gem.Effect))
+        if (retainedAttack is null && infernalBlast is null && !spell && channelGeneration is null && singleStrikeTarget is null
+            && strikeIndex == 0 && additionalStrikeTargets is null && shieldUse is null && hammer is null
+            && boneshatter?.Pulse != true && !IsSmite(gem.Effect))
             using (ProjectileMutation(player, advance: scheduledSession is null))
                 (spirit, echo, memoryBuff) = StrikeExtrasLocked(player, skillId, gem.Effect, skillStats, from, centre, sequence,
-                    targetId, ProjectileWorldTime(player));
+                    targetId, ProjectileWorldTime(player), exertedTargets: ancestralTargets);
         if (memoryBuff is not null)
-            await SendWorldRecord(player, player.Id, memoryBuff, $"0x01c1 player buff skill_location_memory for skill 0x{skillId:x4}");
+        {
+            string description = $"0x01c1 player buff skill_location_memory for skill 0x{skillId:x4}";
+            if (scheduledSession is not null) scheduledSession.World(player.Id, memoryBuff, description);
+            else await SendWorldRecord(player, player.Id, memoryBuff, description);
+        }
         // A channel's hits (Cyclone, C→S 0x197) land at once, where the player is. A swing that began before now
         // (swingAt) lands its contact after its start.
-        if (swingAt is { } swung) delay -= AreaTime(player) - swung;
+        if (fistStartedAt is { } fistStart)
+        {
+            if (!immediate)
+            {
+                double remaining = fistStart + repeatDelay + fistPlacementDelay - AreaTime(player);
+                if (remaining > 0) await AreaDelay(player, remaining);
+                await WhilePaused(player);
+                if (Replaced() || player.Closed || !Current()) return;
+            }
+            using (ProjectileMutation(player, advance: scheduledSession is null))
+                centre = PlaceCrushingFist(player, gem.Effect, weapon, skillStats, to, targetId);
+        }
+        if ((swingAt ?? fistStartedAt) is { } swung) delay -= AreaTime(player) - swung;
         if (!immediate)
         {
-            await AreaDelay(player, Math.Max(0.05, delay));
+            if (!crushingFist || delay > 0) await AreaDelay(player, crushingFist ? delay : Math.Max(0.05, delay));
             await WhilePaused(player);
             if (Replaced() || player.Closed || !Current()) return;
         }
+        if (holyPath && holyPathUse.Landing != from
+            && await CommitTravelLanding(player, holyPathUse.Landing, Current) is null) return;
+        if (lacerate is not null && !SameTriggerSource(lacerate.Source, SupportedSkill(player, skillId))) return;
         int addedChaos;
+        int glacialFreezeMore = 0;
+        bool shatteringCritical = false;
+        bool shatterFrozen = !spell && Stat(global::Stat.GlacialHammerShatterFrozenEnemiesAt33PctLife) != 0;
         double contactAt = firstContactAt ?? AreaTime(player);
-        int strikes = SkillMultiStrike.StrikeCount(SkillsFor(player).EffectId(gem.Effect), Stat(global::Stat.BaseSkillNumberOfAdditionalHits),
+        int strikes = lacerate is not null ? 1 : SkillMultiStrike.StrikeCount(SkillsFor(player).EffectId(gem.Effect), Stat(global::Stat.BaseSkillNumberOfAdditionalHits),
             immediate, channelGeneration is not null, spell, wave);
         ISet<uint>? alreadyHit = priorTargets ?? SkillMultiStrike.SnapshotPriorTargets(once, strikes);
         List<(uint Id, SpawnedMonster M)> targets;
@@ -2326,24 +3405,226 @@ public static partial class Game
         // Ice Nova's ring reaches each victim in turn (IceNovaRing) and Ground Slam's wave does the same by distance
         // (GroundSlamWave); a channel's sweep lands at once.
         bool ring = !immediate && SkillsFor(player).ActionHash(gem.Effect) == IceNovaRing.Action;
+        bool travellingSweep = ring || wave || vaalWave || fissure;
+        TectonicFissureUse? tectonic = null;
         int frostboltCap = ring ? Stat(global::Stat.IceNovaNumberOfFrostBoltsToCastOn) : 0;
         double frostboltMore = 1;
+        bool hexblast = IsHexblastEffect(SkillsFor(player).EffectId(gem.Effect));
+        bool hexblastExpanded = false;
+        bool reaveGained = false;
+        ReaveArc? reaveArc = null;
+        bool elementalHit = !spell && Stat(global::Stat.ElementalHitNoDamageOfUnchosenElementalType) != 0;
+        int element = 3, elementalHitContacts = 0;
+        int elementalHitPerAilment = elementalHit ? Stat(global::Stat.ElementalHitDamagePlusPctFinalPerEnemyElementalAilment) : 0;
+        HashSet<uint>? elementalHitStruck = null;
+        (int Radius, double More)? elementalHitSplash = null;
         int artVariation = ring ? SkillArtVariation(player, gem.Gem) : 0;
+        BladeFlurryBonus flurryBonus = default;
         double sweepStart = 0;
         double[] reach = [];
+        (int X, int Y) fissureEnd = default;
+        HashSet<uint> struck;
         int epoch = player.ProjectileEpoch;
+        SunderWave? sunder = null;
+        IceCrashUse? iceCrash = null;
         using (ProjectileMutation(player, advance: scheduledSession is null))
         {
             double now = ProjectileWorldTime(player);
-            if (!Current() || !sacrifice.Current) return;
-            addedChaos = sacrifice.AddedChaos();
+            if (!Current() || sacrifice is { Current: false }) return;
+            if (holyPath) CreateConsecratedPathGroundLocked(player, centre, skillStats, now);
+            addedChaos = sacrifice?.AddedChaos() ?? 0;
             // A freeze or stun that landed after this stage was paid interrupts it before the sweep.
             if (channelGeneration is not null
                 && PlayerActionBlocked(player, AreaTime(player), AreaTime(player))) return;
+            CastingIntensity(player, skillId)?.Complete();
+            if (!spell && areaAction == IceCrashUse.Action && IceCrashUse.Handles(effectId) && scheduledSession is null)
+            {
+                centre = IceCrashUse.Impact(player, from, to, MeleeSkillReach(player, weapon, gem.Effect, skillStats));
+                iceCrash = new(player, centre, epoch, hand, IceCrashUse.Cadence(effectId),
+                    SkillAreaStats(player, areaStats, gem.Effect), skillStats, radiusMore * chargeRadius, radiusOverride,
+                    excludeMonster, singleStrikeTarget, once, targetFilter);
+                radius = iceCrash.Extent;
+            }
+            if (!spell && !immediate && triggeredCurrent is null && strikeIndex == 0)
+            {
+                int freezeMore = Stat(global::Stat.GlacialHammerThirdHitFreezeAsThoughDealtDamagePlusPct);
+                bool alwaysCrit = Stat(global::Stat.GlacialHammerThirdHitAlwaysCrits) != 0;
+                if ((freezeMore != 0 || alwaysCrit)
+                    && ThirdGlacialHammerStrikeLocked(player, skillId, gem.Effect, action, now))
+                {
+                    glacialFreezeMore = freezeMore;
+                    shatteringCritical = alwaysCrit;
+                }
+            }
+            if (ownSlam && retainedAttack is null && strikeIndex == 0)
+            {
+                var slamOrigin = holyPath ? holyPathUse.Landing : from;
+                var fissureAt = slamOrigin;
+                foreach (var cell in GameServer.Core.World.ClientPathfinder.Line(slamOrigin, centre))
+                {
+                    if (!player.Layout.WalkableFor(cell.X, cell.Y, 0) || player.Barrier.Contains(cell)) break;
+                    fissureAt = cell;
+                }
+                TriggerSlamSupportLocked(player, skillId, admittedGem, hand, weapon, offCritical, fissureAt, now,
+                    global::Stat.SupportFissureTriggerFissureOnSlamSkillImpactChancePct, "TriggeredSupportFissure");
+            }
+            if (!spell && retainedAttack is null && areaAction == EarthshatterFissures.Action)
+            {
+                ScheduleEarthshatterLocked(player, skillId, gem, admittedGem, from, to, sequence, repeat, hand, weapon,
+                    offCritical, criticalRoll, radiusMore * chargeRadius, damageMore * hitAndAilmentMore, ruthless,
+                    cryExerted == true, seismicExerted, rallyingDamage, now);
+                return;
+            }
+            if (retainedAttack is null && strikeIndex == 0 && areaAction == PerforateAction)
+            {
+                SchedulePerforateLocked(player, gem, admittedGem, from, to, sequence, repeat, hand, weapon, offCritical,
+                    criticalRoll, radiusMore * chargeRadius, damageMore, ruthless, cryExerted == true, seismicExerted, now, rallyingDamage);
+                return;
+            }
+            if (stormPeriod is double interval && strikeIndex == 0)
+                CreateBladestormLocked(player, gem, admittedGem, hand, weapon, offCritical, from, to, interval,
+                    sequence, now, radiusMore * chargeRadius, damageMore * hitAndAilmentMore, ruthless, cryExerted,
+                    rallyingDamage, otherWarcries);
+            if (swordstorm && retainedAttack is null)
+            {
+                ScheduleSwordstormLocked(player, gem, admittedGem, weapon, criticalRoll, to, sequence, now, radius, damageMore, ruthless);
+                return;
+            }
+            if (areaAction == GlacialShieldSwipeAction && retainedAttack is null)
+            {
+                ScheduleGlacialShieldSwipeLocked(player, gem, admittedGem, criticalRoll, to, sequence, now, radius, damageMore, ruthless);
+                return;
+            }
+            if (areaAction == EviscerateAction && retainedAttack is null)
+            {
+                int width = (int)Math.Round(SkillSecondaryRadius(player, areaStats, spell: false, gem.Effect)
+                    * radiusMore * chargeRadius);
+                ScheduleEviscerateLocked(player, gem, admittedGem, weapon, criticalRoll, to, sequence, now,
+                    radius, width, damageMore, ruthless);
+                return;
+            }
+            if (areaAction == ShieldOfLightAction && retainedAttack is null)
+            {
+                int allyRadius = (int)Math.Round(SkillSecondaryRadius(player, areaStats, spell: false, gem.Effect)
+                    * radiusMore * chargeRadius);
+                ScheduleShieldOfLightLocked(player, gem, admittedGem, criticalRoll, to, sequence, now,
+                    radius, allyRadius, damageMore, ruthless);
+                return;
+            }
+            if (retainedAttack is null && strikeIndex == 0 && areaAction == HolyHammersAction)
+            {
+                ScheduleHolyHammersLocked(player, gem, admittedGem, from, to, sequence, repeat, hand, weapon, offCritical,
+                    criticalRoll, radius, damageMore, ruthless, cryExerted == true, now, rallyingDamage, seismicExerted);
+                return;
+            }
+            if (divineBlast && !immediate && strikeIndex == 0)
+                ProjectilesFor(player).PlaceDivineBlastOrb(gem, centre, admittedGem, criticalRoll);
             // Queued mana output may outlast movement: resolve a channel at its current position.
-            if (channelGeneration is not null) centre = player.Walk.Position(now);
-            (int X, int Y) end = fissure ? VolcanicFissureSweep.End(player.Layout, from, to, radius) : default;
-            double reachLimit = wave ? waveLength : fissure ? Dist(from, end) : radius;
+            if (channelGeneration is not null)
+            {
+                centre = player.Walk.Position(now);
+                if (tumultContact)
+                    radius = (int)Math.Round(CycloneHitRadius(player, skillId, gem.Effect, areaStats) * radiusMore * chargeRadius);
+            }
+            BladeFlurryChannel? flurry = flurryRelease;
+            if (channelGeneration is int stageGeneration && IsBladeFlurry(player, gem.Effect))
+            {
+                if (!BladeFlurryChannels.TryGetValue(player, out flurry) || flurry.Generation != stageGeneration) return;
+                GainBladeFlurryStage(player, flurry);
+            }
+            if (flurry is not null)
+            {
+                if (!BladeFlurryContact(player, flurry, areaStats, now, flurryRelease is not null, out centre, out radius)) return;
+                flurryBonus = BladeFlurryStageBonus(flurry.Source.Stats, flurry.Stages, flurry.Maximum);
+                hitAndAilmentMore *= flurryBonus.Damage;
+            }
+            if (retainedAttack is null && strikeIndex == 0 && effectId == "VolcanicFissureAltX" && areaAction is { } fissureAction)
+            {
+                var source = CaptureExertedAreaAttack(player, skillId, admittedGem, hand, weapon, offCritical,
+                    damageMore, damageMore, "fissure", cryExerted == true, otherWarcries, rallyingDamage);
+                ScheduleSnakingFissureLocked(player, skillId, gem, source, from, to, now, fissureAction,
+                    sequence, repeat, radiusMore * chargeRadius, criticalRoll, ruthless, cryExerted == true, seismicExerted, rallyingDamage);
+                return;
+            }
+            if (retainedAttack is null && strikeIndex == 0 && Stat(global::Stat.IsPlayerEarthquake) != 0)
+                ScheduleEarthquakeAftershockLocked(player, skillId, gem, admittedGem, centre, sequence, hand, weapon,
+                    offCritical, criticalRoll, now, radiusMore, damageMore, ruthless, cryExerted == true, seismicExerted, rallyingDamage);
+            if (!spell && strikeIndex == 0 && scheduledSession is null && triggeredCurrent is null)
+            {
+                bool cataclysm = Stat(global::Stat.QualityDisplayAlternateTectonicSlamIsGem) != 0;
+                if (cataclysm || SkillsFor(player).EffectId(gem.Effect) == "TectonicSlam")
+                {
+                    var slam = CommitTectonicSlamLocked(player, skillId, gem.Effect, cataclysm, Stat, now);
+                    radius = (int)Math.Floor(radius * slam.RadiusFactor);
+                    damageMore *= slam.HitFactor;
+                    if (areaAction == TectonicFissures.Action)
+                    {
+                        var area = SkillAreaStats(player, areaStats, gem.Effect);
+                        int GetArea(uint key) => area.GetValueOrDefault(key);
+                        double increased = 1 + SkillArea.Increased(GetArea, spell: false) / 100d;
+                        double ordinaryArea = SkillArea.Modifier(GetArea, spell: false);
+                        double size = radiusMore * slam.RadiusFactor
+                            * Math.Max(0, 1 + GetArea(global::Stat.ActiveSkillAreaOfEffectRadiusPlusPctFinal) / 100d);
+                        float Scale(int otherIncreased) => increased <= 0 ? 0
+                            : (float)(Math.Floor(100 * Math.Sqrt(ordinaryArea / increased
+                                * Math.Max(0, increased + otherIncreased / 100d))) / 100 * size);
+                        uint repeatsLeft = (uint)Math.Max(0, MeleeAttackRepeats(player, skillId) - repeat);
+                        var paths = TectonicFissures.Plan(from, to, sequence, player.Id, repeatsLeft,
+                            slam.BranchChance, slam.ExtraBranch, Scale);
+                        tectonic = new(player, paths, AreaTime(player), epoch, excludeMonster, singleStrikeTarget, once, targetFilter);
+                    }
+                }
+            }
+            if (!spell && strikeIndex == 0 && areaAction != EarthshatterFissures.Action
+                && EarthshatterSpikes.TryGetValue(player.Area, out var spikes) && spikes.Count != 0
+                && (!immediate || IsLeapSlam(player, gem.Effect) || retainedAttack is not null)
+                && SkillsFor(player).HasType(gem.Effect, "Slam"))
+            {
+                // The client scans a circle for spikes even when Ground Slam's damage uses its forward wave.
+                double spikeRange = wave ? SkillRadius(player, 37, areaStats, spell: false, gem.Effect) * radiusMore : radius;
+                TriggerEarthshatterSpikesLocked(player, centre, spikeRange, now);
+            }
+            if (!spell && retainedAttack is null && IsTrarthusChainHook(effectId))
+            {
+                if (GemSkillInstanceDisabled(player, gem.Effect, skillId) is null
+                    && SameTriggerSource(admittedGem, SupportedSkill(player, skillId)))
+                    AttachTrarthusLocked(player, gem, admittedGem, to, targetId, now, hand, weapon, offCritical,
+                        criticalRoll, sequence, radiusMore * chargeRadius, damageMore * hitAndAilmentMore,
+                        ruthless, cryExerted, rallyingDamage);
+                return;
+            }
+            if (cleaveAttack)
+            {
+                var cleaveFrom = player.Walk.Position(now);
+                int arcRadius = CleaveRadius(player, gem.Effect, areaStats, cleaveFrom, now);
+                var direction = cleaveFrom == to ? (0d, -1d) : GroundSlamWave.Direction(cleaveFrom, to);
+                radius = Math.Max(0, (int)(arcRadius * radiusMore * chargeRadius));
+                cleave = new(cleaveFrom, direction, radius);
+                centre = cleaveFrom;
+            }
+            var reaveFrom = from;
+            if (reave)
+            {
+                int stages = ReaveStages(player);
+                var reaveStats = SkillAreaStats(player, skillStats, gem.Effect);
+                double stageMore = 1 + Stat(global::Stat.ReaveAreaOfEffectPlusPctFinalPerStage) * stages / 100d;
+                // The client scans from one body radius behind the player (FUN_141bdd210),
+                // with a 22-cell basis before gem levels and area modifiers (FUN_141bd9540).
+                radius = (int)Math.Floor(SkillArea.Radius(22, key => reaveStats.GetValueOrDefault(key),
+                    spell: false, stageMore) * radiusMore);
+                reaveFrom = player.Walk.Position(now);
+                reaveArc = ReaveArea(reaveFrom, to, radius, Stat(global::Stat.ReaveRotationOnRepeat), repeat);
+                centre = reaveArc.Value.Origin;
+                if (Stat(global::Stat.SkillConvertPctPhysicalDamageToRandomElement) is int conversion and > 0)
+                {
+                    admittedGem = ReaveConversion(player, admittedGem, conversion);
+                    skillStats = admittedGem.Stats;
+                }
+            }
+            double reachLimit = wave ? waveLength : radius;
+            if (areaAction == SunderWave.Action && !spell && !immediate)
+                sunder = new(player, from, to, skillStats, SkillAreaStats(player, areaStats, gem.Effect),
+                    radiusMore * chargeRadius, epoch, excludeMonster, singleStrikeTarget, once, targetFilter);
             // Ice Nova of Frostbolts expands from up to N active player Frostbolt projectiles near the aimed point,
             // with its native damage multiplier, instead of only expanding once around the caster.
             List<(int X, int Y)>? centres = null;
@@ -2364,51 +3645,145 @@ public static partial class Game
                     frostboltMore = Math.Max(0, 1 + Stat(global::Stat.IceNovaDamageWhenCastOnFrostboltPlusPctFinal) / 100.0);
                 }
             }
+            bool shapeUsesNearby = boneshatter is not null || lacerate is not null
+                || cleave is not null || reaveArc is not null || crushingFist || nearbyOnly;
             IEnumerable<(uint Key, SpawnedMonster Value, (int X, int Y) At, double Distance)> TargetsAt((int X, int Y) c) =>
-                player.Area.Monsters.Select(e => (e.Key, e.Value, At: e.Value.Walk.Position(now)))
-                .Select(e => (e.Key, e.Value, e.At, Distance: fissure
-                    ? VolcanicFissureSweep.ContactDistance(from, end, e.At, radius) : Dist(e.At, c)))
+                (contactTargets is null
+                    ? (shapeUsesNearby ? player.Area.MonstersNear(c, radius) : player.Area.Monsters)
+                    : contactTargets.Select(id => new KeyValuePair<uint, SpawnedMonster>(id, player.Area.Monsters.GetValueOrDefault(id)!))
+                        .Where(entry => entry.Value is not null))
+                .Select(e => (e.Key, e.Value, At: e.Value.Walk.Position(now)))
+                .Select(e => (e.Key, e.Value, e.At, Distance: Dist(e.At, c)))
                 .Where(e => e.Key != excludeMonster && e.Value.Hostile && !e.Value.Dead && e.Value.Life > 0 && e.Value.OwnerId is null
                     && (singleStrikeTarget is null || e.Key == singleStrikeTarget)
-                    && e.Distance <= reachLimit
+                    && (e.Distance <= reachLimit + (crushingFist ? LivingCollision.Size(e.Value) : 0)
+                        || contactTargets is not null || shieldWaves is not null
+                        || lacerate is not null || cleave is not null || reaveArc is not null)
+                    && (!crushingFist || !e.Value.WorldHidden && MeleeArcSight(player, c, e.At))
+                    && (lacerate is null || !e.Value.WorldHidden && lacerate.Waves.Covers(lacerate.Phase, e.At, LivingCollision.Size(e.Value))
+                        && MeleeArcSight(player, from, e.At))
+                    && (cleave is not { } arc || !e.Value.WorldHidden
+                        && arc.Covers(e.At, e.Distance, LivingCollision.Size(e.Value)) && MeleeArcSight(player, c, e.At))
+                    && (reaveArc is not { } sweep || !e.Value.WorldHidden && sweep.Covers(e.At, LivingCollision.Size(e.Value))
+                        && MeleeArcSight(player, reaveFrom, e.At))
                     && (strikeIndex > 0 ? !SkillMultiStrike.WasHitBeforeUse(alreadyHit, e.Key) : once?.Contains(e.Key) != true)
-                    && (!wave || GroundSlamWave.Covers(waveDir, from, e.At, waveHalfAngle, waveLength)));
-            var found = (centres is null ? TargetsAt(centre) : centres.SelectMany(TargetsAt)).ToList();
+                    && (!wave || GroundSlamWave.Covers(waveDir, from, e.At, waveHalfAngle, waveLength))
+                    && (targetFilter is null || targetFilter(e.Key, e.At)));
+            List<(uint Key, SpawnedMonster Value, (int X, int Y) At, double Distance)> found;
+            if (fissure)
+                found = [];
+            else if (infernalStrike && singleStrikeTarget is null)
+            {
+                int extraReach = MeleeSkillReach(player, weapon, gem.Effect, skillStats) - WeaponFor(player).Range;
+                uint primary = LightningStrikeTarget(player, player.Walk.Position(now), to, targetId, now, extraReach);
+                found = primary != 0 && player.Area.Monsters.TryGetValue(primary, out var struckTarget)
+                    ? TargetsAt(struckTarget.Walk.Position(now)).Where(e => e.Key == primary).ToList() : [];
+            }
+            else if (katabasisStrike)
+            {
+                // The chilling area's radius does not increase the reach or target count of the strike.
+                uint requested = singleStrikeTarget ?? targetId;
+                if (requested != 0 && player.Area.Monsters.TryGetValue(requested, out var selected))
+                    centre = selected.Walk.Position(now);
+                int strikeReach = MeleeSkillReach(player, weapon, gem.Effect, skillStats) + 2;
+                found = TargetsAt(centre)
+                    .Where(entry => (requested == 0 || entry.Key == requested) && !entry.Value.WorldHidden
+                        && SwingInReach(player, entry.Value, from, entry.At, strikeReach))
+                    .OrderBy(entry => entry.Distance).ThenBy(entry => entry.Key).Take(1).ToList();
+            }
+            else
+            {
+                var candidates = centres is null ? TargetsAt(centre) : centres.SelectMany(TargetsAt);
+                found = sunder is not null || iceCrash is not null || tectonic is not null ? []
+                    : shieldUse is null ? candidates.ToList() : candidates.Where(target =>
+                    shieldUse.Includes(target.Key, target.At, LivingCollision.Size(target.Value))).ToList();
+                if (elementalHit)
+                {
+                    element = SelectElementalHitElement(player, skillId, admittedGem, sequence, repeat);
+                    if (element >= ElementalHitOnly.Length) return;
+                    skillStats = new Dictionary<uint, int>(skillStats) { [ElementalHitOnly[element]] = 1 };
+                    admittedGem = admittedGem with { Stats = skillStats };
+                    int strikeReach = MeleeSkillReach(player, weapon, gem.Effect, skillStats) + 2;
+                    var primary = found.Where(entry => (targetId == 0 || entry.Key == targetId)
+                            && !entry.Value.WorldHidden && SwingInReach(player, entry.Value, from, entry.At, strikeReach))
+                        .OrderBy(entry => entry.Distance).ThenBy(entry => entry.Key).FirstOrDefault();
+                    found.Clear();
+                    if (primary.Value is not null) found.Add(primary);
+                }
+                if (pestilentStrike && singleStrikeTarget is null)
+                {
+                    int strikeReach = MeleeSkillReach(player, weapon, gem.Effect, skillStats) + 2;
+                    var origin = player.Walk.Position(now);
+                    var primary = found.Where(entry => (targetId == 0 || entry.Key == targetId)
+                            && !entry.Value.WorldHidden && SwingInReach(player, entry.Value, origin, entry.At, strikeReach))
+                        .OrderBy(entry => entry.Distance).ThenBy(entry => entry.Key).FirstOrDefault();
+                    found.Clear();
+                    if (primary.Value is not null) found.Add(primary);
+                }
+            }
+            if (hexblast)
+            {
+                var primary = targetId != 0 ? found.Find(entry => entry.Key == targetId)
+                    : found.OrderBy(entry => entry.Distance).ThenBy(entry => entry.Key).FirstOrDefault();
+                found.Clear();
+                if (primary.Value is not null)
+                {
+                    found.Add(primary);
+                    centre = primary.At;
+                    if (HexblastHex(primary.Value, now) is not null)
+                        found.AddRange(TargetsAt(primary.At).Where(entry => entry.Key != primary.Key));
+                }
+            }
             // Hits that may reach each monster only once across several sweeps record it here.
             if (once is not null) foreach (var f in found) once.Add(f.Key);
-            if (ring || wave || fissure)
+            if (travellingSweep) sweepStart = AreaTime(player);
+            if (travellingSweep && !fissure)
             {
                 found.Sort((a, b) => a.Distance.CompareTo(b.Distance));
-                reach = wave || fissure
-                    ? [.. found.Select(f => GroundSlamWave.AdvanceSeconds(f.Distance))]
-                    : [.. found.Select(f => IceNovaRing.Reach(f.Distance, radius, artVariation))];
-                sweepStart = AreaTime(player);
+                reach = vaalWave
+                    ? [.. found.Select(f => GroundSlamWave.VaalAdvanceSeconds(f.Distance, radius))]
+                    : wave
+                        ? [.. found.Select(f => GroundSlamWave.AdvanceSeconds(f.Distance))]
+                        : [.. found.Select(f => IceNovaRing.Reach(f.Distance, radius, artVariation))];
             }
             if (fissure)
-                ScheduleFissureEruption(player, ProjectilesFor(player), skillId, gem, from, end,
-                    now, epoch, criticalRoll, sequence, repeat, damageMore, cryExerted == true);
+            {
+                fissureEnd = VolcanicFissureSweep.End(player.Layout, from, to, radius);
+                ScheduleFissureEruption(player, ProjectilesFor(player), skillId, gem, from, fissureEnd,
+                    now, epoch, criticalRoll, sequence, repeat, damageMore, cryExerted == true, seismicExerted, radiusMore, rallyingDamage);
+            }
             targets = [.. found.Select(f => (f.Key, f.Value))];
             sweep = targets.Count;
             // shortcut: spirit and echo targets come after the ring's own and get no ring delay; time them by their
             // distance too once the client's rule for them is read.
-            var struck = targets.Select(t => t.Id).ToHashSet();
+            struck = targets.Select(t => t.Id).ToHashSet();
             foreach (uint id in spirit)
-                if (struck.Add(id) && player.Area.Monsters.TryGetValue(id, out var s) && !s.Dead && s.Life > 0) targets.Add((id, s));
-            if (echo is { } at)
+                if (struck.Add(id) && player.Area.Monsters.TryGetValue(id, out var s) && !s.Dead && s.Life > 0
+                    && (additionalStrikeTargets is null || s is { Hostile: true, OwnerId: null, WorldHidden: false }))
+                    targets.Add((id, s));
+            if (echo?.Centre is { } at)
                 targets.AddRange(player.Area.MonstersNear(at, radius).Where(e => e.Value.Hostile && !e.Value.Dead && e.Value.Life > 0
                     && Dist(e.Value.Walk.Position(now), at) <= radius && struck.Add(e.Key)).Select(e => (e.Key, e.Value)));
-            // Melee Splash: each struck enemy splashes onto the enemies around it, for the support's less damage.
-            if (!spell && hammer is null)
+            if (elementalHit)
+            {
+                elementalHitStruck = struck;
+                elementalHitContacts = targets.Count;
+            }
+            // Melee Splash: each struck enemy splashes onto the enemies around it (Melee Strike skills only).
+            if (!spell && hammer is null && allowMeleeSplash && boneshatter?.Pulse != true && infernalBlast is null
+                && (targets.Count > 0 || elementalHit)
+                && SkillsFor(player).IsStrike(gem.Effect) && MeleeAttack(player, gem.Effect))
             {
                 var merged = SkillAreaStats(player, SupportedSkill(player, skillId).Stats, gem.Effect);
                 int SplashStat(uint key) => merged.GetValueOrDefault(key);
-                if (MeleeSplash.Settings(SplashStat) is { } splash)
+                if (elementalHit) elementalHitSplash = MeleeSplash.Settings(SplashStat);
+                else if (MeleeSplash.Settings(SplashStat) is { } splash)
                     foreach (var (_, m) in targets.ToArray())
                     {
                         var splashAt = m.Walk.Position(now);
                         foreach (var (sid, sm) in player.Area.MonstersNear(splashAt, splash.Radius))
-                            if (sm.Hostile && !sm.Dead && sm.Life > 0 && sm.OwnerId is null && struck.Add(sid)
-                                && Dist(sm.Walk.Position(now), splashAt) <= splash.Radius)
+                            if (sm.Hostile && !sm.Dead && sm.Life > 0 && sm.OwnerId is null && !sm.WorldHidden
+                                && Dist(sm.Walk.Position(now), splashAt) <= splash.Radius && struck.Add(sid))
                             {
                                 targets.Add((sid, sm));
                                 splashMore[sid] = splash.More;
@@ -2417,52 +3792,159 @@ public static partial class Game
                     }
             }
         }
+        var fissureOrigin = ProjectileSession.Vector(from);
+        var fissurePath = fissure ? ProjectileSession.Vector(fissureEnd) - fissureOrigin : default;
+        double fissureLength = fissurePath.Length;
+        var fissureDirection = fissurePath.Unit;
+        double fissureFront = -1;
+        List<(uint Id, SpawnedMonster M, double Distance)>? fissureContacts = fissure ? [] : null;
+
+        async Task<bool> AddFissureContacts()
+        {
+            var contacts = fissureContacts!;
+            contacts.Clear();
+            while (fissureFront < fissureLength)
+            {
+                double speed = GroundSlamWave.CellsPerSecond;
+                double next = fissureFront < 0 ? 0 : Math.Min(fissureLength, fissureFront + speed * FrameMs / 1000d);
+                if (!await WaitProjectileTime(player, sweepStart + GroundSlamWave.AdvanceSeconds(next), epoch))
+                    return false;
+                using (ProjectileMutation(player, advance: scheduledSession is null))
+                {
+                    if (!player.ProjectileActive(epoch) || player.PlayerLife == 0) return false;
+                    double start = Math.Max(0, fissureFront);
+                    if (fissureFront >= 0)
+                        next = Math.Clamp((AreaTime(player) - sweepStart) * speed, next, fissureLength);
+                    fissureFront = next;
+
+                    // The client's fissure checks the actors around each new path segment. Look up only the
+                    // newly covered capsule, using the same area clock as the walkers.
+                    var midpoint = fissureOrigin + fissureDirection * ((start + next) / 2);
+                    double now = ProjectileWorldTime(player);
+                    foreach (var (id, monster) in player.Area.MonstersNear((midpoint.X, midpoint.Y), radius + (next - start) / 2))
+                    {
+                        if (id == excludeMonster || !monster.Hostile || monster.Dead || monster.Life == 0 || monster.OwnerId is not null
+                            || monster.WorldHidden || struck.Contains(id) || (singleStrikeTarget is not null && id != singleStrikeTarget)
+                            || (strikeIndex > 0 ? SkillMultiStrike.WasHitBeforeUse(alreadyHit, id) : once?.Contains(id) == true)) continue;
+                        var at = monster.Walk.Position(now);
+                        double distance = VolcanicFissureSweep.ContactDistance(fissureOrigin, fissureDirection, start, next, at, radius);
+                        if (double.IsFinite(distance) && (targetFilter is null || targetFilter(id, at)))
+                            contacts.Add((id, monster, distance));
+                    }
+                    contacts.Sort(static (a, b) => a.Distance != b.Distance ? a.Distance.CompareTo(b.Distance) : a.Id.CompareTo(b.Id));
+                    foreach (var (id, monster, _) in contacts)
+                    {
+                        struck.Add(id);
+                        once?.Add(id);
+                        targets.Add((id, monster));
+                    }
+                }
+                if (contacts.Count > 0) return true;
+            }
+            return false;
+        }
+
         // One simultaneous sweep, independent of notification latency. A holy hammer's hits are melee area hits that can
         // grant Fortification (the wiki's Holy Sweep of Hammerfalls); Rage stays with its sweep.
-        bool fortificationGranted = false;
-        bool rageGranted = hammer is not null; // Only a positive gain takes this sweep's latch.
+        bool fortificationGranted = shieldUse?.FortificationGranted == true || lacerate?.FortificationGranted == true;
+        bool rageGranted = hammer is not null || shieldUse?.RageGranted == true || lacerate?.RageGranted == true; // Only a positive gain takes this sweep's latch.
         // The enemies this sweep struck and where, for Holy Sweep's hammers (RunHolyHammers).
         var hammerTargets = new List<(uint Id, (int X, int Y) At)>();
         double bloodMore = BloodChargeDamageMore(player, Stat);
         int landed = 0;
+        bool gainedImmolationCharge = false;
         // One sweep, one hit: its offensive inputs are read once, at the first contact (inside the projectile mutation, after
         // earlier contacts caught up), and rolled per monster. They were computed again for every monster (a whole stat
         // calculation each), which spread one sweep's hits over a second in a crowd.
         Dictionary<uint, int>? playerStats = null;
+        IReadOnlyDictionary<uint, int>? ailmentSkillStats = null;
         Penetration.PerType pen = default;
         HitResistances.Mods mods = default;
+        int extraArcRolls = 0;
         AreaSkillDamageProfile sweepProfile = default!;
         AreaSkillDamageProfile? blindedProfile = null;
-        SpiderDamageSource? sweepSpider = null;
+        SpiderDamageSource? sweepSpider = null, sweepOffSpider = null;
+        double mainHandMore = 1, dualWieldMore = 1;
         int sweepMultiplier = 0;
         AttackAccuracyProfile accuracy = default;
         LeechSources? leech = null;
         bool weaponAttack = false;
+        Item? weaponContactSource = null, secondWeaponContactSource = null;
+        PlayerSkillSource? goreShockwave = null;
         TinctureKillBonus? tinctureKill = null;
         IReadOnlyDictionary<uint, int>? weaponLocal = null;
+        int weaponWitherChance = 0;
+        string? sweepWeaponClass = null, secondSweepWeaponClass = null;
         ImpaleStats.Settings impale = default, criticalImpale = default;
         // Every monster gets its hit before the sweep's deaths run their loot, experience and quest work, and before a
         // Mirrored monster's reflected ailments reach the player (its freeze would end the action between two targets).
         var deaths = new List<(uint Id, SpawnedMonster M)>();
         var reflected = new List<MonsterElementalAilments.Effect>();
         PlayerStatScope? sweepStats = null;
+        int settledDeaths = 0;
+
+        async Task SettleSweep()
+        {
+            if (reflected.Count > 0 && playerStats is not null)
+                using (ProjectileMutation(player, advance: scheduledSession is null))
+                    ReflectPendingAilmentsLocked(player, reflected, ProjectileWorldTime(player), playerStats, AreaRng(player));
+            while (settledDeaths < deaths.Count)
+            {
+                var (deadId, dead) = deaths[settledDeaths++];
+                if (scheduledSession is { } scheduled)
+                    CommitProjectileKill(scheduled, deadId, dead, scheduled.Runtime.Now, AreaRng(player),
+                        playerKill: ownerContact, skillStats: skillStats);
+                else await MonsterKilled(player, deadId, dead, skillStats: skillStats);
+            }
+        }
+
         try
         {
-            for (int victim = 0; victim < targets.Count; victim++)
+            for (int victim = 0; ; victim++)
             {
+                if (victim == targets.Count)
+                {
+                    if (sunder is not null)
+                    {
+                        sweepStats?.Dispose();
+                        sweepStats = null;
+                        await SettleSweep();
+                        if (!await sunder.AppendContacts(targets)) break;
+                    }
+                    else if (iceCrash is not null)
+                    {
+                        sweepStats?.Dispose();
+                        sweepStats = null;
+                        await SettleSweep();
+                        if (!await iceCrash.AppendContacts(targets)) break;
+                    }
+                    else if (tectonic is not null)
+                    {
+                        sweepStats?.Dispose();
+                        sweepStats = null;
+                        await SettleSweep();
+                        if (!await tectonic.AppendContacts(targets)) break;
+                    }
+                    else if (!fissure || !await AddFissureContacts()) break;
+                }
+                if (hexblast && victim > 0 && !hexblastExpanded) break;
                 var (id, m) = targets[victim];
+                bool sunderShockwave = sunder?.IsShockwave == true;
                 // A ring and a wave arrive over time: the victim nearest the caster (or the player) first, each one when its
                 // front reaches it. A retired wave (death, area change, a closed connection) stops the rest of the sweep.
-                if ((ring || wave || fissure) && victim < reach.Length && reach[victim] > 0
+                if (travellingSweep && victim < reach.Length && reach[victim] > 0
                     && !await WaitProjectileTime(player, sweepStart + reach[victim], epoch))
 
                 {
-                    if (wave) Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: the wave was retired "
+                    if (wave || vaalWave) Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: the wave was retired "
                         + $"{AreaTime(player) - sweepStart:0.###} s in, {targets.Count - victim} monster(s) left unhit");
                     break;
                 }
-                if (wave && victim < reach.Length)
-                    Console.WriteLine($"[gateway] {player.Connection.Remote} {gem.Name} wave reaches 0x{id:x} at {reach[victim] * GroundSlamWave.CellsPerSecond:0.#} cells {reach[victim]:0.###} s after the slam");
+                if ((wave || vaalWave) && victim < reach.Length)
+                {
+                    double cellsPerSecond = vaalWave ? radius / GroundSlamWave.VaalTravelSeconds : GroundSlamWave.CellsPerSecond;
+                    Console.WriteLine($"[gateway] {player.Connection.Remote} {gem.Name} wave reaches 0x{id:x} at {reach[victim] * cellsPerSecond:0.#} cells {reach[victim]:0.###} s after the slam");
+                }
                 MonsterHit? applied;
                 byte hitCode;
                 int damage;
@@ -2471,12 +3953,16 @@ public static partial class Game
                 List<byte[]>? ignited = null, bled = null;
                 string igniteLog = "", bleedLog = "";
                 StunHit stun;
+                SpawnedMonster.NativeKnockback? nativeKnockback = null;
                 using (ProjectileMutation(player, advance: scheduledSession is null))
                 {
                     // Catch up earlier projectile contacts before reading any live offensive input. The first accepted
                     // target opens one fresh character scope, which every victim reuses until this sweep's loop exits.
                     if (player.Closed || player.LeavingArea || player.RageRetired || player.PlayerLife == 0 || player.Paused
-                        || !(ring || wave || fissure || hammer is not null) && (!Current() || !holdsItsSwing && !preservesSwing && cooldownUse is null && triggeredCurrent is null && !PlayerActionCurrent(player, action))) break;
+                        || (sunder is not null || iceCrash is not null || tectonic is not null) && !player.ProjectileActive(epoch)
+                        || !(travellingSweep || hammer is not null || sunder is not null || iceCrash is not null || tectonic is not null)
+                            && (!Current() || !holdsItsSwing && !preservesSwing && cooldownUse is null
+                                && triggeredCurrent is null && !PlayerActionCurrent(player, action))) break;
                     if (m.Dead || m.Life == 0 || !m.Hostile
                         || !player.Area.Monsters.TryGetValue(id, out var current) || !ReferenceEquals(current, m)) continue;
                     bool freshPlayer = playerStats is null;
@@ -2484,23 +3970,42 @@ public static partial class Game
                     {
                         sweepStats = new PlayerStatScope(player, fresh: true);
                         playerStats = new Dictionary<uint, int>(CharacterPlayerStats(player));
+                        if (!spell && linkedSource && SkillsFor(player).IsMelee(gem.Effect)
+                            && admittedGem.WornGrant is not { EffectId: GoreShockwaveEffect })
+                            goreShockwave = GoreShockwaveForHit(player, playerStats);
+                        if (spell) extraArcRolls = ArcExtraRolls(player, effectId, playerStats);
                         // Capture the admitted gem and actual source weapon once. The ordinary main hand keeps its local
                         // sources; a shield skill's off hand intentionally carries none of the main hand's local values.
-                        var shield = spell ? null : ShieldWeapon(player, skillId);
+                        var shield = spell || retainedAttack is not null ? null : ShieldWeapon(player, skillId);
                         // A dual-wielded use swings its hand's weapon (AttackHands); both hands at once add the off hand's
                         // hit to the main hand's (SupportedSwingHit), each from its own captured inputs.
-                        var swingWeapon = shield ?? OffHandSwing(player, hand);
-                        var sourceWeapon = shield ?? HandWeapon(player, hand);
+                        var swingWeapon = retainedAttack?.Weapon ?? shield ?? OffHandSwing(player, hand);
+                        var sourceWeapon = retainedAttack?.Weapon ?? shield ?? HandWeapon(player, hand);
+                        if (!spell) sweepWeaponClass = sourceWeapon.ItemClass ?? "";
                         var local = spell || shield is not null ? null : sourceWeapon.LocalSources;
                         weaponLocal = local;
                         weaponAttack = !spell && shield is null && sourceWeapon.ItemClass is not null && SkillsFor(player).IsAttack(gem.Effect);
                         if (weaponAttack)
+                        {
                             tinctureKill = TinctureKillBonusFor(player, playerStats, hand);
-                        if (SupportedHitInputsFor(player, skillId, weapon: sourceWeapon, charges: discharge?.Charges, capturedGem: admittedGem, area: IsSmite(gem.Effect) ? singleStrikeTarget is null : null)
+                            weaponContactSource = SkeletonWeaponContactSource(player, hand, local);
+                            weaponWitherChance = local?.GetValueOrDefault(global::Stat.LocalWitheredOnHitFor2SecondsPctChance) ?? 0;
+                        }
+                        bool? hitArea = boneshatter?.Pulse ?? (infernalBlast is not null ? true
+                            : infernalStrike || pestilentStrike ? false : IsSmite(gem.Effect) ? singleStrikeTarget is null : (bool?)null);
+                        if (SupportedHitInputsFor(player, skillId, weapon: sourceWeapon, charges: discharge?.Charges, capturedGem: admittedGem, area: hitArea)
                             is not { } capturedInputs) break;
-                        var offInputs = shield is null && hand == AttackHand.Both && OffhandWeaponFor(player) is { } bothOff
+                        var bothOff = shield is null && hand == AttackHand.Both ? OffhandWeaponFor(player) : null;
+                        var offInputs = bothOff is not null
                             ? SupportedHitInputsFor(player, skillId, weapon: bothOff, charges: discharge?.Charges, capturedGem: admittedGem)
                             : null;
+                        if (weaponAttack && offInputs is not null)
+                        {
+                            secondWeaponContactSource = SkeletonWeaponContactSource(player, AttackHand.Off, bothOff?.LocalSources);
+                            secondSweepWeaponClass = bothOff?.ItemClass;
+                            weaponWitherChance = Math.Max(weaponWitherChance,
+                                bothOff?.LocalSources?.GetValueOrDefault(global::Stat.LocalWitheredOnHitFor2SecondsPctChance) ?? 0);
+                        }
                         // Sacrifice's prepaid chaos is flat added damage. Apply the admitted skill's effectiveness
                         // before the shared hit and ailment ancestry, so increases, more multipliers and prohibition
                         // rules see it exactly as they see any other spell-added damage.
@@ -2516,6 +4021,9 @@ public static partial class Game
                                 Raw = offInputs.Raw.Add(DamageType.Chaos, new(added, added)),
                             };
                         }
+                        int totalExertWarcries = !attack ? 0 : (cryExerted == true ? 1 : 0) + otherWarcries + (rallyingDamage.HasValue ? 1 : 0);
+                        long exertedIncreased = !attack ? 0 : ExertedAttackIncreasedDamage(playerStats, skillStats,
+                            totalExertWarcries, seismicExerted, ancestralTargets > 0);
                         long additionalIncreased = PlayerHitDamage.VsBlindedDamageStat is var key
                             ? (long)playerStats.GetValueOrDefault(key) + admittedGem.Stats.GetValueOrDefault(key) : 0;
                         AreaSkillDamageProfile Profile(long increased)
@@ -2531,28 +4039,110 @@ public static partial class Game
                                     melee: SkillsFor(player).IsMelee(gem.Effect), increased, capturedInputs),
                                 SupportedPoison(player, skillId, spell, playerStats, swingWeapon, increased, capturedInputs));
                         }
-                        sweepProfile = Profile(0);
-                        sweepSpider = CaptureSpiderDamage(player, capturedInputs,
-                            AddedEffectiveness(player, admittedGem.Effect, admittedGem.Level), context: true, local: local);
-                        if (additionalIncreased != 0) blindedProfile = Profile(additionalIncreased);
+                        sweepProfile = Profile(exertedIncreased);
+                        double targetEffectiveness = AddedEffectiveness(player, admittedGem.Effect, admittedGem.Level);
+                        sweepSpider = CaptureSpiderDamage(player, capturedInputs, targetEffectiveness, context: true, local: local,
+                            bow: false, offHand: hand == AttackHand.Off, required: HasLocalTargetDamage(bothOff?.LocalSources),
+                            extraIncreased: exertedIncreased);
+                        if (sweepSpider is not null && !spell && shield is null)
+                        {
+                            if (hand != AttackHand.Off)
+                                (mainHandMore, dualWieldMore) = HandDamageMore(player, admittedGem.Stats);
+                            else
+                                (_, dualWieldMore) = HandDamageMore(player, admittedGem.Stats);
+                            if (offInputs is not null)
+                                sweepOffSpider = CaptureSpiderDamage(player, offInputs, targetEffectiveness, context: true,
+                                    local: OffhandWeaponFor(player)?.LocalSources, bow: false, offHand: true, required: true,
+                                    extraIncreased: exertedIncreased);
+                        }
+                        if (additionalIncreased != 0) blindedProfile = Profile(exertedIncreased + additionalIncreased);
                         pen = Penetration.Of(playerStats, Stats, attack: !spell, skillStats, local);
                         mods = HitResistMods(playerStats, skillStats);
-                        sweepMultiplier = SupportedCriticalMultiplier(player, skillId);
-                        if (!spell) accuracy = SupportedAccuracy(player, skillId, hand);
+                        sweepMultiplier = (retainedAttack?.CriticalMultiplier ?? SupportedCriticalMultiplier(player, skillId, sourceWeapon))
+                            + flurryBonus.CriticalMultiplier;
+                        if (!spell)
+                        {
+                            long exertedAcc = !attack ? 0 : ExertedAttackAccuracyIncrease(totalExertWarcries, playerStats, skillStats);
+                            accuracy = retainedAttack is not null
+                                ? retainedAttack.Accuracy
+                                : SupportedAccuracy(player, skillId, hand, exertedAcc);
+                        }
                         leech = HitLeechSources(playerStats, !spell, skillStats, local, !spell && SkillsFor(player).IsMelee(gem.Effect));
-                        impale = ImpaleStats.From(playerStats, Stats, !spell, skillStats, local);
-                        criticalImpale = ImpaleStats.From(playerStats, Stats, !spell, skillStats, local, critical: true);
+                        impale = WeaponImpaleSettings(playerStats, Stats, !spell, skillStats, spell || shield is not null ? null : sourceWeapon);
+                        criticalImpale = WeaponImpaleSettings(playerStats, Stats, !spell, skillStats, spell || shield is not null ? null : sourceWeapon, critical: true);
+                        if (removeStunAndKnockback)
+                        {
+                            var adjusted = new Dictionary<uint, int>(skillStats)
+                            {
+                                [global::Stat.BaseGlobalChanceToKnockbackPct] = -playerStats.GetValueOrDefault(global::Stat.BaseGlobalChanceToKnockbackPct),
+                            };
+                            ailmentSkillStats = adjusted;
+                        }
+                        else if (extraKnockbackDistancePct != 0 || (offHandWeapon && skillStats.GetValueOrDefault(global::Stat.GlobalKnockback) != 0))
+                        {
+                            var adjusted = new Dictionary<uint, int>(skillStats);
+                            if (extraKnockbackDistancePct != 0)
+                                adjusted[global::Stat.KnockbackDistancePlusPct] = adjusted.GetValueOrDefault(global::Stat.KnockbackDistancePlusPct) + extraKnockbackDistancePct;
+                            if (offHandWeapon && adjusted.GetValueOrDefault(global::Stat.GlobalKnockback) != 0
+                                && adjusted.GetValueOrDefault(global::Stat.BaseGlobalChanceToKnockbackPct) < 100)
+                                adjusted[global::Stat.BaseGlobalChanceToKnockbackPct] = 100;
+                            ailmentSkillStats = adjusted;
+                        }
+                        else
+                            ailmentSkillStats = skillStats;
+                        if (retaliation)
+                        {
+                            uint durationKey = global::Stat.RetaliationSkillsAllAilmentDurationPlusPct;
+                            long duration = (long)playerStats.GetValueOrDefault(durationKey) + skillStats.GetValueOrDefault(durationKey);
+                            if (duration != 0)
+                            {
+                                uint ailmentDurationKey = global::Stat.BaseAllAilmentDurationPlusPct;
+                                ailmentSkillStats = new Dictionary<uint, int>(ailmentSkillStats)
+                                {
+                                    [ailmentDurationKey] = ActorScale.Saturate(ailmentSkillStats.GetValueOrDefault(ailmentDurationKey) + duration),
+                                };
+                            }
+                        }
+                        if (weaponAttack)
+                            ailmentSkillStats = WithWeaponAilmentStats(ailmentSkillStats, local,
+                                offHand: hand == AttackHand.Off, otherWeapon: offInputs is not null ? bothOff?.LocalSources : null);
                     }
                     // The target's condition is chosen before accuracy, crit RNG, on-hit hooks and the hit's own Blind.
                     var profile = Blinded(player, id) && blindedProfile is not null
                         ? blindedProfile : sweepProfile;
                     if (sweepSpider is { } spider)
                     {
-                        var woven = SpiderDamageProfile(spider, m.SpiderWebs.Count(ProjectileWorldTime(player)),
-                            Blinded(player, id), m.Ignites.Burning, m.Bleeds.Burning, EnemyOnLowLife(m));
-                        profile = new(woven.Hit.Scale(ruthless), woven.Ignite, woven.Bleed, woven.Poison);
+                        double hitAt = ProjectileWorldTime(player);
+                        int webs = m.SpiderWebs.Count(hitAt);
+                        bool maimed = m.MaimedUntil > hitAt, lowLife = EnemyOnLowLife(m);
+                        bool targetIgnited = m.Ignites.IgnitedAt(hitAt), bleeding = m.Bleeds.IgnitedAt(hitAt);
+                        bool close = spider.Melee && spider.Stats.GetValueOrDefault(global::Stat.MeleeDamagePlusPctAtCloseRange) != 0
+                            && InCloseRange(player, m, hitAt);
+                        bool blinded = Blinded(player, id, hitAt);
+                        var conditionalDamage = ContactDamage(player, m, hitAt, spider.Stats, spider.Local);
+                        var woven = SpiderDamageProfile(spider, webs, blinded, targetIgnited, bleeding,
+                            lowLife, maimed, close, conditionalDamage);
+                        var conditionalHit = mainHandMore == 1 ? woven.Hit : woven.Hit.Scale(mainHandMore);
+                        if (sweepOffSpider is { } off)
+                            conditionalHit = conditionalHit.Add(SpiderDamageProfile(off, webs, blinded, targetIgnited, bleeding,
+                                lowLife, maimed, close, ContactDamage(player, m, hitAt, off.Stats, off.Local)).Hit);
+                        double contactMore = ruthless * dualWieldMore;
+                        if (contactMore != 1) conditionalHit = conditionalHit.Scale(contactMore);
+                        if (scaledBlastChaos > 0) conditionalHit = conditionalHit.Add(DamageType.Chaos, new(scaledBlastChaos, scaledBlastChaos));
+                        profile = new(conditionalHit, woven.Ignite, woven.Bleed, woven.Poison);
                     }
-                    if (!spell && repeat > 0)
+                    var fullLifeStrike = dualStrikeBonuses.Against(m);
+                    double profileMore = phaseDamageMore * hitAndAilmentMore * fullLifeStrike.DamageMore;
+                    if (boneshatter is not null)
+                    {
+                        profileMore *= boneshatter.More;
+                        if (m.FlinchUntil > ProjectileWorldTime(player))
+                            profileMore *= Math.Max(0, 1 + Stat(global::Stat.ActiveSkillDamagePlusPctFinalVsStunnedEnemies) / 100d);
+                    }
+                    if (profileMore != 1)
+                        profile = new(profile.Hit.Scale(profileMore), RepeatAilment(profile.Ignite, profileMore),
+                            RepeatAilment(profile.Bleed, profileMore), RepeatAilment(profile.Poison, profileMore));
+                    if (!spell && repeat > 0 && retainedAttack is null)
                     {
                         double repeatMore = MeleeRepeatDamageMore(player, skillId, repeat);
                         profile = profile with
@@ -2562,33 +4152,95 @@ public static partial class Game
                             Poison = RepeatAilment(profile.Poison, repeatMore),
                         };
                     }
-                    var contactHit = profile.Hit;
+                    double overexertionMore = !attack ? 1 : ExertedAttackMore(skillStats, cryExerted == true, otherWarcries, rallyingDamage, playerStats);
+                    if (overexertionMore != 1)
+                        profile = profile with
+                        {
+                            Ignite = RepeatAilment(profile.Ignite, overexertionMore),
+                            Bleed = RepeatAilment(profile.Bleed, overexertionMore),
+                            Poison = RepeatAilment(profile.Poison, overexertionMore),
+                        };
+                    double elementalAt = elementalHit || hexblast ? ProjectileWorldTime(player) : 0;
+                    var elementalAilments = elementalHit ? ElementalHitAilmentsOn(m, elementalAt) : ElementalHitAilments.None;
+                    double elementalMore = elementalHit ? ElementalHitDamageMore(elementalHitPerAilment, elementalAilments) : 1;
+                    var hex = hexblast ? HexblastHex(m, elementalAt) : null;
+                    double targetAilmentMore = hex is null ? elementalMore
+                        : Math.Max(0, 1 + Stat(global::Stat.HexblastAilmentDamagePlusPctFinalIfHexed) / 100d);
+                    if (targetAilmentMore != 1)
+                        profile = profile with
+                        {
+                            Ignite = RepeatAilment(profile.Ignite, targetAilmentMore),
+                            Bleed = RepeatAilment(profile.Bleed, targetAilmentMore),
+                            Poison = RepeatAilment(profile.Poison, targetAilmentMore),
+                        };
+                    var contactHit = elementalMore == 1 ? profile.Hit : profile.Hit.Scale(elementalMore);
+                    if (retainedAttack is { } savedAttack)
+                    {
+                        contactHit = contactHit.Scale(savedAttack.HitMore);
+                        profile = profile with
+                        {
+                            Ignite = RepeatAilment(profile.Ignite, savedAttack.AilmentMore),
+                            Bleed = RepeatAilment(profile.Bleed, savedAttack.AilmentMore),
+                            Poison = RepeatAilment(profile.Poison, savedAttack.AilmentMore),
+                        };
+                    }
+                    double waveDamageMore = sunderShockwave ? sunder!.ShockwaveMore : iceCrash?.DamageMore ?? 1;
+                    if (waveDamageMore != 1)
+                    {
+                        contactHit = contactHit.Scale(waveDamageMore);
+                        profile = profile with
+                        {
+                            Ignite = RepeatAilment(profile.Ignite, waveDamageMore),
+                            Bleed = RepeatAilment(profile.Bleed, waveDamageMore),
+                            Poison = RepeatAilment(profile.Poison, waveDamageMore),
+                        };
+                    }
                     if (frostboltMore != 1) contactHit = contactHit.Scale(frostboltMore);
+                    if (chargeAttackMore != 1) contactHit = contactHit.Scale(chargeAttackMore);
                     if (spell && repeat > 0) contactHit = contactHit.Scale(GreaterEchoHitMore(repeat, Stat));
                     if (waveCloseDamage != 0 && victim < reach.Length)
                         contactHit = contactHit.Scale(GroundSlamWave.CloseHitMultiplier(
                             reach[victim] * GroundSlamWave.CellsPerSecond, waveLength, waveCloseDamage));
-                    else if (SkillsFor(player).EffectId(gem.Effect) == "VaalGroundSlam")
+                    else if (holyPath)
+                        contactHit = contactHit.Scale(GroundSlamWave.CloseHitMultiplier(
+                            Dist(holyPathUse.Landing, m.Walk.Position(ProjectileWorldTime(player))), radius,
+                            Stat(global::Stat.GroundslamDamageToCloseTargetsPlusPctFinal)));
+                    else if (vaalSlam)
                     {
-                        double distance = Dist(player.Walk.Position(ProjectileWorldTime(player)), m.Walk.Position(ProjectileWorldTime(player)));
-                        contactHit = contactHit.Scale(1 + Stat(global::Stat.GroundslamDamageToCloseTargetsPlusPctFinal)
-                            / 100.0 * Math.Max(0, 1 - distance / Math.Max(1, radius)));
+                        double distance = vaalWave && victim < reach.Length
+                            ? reach[victim] * radius / GroundSlamWave.VaalTravelSeconds
+                            : Dist(from, m.Walk.Position(ProjectileWorldTime(player)));
+                        contactHit = contactHit.Scale(GroundSlamWave.CloseHitMultiplier(distance, radius,
+                            Stat(global::Stat.GroundslamDamageToCloseTargetsPlusPctFinal)));
                     }
                     if (!spell && SkillsFor(player).IsMelee(gem.Effect))
                         contactHit = WithMeleeProximityLocked(player, playerStats, skillStats, m, contactHit, ProjectileWorldTime(player));
-                    int hitChance = spell ? 100 : AttackHitChanceAt(player, id, m, ProjectileWorldTime(player), accuracy, playerStats);
-                    if (!spell && !accuracy.CannotBeEvaded && hammer?.CannotBeEvaded != true && !m.AttackEvasion.Hits(hitChance, ProjectileWorldTime(player), player.AttackAccuracyRandom)) continue;
+                    // The wave rolls accuracy to create a shockwave. The shockwave itself hits the surrounding enemies.
+                    int hitChance = spell || sunderShockwave ? 100 : AttackHitChanceAt(player, id, m, ProjectileWorldTime(player), accuracy, playerStats);
+                    if (!spell && !sunderShockwave && !accuracy.CannotBeEvaded && hammer?.CannotBeEvaded != true
+                        && !m.AttackEvasion.Hits(hitChance, ProjectileWorldTime(player), player.AttackAccuracyRandom)) continue;
                     if (MonsterBlocks(m, AreaRng(player), spell, ProjectileWorldTime(player), skillStats))
                     {
                         Console.WriteLine($"[gateway] {player.Connection.Remote} {gem.Name} on 0x{id:x} ({m.Label}) blocked");
                         continue;
                     }
-                    var gambler = GamblerFor(playerStats);
+                    var hitRolls = HitRollsFor(playerStats);
+                    if (extraArcRolls > 0) hitRolls = hitRolls with
+                    {
+                        DamageExtraRolls = hitRolls.DamageExtraRolls < 0 ? 0 : Math.Max(hitRolls.DamageExtraRolls, extraArcRolls)
+                    };
+                    int hitExertWarcries = !attack ? 0 : (cryExerted == true ? 1 : 0) + otherWarcries + (rallyingDamage.HasValue ? 1 : 0);
+                    var damageRoll = WithExertedAttackRollModifiers((hitRolls with { DamageMorePct = 0 })
+                        .ForSkill(Stat, spell, finalRepeat: repeat == SpellRepeats(player, skillId, gem.Effect),
+                            intelligence: player.Pools.Intelligence), cryExerted == true, hitExertWarcries, playerStats, skillStats).ForWeapon(weaponLocal);
+                    long criticalDoubleDamage = HitRollModifiers.CriticalDoubleDamageOf(playerStats, skillStats);
                     var rolled = WithConditionalSupportDamageLocked(player, skillStats, !spell, m,
-                        GameEvents.WithOutgoingDamage(player, playerStats, m, WithIntimidatingCryExert((gambler with { DamageMorePct = 0 })
-                            .ForSkill(Stat, spell, finalRepeat: repeat == SpellRepeats(player, skillId, gem.Effect)), cryExerted == true)
-                            .ForWeapon(weaponLocal).RollOutgoingHit(contactHit, AreaRng(player))),
+                        GameEvents.WithOutgoingDamage(player, playerStats, m,
+                            damageRoll.RollBeforeCritical(contactHit, AreaRng(player), criticalDoubleDamage)),
                         ProjectileWorldTime(player));
+                    double targetHitMore = hex is null ? 1
+                        : Math.Max(0, 1 + Stat(global::Stat.HexblastHitDamagePlusPctFinalIfHexed) / 100d);
+                    if (targetHitMore != 1) rolled = rolled.Scale(targetHitMore);
                     // Hallow: an attack against an enemy affected by Hallowing Flame gains its share of physical damage as
                     // extra fire, and removes the flame.
                     if (!spell && m.HallowingFlameUntil > ProjectileWorldTime(player) && rolled[DamageType.Physical].Min is > 0 and var flamePhys)
@@ -2597,92 +4249,259 @@ public static partial class Game
                         rolled = rolled.Add(DamageType.Fire, new(flameFire, flameFire));
                         m.HallowingFlameUntil = 0;
                     }
+                    if (attack)
+                        rolled = WithExertedAttackDamage(rolled, skillStats, cryExerted == true, otherWarcries, rallyingDamage, playerStats);
+                    int exertedCritBonus = !attack ? 0 : ExertedAttackBonusCritPermyriad(hitExertWarcries, playerStats, skillStats);
                     // The shared roll meets each target's current chance: a source can change between targets.
-                    int criticalChance = CriticalChanceOn(player, id, SupportedCriticalChance(player, skillId, hand, offCritical),
-                        SupportedCriticalChanceVsBlinded(player, skillId, release: false, swingCritical),
-                        SupportedCriticalChanceVsGround(player, skillId, release: false, swingCritical));
-                    critical = RollCriticalStrike(player, criticalChance, skillStats,
-                            attack: !spell, skillRoll: criticalRoll, playerStats: playerStats)
-                        && (spell || GameServer.Core.World.EvasionEntropy.ConfirmsCritical(hitChance, player.AttackAccuracyRandom));
-                    int multiplier = CriticalMultiplierOn(m, sweepMultiplier, playerStats, skillStats);
+                    if (!linkedSource && retainedAttack is { } source)
+                    {
+                        int capturedChance = CriticalChanceOn(player, id, source.CriticalChance, source.CriticalVsBlind, source.CriticalVsGround);
+                        critical = RollCriticalStrike(player, capturedChance, skillStats, attack: true, skillRoll: criticalRoll, playerStats: playerStats)
+                            && GameServer.Core.World.EvasionEntropy.ConfirmsCritical(hitChance, player.AttackAccuracyRandom);
+                    }
+                    else
+                    {
+                        int useCriticalChance = extraCriticalIncrease == 0
+                            ? SupportedCriticalChance(player, skillId, hand, offCritical, extraIncrease: 0, extraBaseCrit: exertedCritBonus)
+                            : SupportedCriticalChanceFor(player, skillId, release: false, extraIncrease: extraCriticalIncrease, weaponCritical: null, extraBaseCrit: exertedCritBonus);
+                        int criticalChance = CriticalChanceOn(player, id, useCriticalChance,
+                            SupportedCriticalChanceVsBlinded(player, skillId, release: false, swingCritical, extraIncrease: 0, extraBaseCrit: exertedCritBonus),
+                            SupportedCriticalChanceVsGround(player, skillId, release: false, swingCritical, extraIncrease: 0, extraBaseCrit: exertedCritBonus));
+                        // Read an existing bleed before this attack can inflict its own.
+                        if (!spell && m.Bleeds.IgnitedAt(ProjectileWorldTime(player)))
+                        {
+                            long bleedingCrit = (long)Stat(global::Stat.CriticalStrikeChancePlusPctVsBleedingEnemies)
+                                + playerStats.GetValueOrDefault(global::Stat.CriticalStrikeChancePlusPctVsBleedingEnemies);
+                            if (bleedingCrit != 0)
+                                criticalChance = CriticalChanceOn(player, id,
+                                    SupportedCriticalChance(player, skillId, hand, offCritical, bleedingCrit, exertedCritBonus),
+                                    SupportedCriticalChanceVsBlinded(player, skillId, release: false, swingCritical, bleedingCrit, exertedCritBonus),
+                                    SupportedCriticalChanceVsGround(player, skillId, release: false, swingCritical, bleedingCrit, exertedCritBonus));
+                        }
+                        if (flurryBonus.CriticalMore != 0)
+                            criticalChance = Math.Min(10_000, (int)(criticalChance * flurryBonus.CriticalMore));
+                        int targetChance = shatteringCritical ? 10_000 : fullLifeStrike.CriticalChance(criticalChance);
+                        critical = RollCriticalStrike(player, targetChance, skillStats,
+                                attack: !spell, skillRoll: criticalRoll, playerStats: playerStats)
+                            && (spell || GameServer.Core.World.EvasionEntropy.ConfirmsCritical(hitChance, player.AttackAccuracyRandom));
+                    }
+                    rolled = damageRoll.CompleteCriticalMultiplier(rolled, AreaRng(player), critical, criticalDoubleDamage);
+                    int sourceMultiplier = CriticalMultiplierWithWeapon(sweepMultiplier, m, weaponLocal);
                     double at = ProjectileWorldTime(player);
-                    (damage, resistance, var mitigated) = MonsterHitDamage(m, rolled, critical, attack: !spell, at, mods, pen,
-                        gambler.InvertsResistance(AreaRng(player)));
+                    int multiplier = CriticalMultiplierOn(m, sourceMultiplier, at, playerStats, skillStats);
+                    // Deferred manual hits use the same lifetime guard as automatic payloads. The native link
+                    // resolver excludes triggered skills from these supports.
+                    var resonance = WithResonanceHitLocked(player, skillStats, rolled, mods, pen, at);
+                    rolled = resonance.Packet;
+                    int witheredElemental = WitheredElementalHitTaken(m, player.Id, at, playerStats);
+                    (damage, resistance, var mitigated, var takenRules) = ResolveMonsterHit(m, rolled, critical, attack: !spell, at,
+                        resonance.Mods, resonance.Penetration,
+                        hitRolls.InvertsResistance(AreaRng(player), inversionChance), AreaRng(player),
+                        additionalElementalTakenPct: witheredElemental);
                     hitCode = HitCode(mitigated);
-                    var taken = MonsterTakenComponents(m, mitigated, spell, at);
+                    var taken = MonsterTakenComponents(m, mitigated, spell, at, takenRules);
                     if (critical) damage = DamageModel.CriticalDamage(damage, multiplier);
-                    double more = damageMore * bloodMore;
+                    double more = (infernalBlast is null ? damageMore : 1) * bloodMore;
+                    if (flameSurgeBurningMore != 0 && BurningTarget(player, m, at))
+                        more *= Math.Max(0, 1 + flameSurgeBurningMore / 100d);
+                    double flameSurgeGroundDps = flameSurgeExistingIgnite > 0
+                        ? m.Ignites.PerSecond(at) * flameSurgeExistingIgnite / 100d : 0;
+                    int perChill = GolemStat(skillStats, global::Stat.FrostblinkDamagePlusPctFinalPer5PctChillEffectOnTarget);
+                    if (perChill > 0)
+                    {
+                        double chill = m.Ailments.Magnitude(MonsterElementalAilments.Kind.Chill, at);
+                        if (chill >= 5) more *= 1 + Math.Floor(chill / 5.0) * perChill / 100.0;
+                    }
                     if (ReferenceEquals(brandedTarget, m))
                         more *= Math.Max(0, 1 + GolemStat(skillStats, global::Stat.TriggerBrandSupportHitDamagePlusPctFinalVsBrandedEnemy) / 100.0);
                     if (splashMore.TryGetValue(id, out double splashScale)) more *= splashScale;
                     if (more != 1) damage = (int)Math.Floor(damage * Math.Max(0, more));
-                    LeechOnHitLocked(player, m, taken, damage, leech!);
-                    damage = WithImpaleHitLocked(player, m, damage, rolled, critical, sweepMultiplier,
+                    int chaosDamage = MonsterHitChaosDamage(m, mitigated, spell, at, damage, takenRules);
+                    if (ownerContact) LeechOnHitTargetLocked(player, m, taken, damage, leech!, id);
+                    damage = WithImpaleHitLocked(player, m, damage, rolled, critical,
+                        sourceMultiplier + FullLifeCriticalMultiplier(m, playerStats, skillStats),
                         critical ? criticalImpale : impale, more).Damage;
-                    stun = OwnerStun(player, m, damage, mitigated, !spell && SkillsFor(player).IsMelee(gem.Effect), spell, critical, playerStats, skillStats);
+                    if (removeStunAndKnockback)
+                        stun = default;
+                    else
+                    {
+                        stun = OwnerStun(player, gem.Effect, m, damage, mitigated, !spell && SkillsFor(player).IsMelee(gem.Effect), spell, critical,
+                            playerStats, skillStats, localStunReduction: offHandWeapon ? 0 : null, weaponClass: sweepWeaponClass);
+                        long thresholdReduction = extraStunThresholdReduction;
+                        long stunDuration = extraStunDurationPct;
+                        if (retaliation)
+                        {
+                            long Bonus(uint key) => (long)playerStats.GetValueOrDefault(key) + skillStats.GetValueOrDefault(key);
+                            // The native modifier is negative for reduced enemy threshold.
+                            thresholdReduction -= Bonus(global::Stat.RetaliationSkillStunThresholdPlusPct);
+                            stunDuration += Bonus(global::Stat.RetaliationSkillStunDurationPlusPct);
+                        }
+                        if (thresholdReduction != 0 || stunDuration != 0)
+                            stun = stun with
+                            {
+                                ThresholdReductionPct = ActorScale.Saturate(stun.ThresholdReductionPct + thresholdReduction),
+                                DurationPct = ActorScale.Saturate(stun.DurationPct + stunDuration),
+                            };
+                    }
                     // Only the first victim has a freshly built player snapshot. After notification awaits, resolve the
                     // current raw source so a refund between victims cannot keep granting from the sweep's old snapshot.
                     var rampagePlayer = freshPlayer ? playerStats : null;
-                    var rampageSource = RampageOnMeleeHitLocked(player, m, !spell && SkillsFor(player).IsMelee(gem.Effect), rampagePlayer);
+                    var rampageSource = RampageOnMeleeHitLocked(player, m, ownerContact && !spell && SkillsFor(player).IsMelee(gem.Effect), rampagePlayer);
+                    bool pyreTarget = pyreSupport && m.Ignites.IgnitedAt(at);
                     uint lifeBefore = m.Life;
+                    var cull = Cull.Of(playerStats, skillStats, critical, spell).WithWeapon(weaponLocal);
+                    if (shatterFrozen && !splashMore.ContainsKey(id)) cull = cull with { ShatterFrozen = true };
                     applied = ApplyMonsterHitLocked(player, m, damage, rampageSource, rampagePlayer, allyAt: null,
-                        cull: Cull.Of(playerStats, skillStats, critical, spell), cullPlayer: playerStats);
+                        cull: cull, cullPlayer: playerStats, chaosDamage: chaosDamage);
                     if (applied is not null)
                     {
-                        CrueltyOnHitLocked(player, skillId, damage, lifeBefore, m.MaxLife, skillStats, at);
-                        if (!spell) ReleaseCriticalTrigger(player, ProjectilesFor(player),
-                            criticalTrigger, critical, m.Hostile, m.Walk.Position(at), at);
+                        if (elementalHitStruck is not null && victim < elementalHitContacts)
+                        {
+                            int splashRadius = Stat(global::Stat.ElementalHitAreaOfEffectPlus100PctFinalVsEnemyWithAssociatedAilment) != 0
+                                ? ElementalHitRadius(radius, element, elementalAilments) : radius;
+                            AddElementalHitNearby(player, m.Walk.Position(at), at, splashRadius, elementalHitSplash,
+                                targets, elementalHitStruck, splashMore, once);
+                        }
+                        if (ownerContact && applied.Value.Life < lifeBefore)
+                            RecordResonanceHitLocked(player, m, skillStats, rolled, at);
+                        if (ownerContact) CrueltyOnHitLocked(player, skillId, damage, lifeBefore, m.MaxLife, skillStats, at);
+                        if (!spell)
+                        {
+                            ReleaseCriticalTrigger(player, ProjectilesFor(player),
+                                criticalTrigger, critical, m.Hostile, m.Walk.Position(at), at);
+                            ReleaseItemCriticalTrigger(player, ProjectilesFor(player),
+                                itemCriticalTrigger, critical, m.Hostile, m.Walk.Position(at), at);
+                        }
                         else ArcaneSurgeOnSpellHitLocked(player, playerStats, m);
+                        if (ownSlam)
+                            TriggerSlamSupportLocked(player, skillId, admittedGem, hand, weapon, offCritical, m.Walk.Position(at), at,
+                                global::Stat.SupportCrystalfallChanceToTriggerCrystalfallOnHitPct, "TriggeredSupportCrystalfall");
                         if (!spell && applied.Value.Life == 0) ReleaseMeleeKillTrigger(player,
                             ProjectilesFor(player), meleeKillTrigger, true, m.Hostile, m.Walk.Position(at), at);
-                        player.RecentEvents.RecordCriticalOutcome(at, critical);
-                        if (ElementalOverloadCritLocked(player, skillId, SkillsFor(player).EffectId(gem.Effect), playerStats, critical)
+                        if (ownerContact) player.RecentEvents.RecordCriticalOutcome(at, critical, attack: hitPlan.Kind == SkillHitKind.Attack);
+                        if (ownerContact && ElementalOverloadCritLocked(player, skillId, SkillsFor(player).EffectId(gem.Effect), playerStats, critical)
                             is { } eoBuff)
                             ProjectilesFor(player).Packet(eoBuff, $"elemental overload on skill 0x{skillId:x4}");
                         landed++;
+                        if (infernalStrike && (!immolation || !gainedImmolationCharge))
+                        {
+                            var use = new InfernalBlowUse(skillId, gem, admittedGem, criticalRoll, sequence, ruthless,
+                                repeat, cryExerted == true);
+                            ApplyInfernalBlowContact(player, id, m, use, immolation, !immolation && splashMore.ContainsKey(id), playerStats, at);
+                            gainedImmolationCharge |= immolation;
+                        }
+                        else if (infernalBlast is not null && !immolation
+                            && (m.Life == 0 || RandomRolls.Chance(
+                                playerStats.GetValueOrDefault(global::Stat.InfernalBlowExplosionAppliesUnchargedDebuffOnHitPctChance)
+                                    + Stat(global::Stat.InfernalBlowExplosionAppliesUnchargedDebuffOnHitPctChance), 100, AreaRng(player))))
+                            ApplyInfernalBlowContact(player, id, m, infernalBlast, immolation: false,
+                                splash: true, playerStats, at);
+                        if (pestilentStrike && !splashMore.ContainsKey(id))
+                            MarkPestilentStrike(player, id, m, gem.Effect, skillStats, playerStats, at);
                         if (hammer is null) hammerTargets.Add((id, m.Walk.Position(at)));
                         // Item Quantity Support: the kill's loot rolls read the supported skill's share.
                         if (global::Stat.BaseKilledMonsterDroppedItemQuantityPlusPct is var quantityKey)
                             m.KilledWithItemQuantityPct = skillStats.GetValueOrDefault(quantityKey);
                         if (global::Stat.BaseKilledMonsterDroppedItemRarityPlusPct is var rarityKey)
                             m.KilledWithItemRarityPct = skillStats.GetValueOrDefault(rarityKey);
-                        SoulEaterHit(player, m);
-                        if (weaponAttack) player.RecentEvents.Record(StatConditions.HitEnemyWithWeapon, at);
-                        if (applied.Value.Life == 0) RecordTinctureKill(m, tinctureKill);
-                        if (!spell && player.TinctureEffects.AnyEffective) TinctureOnWeaponHitLocked(player, playerStats, m, lifeBefore, at, AreaRng(player));
+                        if (ownerContact) SoulEaterHit(player, m);
+                        if (ownerContact && weaponAttack)
+                        {
+                            RecordWeaponContactLocked(player, at, weaponContactSource, secondWeaponContactSource);
+                            if (critical)
+                            {
+                                ItemMinionsOnWeaponCriticalLocked(player, weaponContactSource, m, at);
+                                if (!ReferenceEquals(weaponContactSource, secondWeaponContactSource))
+                                    ItemMinionsOnWeaponCriticalLocked(player, secondWeaponContactSource, m, at);
+                            }
+                        }
+                        if (ownerContact && applied.Value.Life == 0)
+                        {
+                            RecordTinctureKill(m, tinctureKill);
+                            ReflectKillingBlowImpalesLocked(player, m,
+                                skillStats.GetValueOrDefault(global::Stat.ApplyEnemyImpaleDamageToNearbyEnemiesOnKillingBlowPctChance),
+                                at, playerStats, playerKill: true);
+                        }
+                        if (ownerContact && !spell && player.TinctureEffects.AnyEffective) TinctureOnWeaponHitLocked(player, playerStats, m, lifeBefore, at, AreaRng(player));
                         // Devour: a killing blow recovers the support's life/mana and consumes the corpse (the kill removes it).
-                        if (applied.Value.Life == 0) DevourOnKill(player, m, skillStats);
-                        AilmentsOnHitLocked(player, id, m, mitigated, spell, critical, multiplier, playerStats, skillStats, at,
-                            AreaRng(player), reflected: reflected, poison: profile.Poison, sourceSkill: skillId,
+                        if (ownerContact && applied.Value.Life == 0)
+                        {
+                            DevourOnKill(player, m, skillStats);
+                            if (!spell && SkillsFor(player).IsAttack(gem.Effect)) CaptureAttackKillExplosionLocked(m, playerStats);
+                        }
+                        AilmentsOnHitLocked(player, id, m, mitigated, spell, critical, multiplier, playerStats, ailmentSkillStats!, at,
+                            AreaRng(player), sourceEffect: gem.Effect, reflected: ownerContact ? reflected : null,
+                            poison: profile.Poison, sourceSkill: skillId,
                             blind: BlindHitInput.Capture(playerStats, skillStats),
-                            hitOrigin: IsLeapSlam(player, gem.Effect) ? centre : null,
-                            attackGains: AttackAilmentGains.Capture(playerStats, SkillsFor(player).IsAttack(gem.Effect)));
+                            hitOrigin: cascadePush == default ? retainedAttack?.ProxyActor?.At ?? (IsLeapSlam(player, gem.Effect) ? centre : null)
+                                : CascadeKnockbackOrigin(m.Walk.Position(at), cascadePush),
+                            attackGains: AttackAilmentGains.Capture(playerStats, ownerContact && SkillsFor(player).IsAttack(gem.Effect)),
+                            playerHit: ownerContact, attackerSize: ownerContact ? LivingCollision.PlayerSize : 1, ownHit: ownerContact,
+                            projectileDamage: false, projectileFreezeChance: 0, glacialFreezeMore: glacialFreezeMore,
+                            weaponWitherChance: weaponWitherChance, extraShockChance: extraShockChance, cascadeBurst: cascadeBurst);
+                        if (critical && hitPlan.Kind == SkillHitKind.Attack)
+                            TryDeathmarkedLocked(player, m, at, playerStats);
+                        if (GolemStat(skillStats, global::Stat.RemoveChillOnEnemyWhenYouHit) != 0)
+                            m.Ailments.RemoveActive(MonsterElementalAilments.Kind.Chill, at);
+                        if (scheduledSession is not null || (melee ?? !spell) || damage > 0)
+                            nativeKnockback = TakeNativeKnockbackLocked(m);
+                        if (flameSurgeGroundDps > 0)
+                            ProjectilesFor(player).PlaceFlameSurgeGround(m, gem.Effect, combusting: false, at,
+                                flameSurgeGroundDps, skillStats, playerStats);
                         // As a projectile's hit: a hit with fire that leaves the monster alive may ignite it, an attack with
                         // physical damage bleed it.
                         if (m.Life > 0 && (critical ? profile.Ignite.CriticalMax : profile.Ignite.Max) > 0
                             && IgniteOnHitLocked(player, id, m, profile.Ignite, critical, at,
-                                attackGains: AttackAilmentGains.Capture(playerStats, SkillsFor(player).IsAttack(gem.Effect))) is { } packets)
+                                AttackAilmentGains.Capture(playerStats, ownerContact && SkillsFor(player).IsAttack(gem.Effect)),
+                                out double igniteDps, playerIgnite: ownerContact) is { } packets)
+                        {
                             (ignited, igniteLog) = (packets, IgnitedLog(id, m, critical, at));
+                            if (flameSurgeNewIgnite > 0)
+                                ProjectilesFor(player).PlaceFlameSurgeGround(m, gem.Effect, combusting: true, at,
+                                    igniteDps * flameSurgeNewIgnite / 100d, skillStats, playerStats);
+                        }
                         if (m.Life > 0 && rolled[DamageType.Physical].Max > 0
                             && BleedOnHitLocked(player, id, m, profile.Bleed, critical, at,
                                 BleedReflected(playerStats)) is { } cut)
                             (bled, bleedLog) = (cut, BleedingLog(id, m, critical, at));
+                        if (hex is not null)
+                        {
+                            if (victim == 0) hexblastExpanded = true;
+                            int keep = Stat(global::Stat.HexblastPctChanceToNotConsumeHex);
+                            if (keep < 100 && (keep <= 0 || !RandomRolls.Chance(keep, 100, AreaRng(player))))
+                                ConsumeHexblastHex(player, id, m, hex);
+                        }
                     }
                     if (applied is { StageStarts: true } staged)
                     {
                         CommitBossStage(player, id, m, ProjectileWorldTime(player));
                         applied = staged with { StageStarts = false };
                     }
-                    if (applied is not null)
+                    if (ownerContact && applied is not null)
                     {
+                        if (sunder is not null && !sunderShockwave) sunder.RecordEmitter(id, m.Walk.Position(at));
                         var fortificationDamage = RawFortificationDamage(rolled, critical, multiplier);
+                        bool strike = !spell && SkillsFor(player).IsStrike(gem.Effect);
+                        var fortifySkill = WithStrikeFortifySkillStat(playerStats, skillStats, strike);
                         bool fortifiedThisHit = !fortificationGranted && (fortificationGranted = FortificationOnHitLocked(player, m,
-                            fortificationDamage, !spell && SkillsFor(player).IsMelee(gem.Effect), playerStats, skillStats));
+                            fortificationDamage, !spell && SkillsFor(player).IsMelee(gem.Effect), playerStats, fortifySkill,
+                            movement: SkillsFor(player).IsMovement(gem.Effect)));
+                        if (fortifiedThisHit) AfterFortificationGainLocked(player, playerStats);
                         stun = stun with { FortificationDamage = fortificationDamage, Fortified = fortifiedThisHit };
-                        if (!rageGranted) rageGranted = RageOnHitLocked(player, attack: !spell,
-                            melee: !spell && SkillsFor(player).IsMelee(gem.Effect), critical, skillStats, playerStats: playerStats);
+                        if (!rageGranted) rageGranted = RageOnHitWithWeaponLocked(player, attack: !spell,
+                            melee: !spell && SkillsFor(player).IsMelee(gem.Effect), critical, sweepWeaponClass,
+                            skillStats, playerStats: playerStats, secondWeaponClass: secondSweepWeaponClass, target: m);
                         if (!spell && SkillsFor(player).IsMelee(gem.Effect))
                         {
+                            if (warcryTriggers is not null && !splashMore.ContainsKey(id))
+                                ExertedMeleeHitLocked(player, warcryTriggers, m.Walk.Position(at), at);
+                            if (shockwaveSupport)
+                                TriggerShockwaveLocked(player, skillId, admittedGem, hand, weapon, offCritical, m.Walk.Position(at), at);
+                            if (pyreTarget)
+                                TriggerPyreLocked(player, skillId, admittedGem, hand, weapon, offCritical, m.Walk.Position(at), at);
+                            if (goreShockwave is { } gore)
+                                TriggerGoreShockwaveLocked(player, gore, m.Walk.Position(at), at);
+                            GainValourFromMeleeLocked(player, m, applied.Value.Life == 0, at, playerStats);
                             CombatRushOnHit(player, skillStats, at);
                             HallowOnMeleeHit(player, m, skillStats, at);
                             ExcommunicateOnMeleeHit(player, m, skillStats, at);
@@ -2690,16 +4509,37 @@ public static partial class Game
                     }
                 }
                 if (applied is not { } hit) continue;
-                onHit?.Invoke(id);
+                if (!wildStrike || !splashMore.ContainsKey(id)) onHit?.Invoke(id);
+                if (onDirectHit is not null && !sunderShockwave && !splashMore.ContainsKey(id)) onDirectHit(id);
+                if (reave && !reaveGained && !splashMore.ContainsKey(id))
+                {
+                    reaveGained = true;
+                    GainReaveStage(player, Stat);
+                }
+                if (boneshatter is { Pulse: false } traumaStrike && !splashMore.ContainsKey(id))
+                {
+                    traumaStrike.DirectHits.Add(id);
+                    var source = m.Walk.Position(ProjectileWorldTime(player));
+                    stun = stun with { OnStunDuration = seconds => traumaStrike.Stuns.Add((source, seconds)) };
+                }
                 if (scheduledSession is { } scheduled)
                 {
                     using (ProjectileMutation(player, advance: false))
                     {
-                        ChargesOnHit(player, m, critical, spell, gem.Effect, gem.Level, gem.Quality, primary: victim == 0, skillStats: skillStats);
+                        if (ownerContact)
+                            ChargesOnHit(player, m, critical, spell, gem.Effect, gem.Level, gem.Quality, primary: victim == 0, skillStats: skillStats);
                         if (reflected.Count > 0 && playerStats is not null)
                             ReflectPendingAilmentsLocked(player, reflected, ProjectileWorldTime(player), playerStats, AreaRng(player));
-                        CommitScheduledMeleeHit(scheduled, id, m, hit, damage, critical, stun, sequence, gem.Name,
-                            settleKill: singleStrikeTarget is not null, hitCode: hitCode);
+                        if (singleStrikeTarget is not null && hit.Life == 0) SetAcceptedKillSkill(player, skillStats);
+                        try
+                        {
+                            CommitScheduledMeleeHit(scheduled, id, m, hit, damage, critical, stun, sequence,
+                                infernalBlast is not null ? $"{gem.Name} charge explosion"
+                                    : retainedAttack is null ? gem.Name : $"{gem.Name} ({retainedAttack.Phase})",
+                                settleKill: singleStrikeTarget is not null, hitCode: hitCode, knockback: nativeKnockback,
+                                actionHit: infernalBlast is null, proxyActor: retainedAttack?.ProxyActor);
+                        }
+                        finally { if (singleStrikeTarget is not null && hit.Life == 0) ClearAcceptedKillSkill(player); }
                         if (singleStrikeTarget is null && hit.Life == 0) deaths.Add((id, m));
                     }
                     scheduled.Enqueue(() => SendDotBuff(player, ignited, igniteLog));
@@ -2709,9 +4549,10 @@ public static partial class Game
                 if (critical) _ = GainFlaskChargesOnCrit(player);
                 if (critical) await MaybeCreateProfaneGround(player, m.Walk.Position(ProjectileWorldTime(player)));
                 await NotifyMonsterHit(player, id, m, hit, damage,
-                    $"{gem.Name}{(hammer is null ? "" : " (holy hammer)")}{(critical ? " (critical)" : "")}{handNote}{(resistance is null ? "" : $", {resistance}")}",
+                    $"{gem.Name}{(hammer is not null ? " (holy hammer)" : sunderShockwave ? " (shockwave)" : "")}{(critical ? " (critical)" : "")}{handNote}{(resistance is null ? "" : $", {resistance}")}",
                     melee: melee ?? !spell, sequence: sequence, deaths: deaths, hitCode: hitCode, stun: stun, critical: critical,
-                    impactArt: !spell && hammer is null ? MeleeImpactArt(SkillsFor(player).EffectId(gem.Effect)) : null);
+                    impactArt: !spell && hammer is null ? MeleeImpactArt(SkillsFor(player).EffectId(gem.Effect)) : null,
+                    knockback: nativeKnockback);
                 await SendDotBuff(player, ignited, igniteLog);
                 await SendDotBuff(player, bled, bleedLog);
                 ChargesOnHit(player, m, critical, spell, gem.Effect, gem.Level, gem.Quality, primary: id == targets[0].Id, skillStats: skillStats);
@@ -2721,19 +4562,28 @@ public static partial class Game
         {
             if (sweepStats is { } stats) stats.Dispose();
         }
-        if (reflected.Count > 0 && playerStats is not null)
-            using (ProjectileMutation(player, advance: scheduledSession is null)) ReflectPendingAilmentsLocked(player, reflected, ProjectileWorldTime(player), playerStats, AreaRng(player));
-        foreach (var (deadId, dead) in deaths)
-            if (scheduledSession is { } scheduled)
-                CommitProjectileKill(scheduled, deadId, dead, scheduled.Runtime.Now, AreaRng(player));
-            else await MonsterKilled(player, deadId, dead);
+        await SettleSweep();
+        if (landed > 0 && ownerContact && !spell && traumaUse is { Gained: false }
+            && boneshatter is null && infernalBlast is null && hammer is null && retainedAttack is null)
+            using (ProjectileMutation(player, advance: scheduledSession is null))
+                TryGainTraumaLocked(player, scheduledSession, admittedGem, traumaUse, ProjectileWorldTime(player), "Trauma");
+        if (holyPath) await PublishFlaskChanges(player);
         // The wave reports its own shape (the tunables to calibrate, GroundSlamWave) instead of the circle; a gem melee
         // attack reports the clip its contact came from (GemAttackContactDelay), which the live check can compare with the
         // client's animation.
         string shape = wave
             ? $"in a wave {waveLength:0.#} cells long from ({from.X}, {from.Y}) toward ({waveDir.X:0.##}, {waveDir.Y:0.##}), "
                 + $"half angle {waveHalfAngle:0.#} deg at {GroundSlamWave.CellsPerSecond:0.#} cells/s"
-            : $"within {radius} cells of ({centre.X}, {centre.Y})";
+            : shieldUse is { } shieldWave
+                ? $"in shield wave {shieldWave.Phase + 1} from ({centre.X}, {centre.Y}), "
+                    + $"side radius {shieldWave.Waves.SideRadius}, centre radius {shieldWave.Waves.CentreRadius}"
+                : sunder is not null ? "along the Sunder wave"
+                : tectonic is not null ? $"along fissures starting at ({from.X}, {from.Y})"
+                : lacerate is { } slash
+                    ? $"in Lacerate wave {slash.Phase + 1}, {slash.Waves.Angle} deg, {radius} cells from ({centre.X}, {centre.Y})"
+                    : cleave is { }
+                        ? $"in Cleave's forward arc of {radius} cells from ({centre.X}, {centre.Y})"
+                        : $"within {radius} cells of ({centre.X}, {centre.Y})";
         string contact = holdsItsSwing
             ? $", contact {contactFraction:0.###} of the attack ({(contactClip is null ? "the attack1 fallback" : contactClip)})"
             : "";
@@ -2759,22 +4609,50 @@ public static partial class Game
                 else await SendBloodCharges(player, $"{gem.Name}: {landed} hit, {deaths.Count} killed");
             }
         }
-        if (strikeIndex == 0 && strikes > 1)
+        bool nextWave = shieldUse?.TryAdvance() == true || lacerate?.TryAdvance() == true;
+        if (nextWave || shieldUse is null && strikeIndex == 0 && strikes > 1)
         {
-            (double gap, bool keyframe) = GemAttackStrikeGap(player, contactClip);
-            double next = contactAt + gap * SupportedAttackSeconds(player, skillId, hand);
-            await AreaDelay(player, Math.Max(0, next - AreaTime(player)));
+            double next;
+            if (nextWave)
+            {
+                if (lacerate is not null)
+                {
+                    lacerate.FortificationGranted = fortificationGranted;
+                    lacerate.RageGranted = rageGranted;
+                    next = lacerate.DueAt;
+                }
+                else
+                {
+                    shieldUse!.FortificationGranted = fortificationGranted;
+                    shieldUse.RageGranted = rageGranted;
+                    next = shieldUse.DueAt;
+                }
+            }
+            else
+            {
+                (double gap, bool keyframe) = GemAttackStrikeGap(player, contactClip);
+                next = contactAt + gap * (strikeSeconds ?? SupportedAttackSeconds(player, skillId, hand));
+                if (!keyframe) contactClip = null;
+            }
+            double wait = next - AreaTime(player);
+            if (!nextWave || wait > 0) await AreaDelay(player, Math.Max(0, wait));
             await WhilePaused(player);
             if (Replaced() || player.Closed || !Current()) return;
-            Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: strike 2 at {next:0.000} "
-                + $"({(keyframe ? contactClip : "modelled half-attack gap")})");
+            if (!nextWave)
+                Console.WriteLine($"[gateway] {player.Connection.Remote} skill 0x{skillId:x4} {gem.Name}: strike 2 at {next:0.000} "
+                    + $"({contactClip ?? "modelled half-attack gap"})");
             await AreaSkillHitStrike(player, skillId, gem, from, to, immediate: true,
                 sequence: sequence, actionToken: actionToken, cooldownUse: cooldownUse, melee: melee, damageMore: damageMore,
                 excludeMonster: excludeMonster, criticalRoll: criticalRoll, channelGeneration: channelGeneration, targetId: targetId,
                 repeat: repeat, radiusOverride: radiusOverride, once: null, repeatDelay: repeatDelay, radiusMore: radiusMore,
                 sacrifice: sacrifice, swingAt: null, triggeredCurrent: triggeredCurrent, discharge: discharge,
-                strikeIndex: 1, firstContactAt: next, ruthlessMore: ruthlessMore, priorTargets: alreadyHit, scaledBlastChaos: scaledBlastChaos,
-                singleStrikeTarget: singleStrikeTarget, onHit: onHit, scheduledSession: scheduledSession, cryExerted: cryExerted, prepaidRawExtra: prepaidRawExtra, baseChaos: baseChaos, hammer: hammer);
+                strikeIndex: nextWave ? 0 : 1, firstContactAt: next, ruthlessMore: ruthlessMore, priorTargets: alreadyHit, scaledBlastChaos: scaledBlastChaos,
+                singleStrikeTarget: singleStrikeTarget, onHit: onHit, scheduledSession: scheduledSession, cryExerted: cryExerted, prepaidRawExtra: prepaidRawExtra, baseChaos: baseChaos, hammer: hammer, brandedTarget: brandedTarget,
+                targetFilter: targetFilter, extraStunThresholdReduction: extraStunThresholdReduction, extraStunDurationPct: extraStunDurationPct,
+                extraKnockbackDistancePct: extraKnockbackDistancePct, removeStunAndKnockback: removeStunAndKnockback,
+                offHandWeapon: offHandWeapon, shieldUse: shieldUse, additionalStrikeTargets: additionalStrikeTargets,
+                lacerate: lacerate, seismicExerted: seismicExerted, ancestralTargets: ancestralTargets, rallyingDamage: rallyingDamage,
+                traumaUse: traumaUse);
         }
     }
 
@@ -2916,13 +4794,16 @@ public static partial class Game
     // the target's chill and shock: a player hit path uses MonsterHitDamage.
     public static (int Damage, string? Resistance) MonsterDamage(SpawnedMonster m, DamagePacket rolled,
         bool critical, bool attack, HitResistances.Mods mods, Penetration.PerType pen = default, bool invertElemental = false)
-        => MonsterDamage(m, rolled, critical, attack, mods, pen, out _, invertElemental);
+    {
+        var (damage, resistance, _, _) = ResolveMonsterHit(m, rolled, critical, attack, double.NaN, mods, pen, invertElemental);
+        return (damage, resistance);
+    }
 
     public static (int Damage, string? Resistance) MonsterDamage(SpawnedMonster m, DamagePacket rolled,
         bool critical, bool attack, HitResistances.Mods mods, Penetration.PerType pen, out DamagePacket taken, bool invertElemental = false)
     {
-        var (damage, resistance, mitigated) = MonsterHitDamage(m, rolled, critical, attack, double.NaN, mods, pen, invertElemental);
-        taken = MonsterTakenComponents(m, mitigated, spell: !attack);
+        var (damage, resistance, mitigated, rules) = ResolveMonsterHit(m, rolled, critical, attack, double.NaN, mods, pen, invertElemental);
+        taken = MonsterTakenComponents(m, mitigated, spell: !attack, double.NaN, rules);
         return (damage, resistance);
     }
 
@@ -2930,21 +4811,55 @@ public static partial class Game
     // resisted packet that AilmentsOnHitLocked needs: every player hit path calls both (surfcaster.md, Hit paths).
     public static (int Damage, string? Resistance, DamagePacket Mitigated) MonsterHitDamage(SpawnedMonster m, DamagePacket rolled,
         bool critical, bool attack, double now, HitResistances.Mods mods, Penetration.PerType pen = default,
-        bool invertElemental = false)
+        bool invertElemental = false, Random? random = null, bool trapOrMine = false, int additionalTakenPct = 0)
+    {
+        var (damage, resistance, mitigated, _) = ResolveMonsterHit(m, rolled, critical, attack, now,
+            mods, pen, invertElemental, random, trapOrMine, additionalTakenPct);
+        return (damage, resistance, mitigated);
+    }
+
+    static (int Damage, string? Resistance, DamagePacket Mitigated, HitTakenRules Rules) ResolveMonsterHit(
+        SpawnedMonster m, DamagePacket rolled, bool critical, bool attack, double now, HitResistances.Mods mods, Penetration.PerType pen = default,
+        bool invertElemental = false, Random? random = null, bool trapOrMine = false, int additionalTakenPct = 0,
+        int additionalElementalTakenPct = 0)
     {
         var described = new List<string>();
+        mods = ImpurityHitMods(m, now, mods);
         var strike = new HitResistances.Strike(Critical: critical, Attack: attack);
+        var elemental = ReadElementalHitResistances(m, rolled, now, pen, strike, mods);
         var mitigated = rolled.Select((type, range) =>
         {
-            var value = MonsterHitResistance(m, type, pen, now);
-            if (rolled[type].Max > 0 && HitResistances.Describe(type, value, strike, mods) is { } note) described.Add(note);
-            double effective = HitResistances.FinalValue(type, value, strike, mods, invertElemental);
+            if (range.IsZero) return range;
+            var (resistanceType, value) = ElementalHitResistance(m, type, pen, now, strike, mods, elemental);
+            if (type == DamageType.Chaos
+                && mods.ChaosSelection != HitResistances.ResistanceSelection.Default)
+            {
+                bool highest = mods.ChaosSelection == HitResistances.ResistanceSelection.Highest;
+                int selected = DamageModel.Capped(value.Value, value.Maximum);
+                foreach (var alternative in DamageTypes.ConversionOrder)
+                {
+                    if (!DamageTypes.IsElemental(alternative)) continue;
+                    var candidate = MonsterHitResistance(m, alternative, pen, now);
+                    int resistance = DamageModel.Capped(candidate.Value, candidate.Maximum);
+                    if (highest ? resistance <= selected : resistance >= selected) continue;
+                    selected = resistance;
+                    resistanceType = alternative;
+                    value = candidate;
+                }
+            }
+            if (HitResistances.Describe(resistanceType, value, strike, mods) is { } note) described.Add(note);
+            double effective = HitResistances.FinalValue(resistanceType, value, strike, mods, invertElemental);
             return range.Scale(Math.Max(0, 1 - effective / 100));
         });
-        bool ignorePhys = attack && mods.IgnorePhysicalReductionChance > 0
-            && GameServer.Core.World.RandomRolls.Chance(mods.IgnorePhysicalReductionChance, 100, Random.Shared);
-        return (MonsterTakesMitigated(m, mitigated, spell: !attack, now, ignorePhys),
-            described.Count > 0 ? string.Join(", ", described) : null, mitigated);
+        int ignorePhysicalChance = ActorScale.Saturate((long)mods.IgnorePhysicalReductionChance
+            + (attack ? mods.TincturedWeaponIgnorePhysicalReductionChance : 0));
+        bool ignorePhys = mods.IgnorePhysicalReduction || (rolled[DamageType.Physical].Max > 0
+            && GameServer.Core.World.RandomRolls.Chance(ignorePhysicalChance, 100, random ?? Random.Shared));
+        int takenPct = additionalTakenPct + (trapOrMine ? BearTrapDamageTaken(m, now) : 0);
+        int damage = MonsterTakesMitigatedCore(m, mitigated, spell: !attack, now, takenPct, ignorePhys, random, additionalElementalTakenPct);
+        return (damage,
+            described.Count > 0 ? string.Join(", ", described) : null, mitigated,
+            new(takenPct, additionalElementalTakenPct, ignorePhys));
     }
 
     public static HitResistances.Mods HitResistMods(IReadOnlyDictionary<uint, int> player,
@@ -2952,19 +4867,25 @@ public static partial class Game
     {
         var a = HitResistances.Mods.From(player, Stats.Key);
         var b = skill is null ? default : HitResistances.Mods.From(skill, Stats.Key);
-        int ignorePhys = Has(Stat.TinctureApplied)
-            ? Math.Clamp(Value(Stat.HitsIgnoreEnemyMonsterPhysicalDamageReductionPctChanceWithTincturedWeapons), 0, 100)
-            : 0;
         return new(a.CriticalIgnoreElemental | b.CriticalIgnoreElemental,
             a.AttackCriticalIgnoreElemental | b.AttackCriticalIgnoreElemental,
             a.NonCriticalPenetration + b.NonCriticalPenetration, a.CannotPenetrateOrIgnore | b.CannotPenetrateOrIgnore,
             IgnoreFire: Has(Stat.VirtualHitsIgnoreEnemyFireResistance),
             IgnoreChaos: Has(Stat.VirtualHitsIgnoreEnemyChaosResistance),
-            IgnorePhysicalReductionChance: ignorePhys);
+            IgnorePhysicalReductionChance: Value(Stat.HitsIgnoreEnemyMonsterPhysicalDamageReductionPctChance))
+        {
+            ElementalUsesLowestResistance = Has(Stat.ElementalDamageResistedByLowestElementalResistance),
+            ChaosSelection = Has(Stat.ChaosDamageResistedByHighestResistance) ? HitResistances.ResistanceSelection.Highest
+                : Has(Stat.ChaosDamageResistedByLowestResistance) ? HitResistances.ResistanceSelection.Lowest
+                : HitResistances.ResistanceSelection.Default,
+            TincturedWeaponIgnorePhysicalReductionChance = Has(Stat.TinctureApplied)
+                ? Value(Stat.HitsIgnoreEnemyMonsterPhysicalDamageReductionPctChanceWithTincturedWeapons) : 0,
+            CriticalPenetration = Value(Stat.CriticalStrikesPenetratesPctElementalResistancesWhileAffectedByZealotry),
+        };
 
         bool Has(uint name) => name is var key
             && (player.GetValueOrDefault(key) != 0 || (skill?.GetValueOrDefault(key) ?? 0) != 0);
-        int Value(uint key) => player.GetValueOrDefault(key) + (skill?.GetValueOrDefault(key) ?? 0);
+        int Value(uint key) => ActorScale.Saturate((long)player.GetValueOrDefault(key) + (skill?.GetValueOrDefault(key) ?? 0));
     }
 
     // The short state mutation is shared with projectile impact; no awaits in the area's frame. A minion's hit (allyAt: where
@@ -2974,45 +4895,100 @@ public static partial class Game
         Cull cull = default) =>
         ApplyMonsterHitLocked(player, m, damage, rampageSource, playerStats, allyAt, cull, null);
 
+    static MonsterHit? ApplyTypedMonsterHitLocked(Player player, SpawnedMonster m, int damage, int chaosDamage,
+        (int X, int Y)? allyAt = null, IReadOnlyDictionary<uint, int>? playerStats = null, Cull cull = default) =>
+        ApplyMonsterHitLocked(player, m, damage, null, playerStats, allyAt, cull, null, chaosDamage);
+
     // The area-hit caller passes the attack's cached snapshot as `cullPlayer` for every victim: Rampage's `player` is
     // rebuilt only for the first target, so the two contexts must stay separate. This is an overload rather than an
     // extra optional parameter so the seven-argument entry point keeps its reflection-visible signature.
     public static MonsterHit? ApplyMonsterHitLocked(Player player, SpawnedMonster m, int damage,
         bool? rampageSource, IReadOnlyDictionary<uint, int>? playerStats, (int X, int Y)? allyAt,
-        Cull cull, IReadOnlyDictionary<uint, int>? cullPlayer)
+        Cull cull, IReadOnlyDictionary<uint, int>? cullPlayer) =>
+        ApplyMonsterHitLocked(player, m, damage, rampageSource, playerStats, allyAt, cull, cullPlayer, chaosDamage: 0);
+
+    public static MonsterHit? ApplyMonsterHitLocked(Player player, SpawnedMonster m, int damage,
+        bool? rampageSource, IReadOnlyDictionary<uint, int>? playerStats, (int X, int Y)? allyAt,
+        Cull cull, IReadOnlyDictionary<uint, int>? cullPlayer, int chaosDamage) =>
+        ApplyMonsterHitCoreLocked(player, m, damage, rampageSource, playerStats, allyAt, cull, cullPlayer, chaosDamage);
+
+    const string OwnedEnemyHitRecently = "owned_enemy_hit";
+
+    static MonsterHit? ApplyMonsterHitCoreLocked(Player player, SpawnedMonster m, int damage,
+        bool? rampageSource, IReadOnlyDictionary<uint, int>? playerStats, (int X, int Y)? allyAt,
+        Cull cull, IReadOnlyDictionary<uint, int>? cullPlayer, int chaosDamage, ImpaleContact? impale = null,
+        bool bypassesShell = false, bool? ownHit = null)
     {
         if (m.Dead || m.Life == 0) return null;
         // The Divine shrine's aura: a monster wearing base_cannot_be_damaged (MonsterAuraEffect puts it in the monster's
         // EncounterStats, whether it was there when the shrine spawned or walked in later) takes no hit at all, so every
         // path through this funnel leaves its life alone.
         if (m.Effects[Stat.BaseCannotBeDamaged] > 0) return null;
+        // A Misery essence's or Temporal rare's proximity shield blocks a hit from outside its ring; Scorn's avoid_damage_% can avoid the hit.
+        if (MapEssences.ProximityShieldBlocksLocked(player, m, allyAt) || MonsterProximityShieldBlocksLocked(player, m, allyAt)) return null;
+        if (damage > 0 && m.Effects[Stat.AvoidDamagePct] is > 0 and var avoid && Random.Shared.Next(100) < avoid) return null;
+        double hitNow = ProjectileWorldTime(player);
+        if (impale is { } contact)
+            damage = ApplyImpaleContact(m, damage, contact.Physical, contact.At, hitNow, contact.Settings, contact.Random).Damage;
+        int afterShell = AbsorbSomaticShell(m, damage, ref chaosDamage, hitNow, bypassesShell);
+        int lifeDamage = AbsorbMonsterEnergyShieldLocked(player.Area, m, afterShell, chaosDamage, AreaTime(player));
         uint before = m.Life;
-        if (allyAt is null) SpiderHitRewardsLocked(player, m, ProjectileWorldTime(player), playerStats);
-        (m.Life, bool starts) = TakeOwnerHitLocked(player, m, damage, cull, rampageSource, playerStats, cullPlayer);
-        if (m.Life == 0) m.Overkill = (int)Math.Clamp((long)damage - before, 0, int.MaxValue);
+        if (allyAt is null) SpiderHitRewardsLocked(player, m, hitNow, playerStats);
+        (m.Life, bool starts) = TakeOwnerHitLocked(player, m, lifeDamage, cull, rampageSource, playerStats, cullPlayer);
+        if (m.Life == 0) m.Overkill = (int)Math.Clamp((long)lifeDamage - before, 0, int.MaxValue);
         if (m.Kit.Count > 0) BossKits.TakeDamage(m, (long)before - m.Life);
-        CaptureUnhingedHitKillLocked(player, m, playerHit: allyAt is null);
+        CaptureHitCorpseDestructionLocked(player, m, directPlayerHit: allyAt is null, playerStats);
+        if (m is { Hostile: true, Invulnerable: false, EntranceGrace: false } && (ownHit ?? (allyAt is null)))
+            player.RecentEvents.Record(OwnedEnemyHitRecently, hitNow);
         if (allyAt is null)
         {
-            player.LastEnemyHitAt = m.PlayerHitAt = ProjectileWorldTime(player);
+            player.LastEnemyHitAt = m.PlayerHitAt = hitNow;
             player.RecentEvents.Record(StatConditions.HitEnemy, m.PlayerHitAt);
+            GainConvergenceOnHitLocked(player, m, m.PlayerHitAt, playerStats);
         }
-        if (m.Life == 0) { m.Aggro = false; m.Dead = true; CollectVaalSoulAtDeathLocked(player, m); }
-        else if (m.Hostile) { m.Aggro = true; m.LastTarget = null; }
+        if (m.Life == 0)
+        {
+            m.Aggro = false;
+            m.Dead = true;
+            CleanupDeadMonsterLocked(player.Area, m.ObjectId, m);
+            CollectVaalSoulAtDeathLocked(player, m);
+        }
+        else if (m.Hostile)
+        {
+            GainMonsterChargeWhenHitLocked(player, m, hitNow);
+            var pos = m.Walk.Position(hitNow);
+            if (!(m.ReturningHome && m.SpawnAnchor != default && Dist(pos, m.SpawnAnchor) > 2.0 * Math.Max(40, m.AggroRange)))
+            {
+                bool wasAggro = m.Aggro;
+                m.Aggro = true;
+                m.ReturningHome = false;
+                m.LastTarget = null;
+                if (!wasAggro) AlertPackLocked(player, m, pos, hitNow);
+            }
+        }
         TriggerElementalRelicLocked(player, m, hit: damage > 0, killed: m.Life == 0, allyAt);
         if (allyAt is null && damage > 0 && !player.Reservations.Secondary) ReservationHitLocked(player, m);
         return new(m.Life, starts);
     }
 
+    // Keep the signature used by mods built against 0.6.0-beta.
+    public static Task NotifyMonsterHit(Player player, uint id, SpawnedMonster m,
+        MonsterHit hit, int damage, string by, bool log, bool melee, ushort sequence,
+        List<(uint Id, SpawnedMonster M)>? deaths, byte hitCode, StunHit? stun, bool critical, string? impactArt) =>
+        NotifyMonsterHit(player, id, m, hit, damage, by, log, melee, sequence, deaths, hitCode, stun, critical, impactArt,
+            knockback: null);
+
     public static Task NotifyMonsterHit(Player player, uint id, SpawnedMonster m,
         MonsterHit hit, int damage, string by, bool log = true, bool melee = false, ushort sequence = 0,
-        List<(uint Id, SpawnedMonster M)>? deaths = null, byte hitCode = 0, StunHit? stun = null, bool critical = false, string? impactArt = null) =>
+        List<(uint Id, SpawnedMonster M)>? deaths = null, byte hitCode = 0, StunHit? stun = null, bool critical = false, string? impactArt = null,
+        SpawnedMonster.NativeKnockback? knockback = null, IReadOnlyDictionary<uint, int>? skillStats = null) =>
         NotifyMonsterHitCore(player, id, m, hit, damage, by, log, melee, sequence, deaths, hitCode, stun,
-            critical: critical, impactArt: impactArt);
+            critical: critical, impactArt: impactArt, knockback: knockback, skillStats: skillStats);
 
     static async Task NotifyMonsterHitCore(Player player, uint id, SpawnedMonster m,
         MonsterHit hit, int damage, string by, bool log, bool melee, ushort sequence,
-        List<(uint Id, SpawnedMonster M)>? deaths, byte hitCode, StunHit? stun, bool critical, string? impactArt)
+        List<(uint Id, SpawnedMonster M)>? deaths, byte hitCode, StunHit? stun, bool critical, string? impactArt,
+        SpawnedMonster.NativeKnockback? knockback = null, IReadOnlyDictionary<uint, int>? skillStats = null)
     {
         var (life, stageStarts) = hit;
         if (life == 0)
@@ -3030,7 +5006,7 @@ public static partial class Game
             var (px, py) = player.Walk.Position(now);
             var (mx, my) = m.Walk.Position(now);
             await SendWorldRecord(player, player.Id, MeleeHitFeedback(player.Id, sequence, id, hitCode,
-                    HitAngle(mx - px, my - py), critical, impactArt, order.Key, order.Hit),
+                    HitAngle(mx - px, my - py), critical, impactArt, order.Key, order.Hit, knockback),
                 !log ? null : $"0x01af player hit on monster 0x{id:x} (skill, sequence 0x{sequence:x4})");
             if (impactArt is not null) await PresentMeleeImpact(player, impactArt, (px, py), (mx, my));
         }
@@ -3041,16 +5017,18 @@ public static partial class Game
             var (mx, my) = m.Walk.Position(now);
             var hitOrder = HitOrder(player, player.Id);
             byte code = HitCodeWithVariation(hitCode, damage, m.MaxLife, critical || life == 0);
+            ushort flags = (ushort)(0x4000 | HitTypeFlag(code) | (critical ? 0x0020 : 0));
+            byte kind = 0x03, angle = HitAngle(mx - px, my - py);
+            ApplyNativeKnockback(knockback, ref flags, ref kind, ref angle, out ushort u3c, out ushort u3e);
             await SendWorldRecord(player, player.Id, InstanceProtocol.ActionHit(player.Id, sequence == 0 ? (ushort)0xffff : sequence, id,
-                    flags: (ushort)(0x4000 | HitTypeFlag(code) | (critical ? 0x0020 : 0)), kind: 0x03, code: code,
-                    angle: HitAngle(mx - px, my - py), orderKey: hitOrder.Key, checkpoint: hitOrder.Hit),
+                    flags: flags, kind: kind, code: code, angle: angle, u3c: u3c, u3e: u3e, orderKey: hitOrder.Key, checkpoint: hitOrder.Hit),
                 !log ? null : $"0x01af spell/area hit on monster 0x{id:x} (sequence 0x{sequence:x4})");
         }
         // The hit reaction: one of the rig's TakeHit clips and its SoundEvent (0x1b2), as in Attack.
         await SendFlinch(player, id, m, stun ?? new(damage), log);
         Note(!log && life > 0 ? null : $"0x01b1 monster 0x{id:x} hit by {by} for {damage}, life {life}/{m.MaxLife}{(life == 0 ? " (dies)" : "")}");
         // One sweep's deaths (loot, experience, quests) wait until every monster of the sweep has its hit (AreaSkillHit).
-        if (life == 0) { if (deaths is not null) deaths.Add((id, m)); else await MonsterKilled(player, id, m); }
+        if (life == 0) { if (deaths is not null) deaths.Add((id, m)); else await MonsterKilled(player, id, m, skillStats: skillStats); }
         if (stageStarts) _ = RunBossStage(player, id, m);
         if (m.ThresholdReached) await QuestThreshold(player, id, m);
     }
@@ -3065,20 +5043,32 @@ public static partial class Game
 
     public sealed record PlayerRecoveryIntent(int Epoch, int Action, double Until, float Seconds);
 
+    sealed record SpellWindup(int Action, int Recovery, int Epoch, double Until);
+    static readonly RuleTable<Player, SpellWindup> SpellWindups = new();
+
+    static bool InSpellCast(Player player, double now) =>
+        player.PaidChannel is { } channel && CastingSpell(player, channel.Effect) && PaidChannelCurrent(player, channel)
+        || SpellWindups.TryGetValue(player, out var windup)
+            && now < windup.Until && windup.Action == player.ActionCount
+            && windup.Recovery == player.ActionInterruptionGeneration && windup.Epoch == player.ProjectileEpoch;
+
     // Cancellation belongs to the hit boundary; the native animation is a projection of that committed interval.
-    public static PlayerRecoveryIntent? CommitPlayerHitRecoveryLocked(Player player, int damage, double now)
+    public static PlayerRecoveryIntent? CommitPlayerHitRecoveryLocked(Player player, int damage, double now) =>
+        CommitPlayerHitRecoveryLocked(player, damage, now, attacker: 0);
+
+    static PlayerRecoveryIntent? CommitPlayerHitRecoveryLocked(Player player, int damage, double now, uint attacker)
     {
         if (damage <= 0) return null;
         var stats = CharacterPlayerStats(player);
         int Get(uint key) => stats.GetValueOrDefault(key);
         void Trace(string reason)
         {
-            if (Get(AntiquarianEffects.StunRecoverySource) > 0)
+            if (Get(WardBreakEffects.StunRecoverySource) > 0)
                 Console.WriteLine($"[gateway] Turtle Shell stun: {reason}");
         }
-        // The panel publishes the per-Brutal-Charge threshold coefficient on every character; the charges held (converted
-        // Endurance Charges, ChargeEffects) are already in stun_threshold_+%, so it is not an unsupported stat.
-        if (stats.FirstOrDefault(s => s.Value != 0 && PlayerHitRecovery.UnsupportedStat(s.Key)) is { Key: > 0 } unsupported)
+        // WithRage folds the mastery into stun_threshold_+%. Its source coefficient stays in the stat snapshot.
+        if (stats.FirstOrDefault(s => s.Value != 0 && s.Key != Stat.StunThresholdPlusPctPerRage
+                && PlayerHitRecovery.UnsupportedStat(s.Key)) is { Key: > 0 } unsupported)
         { Trace("unsupported stat " + Stats.Name(unsupported.Key)); return null; }
         // Skill immunity can depend on a native action's contact phase, which this server does not track yet.
         // Conservatively skip builds with any equipped skill carrying it, rather than stun an uninterruptible phase.
@@ -3088,20 +5078,37 @@ public static partial class Game
         if (PlayerHasEnergyShieldForRecovery(player, Get)) { Trace("energy shield present"); return null; }
         // A freeze already holds the player, and its action factor would stretch the recovery a hundredfold.
         if (player.ElementalAilments.ActionFactor(now) == 0) { Trace("frozen"); return null; }
+        // Soul of the Brine King: cannot be stunned if stunned or blocked a stunning hit in the past 2 seconds.
+        if (Get(Stat.CannotBeStunnedIfHaveBeenStunnedOrBlockedStunningHitInPast2Seconds) != 0
+            && now - player.LastStunnedOrBlockedStunAt < 2.0)
+        { Trace("brine king stun immunity"); return null; }
         double chance = PlayerHitRecovery.Chance(damage, player.PlayerMaxLife, Get);
+        int ignoreWhileCasting = Get(Stat.AvoidInterruptionWhileCastingPct);
+        if (chance > 0 && ignoreWhileCasting > 0 && InSpellCast(player, now))
+            chance *= (100 - Math.Min(ignoreWhileCasting, 100)) / 100d;
         float seconds = PlayerHitRecovery.Duration(Get, PlayerActionFactor(player));
         if (seconds <= 0 || AreaRng(player).NextDouble() * 100 >= chance
             || player.Closed || player.PlayerLife == 0 || !player.HitRecovery.Begin(now, seconds))
         { Trace($"not accepted (chance {chance:0.###}%, duration {seconds:0.###} s)"); return null; }
-        Trace($"accepted ({seconds:0.###} s, {Get(AntiquarianEffects.StunRecoverySource)}% Life over one second)");
+        Trace($"accepted ({seconds:0.###} s, {Get(WardBreakEffects.StunRecoverySource)}% Life over one second)");
+        player.LastStunnedOrBlockedStunAt = now;
         player.RecentEvents.Record(StatConditions.BeenStunned, now);
-        player.Antiquarian.Stunned(now, player.PlayerMaxLife, Get(AntiquarianEffects.StunRecoverySource));
+        player.WardBreak.Stunned(now, player.PlayerMaxLife, Get(WardBreakEffects.StunRecoverySource));
         CancelMeleeRepeats(player, now);
         int action = Interlocked.Increment(ref player.ActionCount);
+        bool wasCharging = IsShieldChargeActive(player);
+        EndShieldChargeIfInterrupted(player);
         player.ChannelSkill = 0; player.NextAttackAt = now;
+        player.LockstepActionBackswingUntil = 0;
+        player.LockstepActionScheduledAt = 0;
         // A predictive client stops for the recovery and then goes on with its walk (live 2026-11-01: 30 cells apart when
         // this ended it). A lockstep one ends its walk in the frame the 0x1d1 reaches it (PlayerHitRecoveryRecordLocked).
-        if (!player.Connection.LockstepClient) player.Walk.Pause(now, seconds);
+        if (!player.Connection.LockstepClient)
+        {
+            if (wasCharging) player.Walk.Cancel(now);
+            else player.Walk.Pause(now, seconds);
+        }
+        RecordIncomingHitTriggers(player, 0, now, stunned: true, attacker: attacker);
         return new(player.ProjectileEpoch, action, player.HitRecovery.Until, seconds);
     }
 
@@ -3124,6 +5131,7 @@ public static partial class Game
         float seconds = (float)Math.Min(remaining, recovery.Seconds);
         if (player.Connection.LockstepClient)
         {
+            EndShieldChargeIfInterrupted(player);
             player.Walk.Cancel(now);
             if (player.Connection.LockstepFrame is { } frame)
                 player.LockstepBusyUntil = Math.Max(player.LockstepBusyUntil, LockstepRecoveryEnds(frame, seconds));
@@ -3159,6 +5167,16 @@ public static partial class Game
             long left = Math.Max(floor, (long)m.Life - damage);
             if (left * 100 <= (long)m.MaxLife * threshold.LifePct) { m.ThresholdReached = true; m.PresentationChanged?.Invoke(); }
             return ((uint)left, false);
+        }
+        // Encounter-owned non-lethal life floor: damage lowers life normally, stops at 1 instead of killing, and notifies
+        // the controller once in the area's frame.
+        if (m.OnNonLethalZero is { } onNonLethalZero)
+        {
+            long left = (long)m.Life - damage;
+            if (left > 0) return ((uint)left, false);
+            m.Life = 1;
+            onNonLethalZero(m);
+            return (1, false);
         }
         var (life, starts) = BossFights.Damage(m.Life, m.MaxLife, damage, m.StageTaken ? null : m.Stage);
         if (starts)
@@ -3287,9 +5305,16 @@ public static partial class Game
     // after that (5, 0 and 56 frames).
     public static void StopCorpseBlocking(Player player, uint id, SpawnedMonster m)
     {
-        bool kept;
-        kept = KeepCorpseLocked(player, id, m);
-        if (!kept) SendAfter(player, CorpseBlockDelaySeconds, () => CorpseCleared(player, id, m));
+        RememberCursedCorpse(player, id, m);
+        bool kept = KeepCorpseLocked(player, id, m);
+        if (!kept)
+        {
+            // Match the variety's native remove_collidability clip timing on predictive clients instead of delaying
+            // varieties without one by a fixed 165 ms.
+            double delay = m.Variety is { } v ? (Monsters.CorpseUnblockMs(v.Id) ?? 0) / 1000d : CorpseBlockDelaySeconds;
+            if (delay <= 0) _ = CorpseCleared(player, id, m);
+            else SendAfter(player, delay, () => CorpseCleared(player, id, m));
+        }
     }
 
     // Keeps the killed monster's body on a lockstep client and starts what ends it: the wait for its death message's
@@ -3352,15 +5377,35 @@ public static partial class Game
         if (player.Connection.LockstepFrame is not { } frame) return;
         foreach (var record in batch.Records)
         {
-            if (record.LifeWritten is not { } life || record.Object is not { } target
-                || !player.Area.Monsters.TryGetValue(target.Id, out var m)) continue;
-            bool kept = life == 0 && !player.DeathWritten(target.Id, m)
-                && KeepCorpseLocked(player, target.Id, m);
-            player.NoteLifeWritten(target.Id, m, life);
-            if (!kept || !player.CorpseAwaitsDeathOf(target.Id)) continue;
-            StepWalkers(player, frame.Start);
-            player.CorpseDied(target.Id, frame);
+            if (record.LifeWritten is not { } life || record.Object is not { } target) continue;
+            NoteMonsterLifeWrittenLocked(player, target.Id, life, frame);
         }
+    }
+
+    // AreaLife publishes monster 0x01b1 life updates directly into Area.Delta (bypassing SendWorldBatch): observe them
+    // here as each lockstep client's frame ends so corpse blocking starts immediately instead of waiting out the 1 s
+    // CorpseDeathWaitSeconds timeout.
+    public static void CorpseDeathsWritten(Player player, IReadOnlyList<AreaDelta.Record> delta)
+    {
+        if (player.Connection.LockstepFrame is not { } frame) return;
+        foreach (var record in delta)
+        {
+            if (!record.For(player) || record.Bytes.Length < 21) continue;
+            if (System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(record.Bytes) != InstanceProtocol.LifeUpdateId) continue;
+            if (record.Bytes[20] != AreaLife.LifePool) continue;
+            uint life = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(record.Bytes.AsSpan(12));
+            NoteMonsterLifeWrittenLocked(player, record.Entity, life, frame);
+        }
+    }
+
+    static void NoteMonsterLifeWrittenLocked(Player player, uint id, uint life, (double Start, double End) frame)
+    {
+        if (!player.Area.Monsters.TryGetValue(id, out var m)) return;
+        bool kept = life == 0 && !player.DeathWritten(id, m) && KeepCorpseLocked(player, id, m);
+        player.NoteLifeWritten(id, m, life);
+        if (!kept || !player.CorpseAwaitsDeathOf(id)) return;
+        StepWalkers(player, frame.Start);
+        player.CorpseDied(id, frame);
     }
 
     // A monster died (its life reached 0 from the player's attack or skill): the player gains its experience when near
@@ -3368,19 +5413,31 @@ public static partial class Game
     // player is in the area (it stays in Monsters as Dead: no AI, body cleared by StopCorpseBlocking); leaving does not save it.
     // A minion's kill (byMinion) is not the player's for his on-kill effects.
     public static async Task MonsterKilled(Player player, uint id, SpawnedMonster m,
-        bool byMinion = false, bool byHit = true)
+        bool byMinion = false, bool byHit = true, IReadOnlyDictionary<uint, int>? skillStats = null)
     {
-        await MonsterKilledBy(player, id, m, playerKill: !byMinion, byHit);
+        await MonsterKilledBy(player, id, m, playerKill: !byMinion, byHit, skillStats);
         // The map overlay's "X monsters remain" (S→C 0x1a0): one fewer of the area's monsters is alive. Its corpse stays
         // in the roster, so the count is the living ones (MonsterRemaining.cs).
         await SendRemainingMonsters(player);
     }
 
     static async Task MonsterKilledBy(Player player,
-        uint id, SpawnedMonster m, bool playerKill, bool byHit = true)
+        uint id, SpawnedMonster m, bool playerKill, bool byHit = true, IReadOnlyDictionary<uint, int>? skillStats = null)
     {
         // Guarantee the mini life bar is hidden for every kill path (AreaStats deduplicates when already set at the hit/DoT site).
         SetStats(player, id, [(Stat.HideMiniLifeBar, 1)]);
+        if (m.HasCurses || playerKill && m.Hostile && (HitMarkedMonsters.TryGetValue(m, out _)
+                || !IndexedHitMarkAreas.TryGetValue(player.Area, out _)))
+            using (ProjectileMutation(player, advance: false))
+                if (CurrentGameWork && !player.Closed && !player.LeavingArea
+                    && player.Area.Monsters.GetValueOrDefault(id) == m)
+                {
+                    double deathAt = ProjectileWorldTime(player);
+                    if (playerKill && m.Hostile) IndexExistingHitMarksLocked(player);
+                    if (playerKill && m.Hostile && HitMarkedMonsters.TryGetValue(m, out _))
+                        HitSummonsOnDeathLocked(player, id, m, deathAt);
+                    TransferMarksOnDeathLocked(player, m, deathAt);
+                }
         TinctureKillBonus? tinctureKill;
         // The lethal hit froze this decision before its notifications could yield. Consume only that exact receipt.
         bool destroyCorpse;
@@ -3388,14 +5445,19 @@ public static partial class Game
         destroyCorpse = playerKill && byHit && TakeUnhingedHitKillLocked(player, m);
         QueueEssenceDeathSpawnLocked(player, id, m);
         if (playerKill) QueueMadnessExplosionLocked(player, id, m);
-        StopCorpseBlocking(player, id, m);
+        if (!destroyCorpse || HardcoreProgressBlocked(player) || m.Variety is null || !m.Hostile)
+            StopCorpseBlocking(player, id, m);
+        DetonateExplosiveFusesOnDeath(m);
+        QueueInfernalBlowDeath(m, ProjectileWorldTime(player));
+        QueueInfernalCryDeath(id, m, ProjectileWorldTime(player));
+        SpreadPestilentStrike(player, id, m, ProjectileWorldTime(player));
         if (SpreadContagion(player, id, m) is { } contagion)
             await ShowContagionSpread(player, contagion.At, contagion.Radius, contagion.Ao);
         double now = AreaTime(player);
         (int X, int Y) at, playerAt;
-        bool alive, blocked;
-        at = m.Walk.Position(now); playerAt = player.Walk.Position(now); alive = player.PlayerLife > 0;
-        blocked = HardcoreProgressBlocked(player);
+        at = m.Walk.Position(now); playerAt = player.Walk.Position(now);
+        var explosionEquipment = playerKill ? CaptureKillEquipment(player, m, at, now) : default;
+        bool blocked = HardcoreProgressBlocked(player);
         await SendVaalSouls(player);
         // Every kill in a survivors run feeds the run's own experience, whoever landed it (survivors-mode.md).
         // A dead Hardcore character's kills (an ignite still burning) make no progress, as a projectile's (CommitProjectileKill).
@@ -3407,25 +5469,44 @@ public static partial class Game
         var monster = ModMonster(m, at);
         if (playerKill)
         {
+            WitchbaneOnKill(player, m, AreaTime(player));
+            if (MapDeathMarkDuration(player, m) is > 0 and var markMs)
+                await ApplyMapDeathMarkOnKill(player, markMs);
             await GameEvents.RunMonsterKilled(new(player, monster));
-            if (OnslaughtOnKill(player)) await SendKillOnslaught(player);
-            ChargesOnKill(player, m);
-            RecoverOnKill(player, m, tinctureKill);
-            GainPhasingOnKill(player);
+            if (OnslaughtOnKill(player, AreaTime(player), m.TauntedAtDeath)) await SendKillOnslaught(player);
+            ChargesOnKill(player, m, skillStats);
+            if (RecoverOnKill(player, m, tinctureKill) is int deathEpoch)
+                await PlayerDiedAtEpoch(player, "death from life lost on kill", deathEpoch);
+            else if (player.PlayerLife > 0)
+                GainPhasingOnKill(player);
             // ChargesOnKill recorded this accepted kill before the explosion samples its conditions.
+            bool corpseDestroyed = destroyCorpse && DestroyHitKillCorpseLocked(player, id, m);
             bool corpseConsumed, devoured;
             now = AreaTime(player);
             // Devour's corpse is taken before the tattoo's roll: one killing blow consumes a corpse once.
-            devoured = ConsumeDevouredCorpseLocked(player, id, m, now);
-            corpseConsumed = devoured || ConsumeCorpseOnKillLocked(player, id, m, now);
-            bool explodedCorpse = await ExplodeOnKill(player, id, m, at);
-            if (corpseConsumed && !explodedCorpse)
+            devoured = !corpseDestroyed && ConsumeDevouredCorpseLocked(player, id, m, now);
+            corpseConsumed = corpseDestroyed || devoured || ConsumeCorpseOnKillLocked(player, id, m, now);
+            if (corpseConsumed)
                 await Game.SendWorldRemoval(player, id,
-                    $"0x02bd corpse 0x{id:x} ({m.Label}) {(devoured ? "devoured by the supported skill" : "consumed by the killing blow")}");
+                    $"0x02bd corpse 0x{id:x} ({m.Label}) {(corpseDestroyed ? "destroyed on hit kill" : devoured ? "devoured by the supported skill" : "consumed by the killing blow")}");
+            await ExplodeOnKill(player, id, m, at, explosionEquipment);
         }
         // Soul Eater eats the souls of anything killed nearby, the player's kill or not.
         SoulEaterSoul(player, id, at);
-        await SetQuestFlags(player, QuestsOf(player).OnMonsterKilled(player.Layout.Id, variety.Id));
+        // Kin-death charge grants (Dread Primates / Undying Grapplers) & generic CastsOnDeath skills.
+        MonsterKits.GrantKinDeathChargesLocked(player.Area, id, m, now);
+        _ = AreaFrames.Start(() => MonsterKits.ExecuteDeathSkills(player, id, m, at));
+        bool firstBossKill = HasUnsetKillQuestFlag(player, variety.Id);
+        if (!firstBossKill && player.Instance is { } killInstance)
+        {
+            foreach (var peer in killInstance.Presence.PlayersExcept(player.Id))
+            {
+                if (peer is not { Closed: false, LeavingArea: false } other || !other.Connection.PlayerSent
+                    || HardcoreProgressBlocked(other)) continue;
+                if (HasUnsetKillQuestFlag(other, variety.Id)) { firstBossKill = true; break; }
+            }
+        }
+        await SetQuestFlags(player, QuestFlagsOnKill(player, variety.Id));
         // The party's kill: every living player within the experience range takes their share
         // (Progression.PartyMultiplier), the killer included. The presence of a private area is the party (an area is
         // entered as the party's instance).
@@ -3434,69 +5515,37 @@ public static partial class Game
         await GameEvents.RunKill(new(player, m, variety.Id, at) { PlayerKill = playerKill });
         // A summoned monster whose skill says so gives neither experience nor items, and so does a boss's first stage
         // (BossMods: Malachai, Shakari and Piety's escape give no experience; their own rows say so).
-        if (!m.NoRewards && !BossMods.NoRewards(variety) && alive && Dist(at, playerAt) <= ExperienceRange && Monsters.BaseExperience(variety, m.Level) is int baseXp)
+        if (!MonsterGivesNoRewards(m) && player.PlayerLife > 0 && Dist(at, playerAt) <= ExperienceRange)
         {
-            var (xp, gemXp) = KillExperience(killer, monster, baseXp, variety.ExperienceMultiplier, m.Rarity,
-                player.Pools.Level, m.Level, PartyExperienceShareOf(partyShares, player));
+            var (xp, gemXp) = ComputeKillExperience(player, m, variety, monster, PartyExperienceShareOf(partyShares, player));
             // The gems gain their share of the kill only (not a quest's level or /add_xp), at the character's cap too:
             // 10% of the kill's experience before the level penalty.
-            await GainGemExperience(player, gemXp);
-            await GainExperience(player, xp, $"{m.Rarity} {m.Label} 0x{id:x}");
+            if (gemXp > 0) await GainGemExperience(player, gemXp);
+            if (xp > 0) await GainExperience(player, xp, $"{m.Rarity} {m.Label} 0x{id:x}");
         }
         // A quest kill that levels the character up (a1q1: Hillock → at least level 2), wherever the player stands.
-        if (QuestsOf(player).LevelAfterKill(player.Layout.Id, variety.Id) is int level and > 1 && level <= CharacterStats.LevelStarts.Count)
+        if (player.PlayerLife > 0 && QuestsOf(player).LevelAfterKill(player.Layout.Id, variety.Id) is int level and > 1
+            && level <= CharacterStats.LevelStarts.Count)
         {
             uint needed = CharacterStats.LevelStarts[level - 1], have;
             have = player.Character.Experience;
             if (have < needed) await GainExperience(player, needed - have, $"quest: {m.Label} killed, level {level}");
         }
-        await GainKillCharges(player, m.Rarity, $"{m.Rarity} {m.Label} 0x{id:x} killed", tinctureKill?.FlaskChargesPct ?? 0);
-        if (!m.NoRewards) await DropLoot(player, m, at);
-        await PublishUnhingedCorpseDestruction(player, id, m, destroyCorpse);
+        if (!MonsterGivesNoRewards(m))
+            await GainKillCharges(player, m.Rarity, $"{m.Rarity} {m.Label} 0x{id:x} killed", tinctureKill?.FlaskChargesPct ?? 0);
+        await DropLoot(player, m, at, firstBossKill);
     }
 
     // The monster's items (ItemDrops.Roll) as WorldItem objects scattered around where it died, on walkable cells when the
     // area's walk map is known. Like dropped items they lie in the instance (InstanceStore).
-    public static async Task DropLoot(Player player, SpawnedMonster m, (int X, int Y) at)
+    public static async Task DropLoot(Player player, SpawnedMonster m, (int X, int Y) at, bool firstBossKill = false)
     {
-        if (Environment.GetEnvironmentVariable("Game_DROPS") == "0") return;
-        // A stage of a boss that gives no items (Malachai's first form, Abberath, Shavronne's tower, Maligaro's souls),
-        // and the opening tutorial zombie (it drops only the tutorial skill gem via QuestObjects).
-        if (BossMods.GivesNoItems(m.Variety) || m.Variety?.Id == TutorialObjects.Zombie) return;
-        // A survivors run keeps the ground clear: no loot, no gold, nothing reaches the client.
-        if (!GameEvents.AllowsLoot(player)) return;
-        var balance = LeagueFor(player).Rules;
-        // The mods' changes (Program.Mods.cs): their multipliers on top of the league's, their own items besides.
-        var modded = GameEvents.RunDrops(player, ModMonster(m, at));
-        List<ItemDrops.Drop> drops = [];
-        // The King in the Mists always drops one of four uniques, plus its support gems and card. Its humanoid form is
-        // removed without a death, so only the treant (Boss3) reaches here.
-        if (KingInMists.IsBoss3(m.Variety))
-            drops.AddRange(DropsFor(player).KingInMists(m.Level, AreaRng(player)));
-        if (modded is not { Cancel: true })
+        var rng = AreaRng(player);
+        var stacked = RollKillLoot(player, m, at, rng, firstBossKill);
+        if (stacked.Count == 0) return;
+        foreach (var drop in stacked)
         {
-            if (m.Rarity == MonsterRarity.Unique && m.Variety is { } boss)
-                drops.AddRange(DropsFor(player).EncounterJewels(boss.Id, m.Level, AreaRng(player), DropDataProvider.Default.Current));
-            // A generic map drop (approximate rates): use the open map's tier in a map, or tier 1 in the late campaign
-            // once the monster meets MapKeyTier1's DropLevel. The same tier gates base card/scarab and atlas-base drops.
-            int mapTier = MapRunOf(player)?.Area.Tier ?? 0;
-            drops.AddRange(DropsFor(player).Roll(m.Level, m.Rarity, AreaRng(player), IncreasedItemRarity(player, m),
-                balance.ItemDropMultiplier * (modded?.Quantity ?? 1) * ItemQuantityFactor(player, m), balance.EquipmentRarityMultiplier * (modded?.Rarity ?? 1), mapTier, MapModsOf(player)));
-            drops.AddRange(PartyCurrency(player, drops, AreaRng(player)));
-            if (DropsFor(player).Map(m.Level, m.Rarity, mapTier, AreaRng(player), chanceFactor: modded?.MapRelated ?? 1) is { } mapDrop) drops.Add(mapDrop);
-            // And a pile of gold (ItemDrops.Gold), picked up into the stash's gold.
-            if (DropsFor(player).Gold(m.Level, m.Rarity, AreaRng(player),
-                balance.GoldMultiplier * SystemSettings.Default.GoldDropMultiplier * (modded?.Gold ?? 1)) is { } gold) drops.Add(gold);
-            drops.AddRange(ExtraDropsFromMap(player, m.Level, m.Rarity, AreaRng(player)));
-        }
-        drops = ModdedDrops(player, modded, drops, m.Level, m.Rarity, IncreasedItemRarity(player, m), balance.EquipmentRarityMultiplier, AreaRng(player));
-        if (MapBeyond.CorruptsDrops(player, m.Variety?.Id)) CorruptDrops(drops);
-        foreach (var drop in ItemDrops.Stacked(drops))
-        {
-            // A ring around the corpse, 3 to 6 cells out.
-            double angle = AreaRng(player).NextDouble() * Math.Tau, r = 3 + AreaRng(player).NextDouble() * 3;
-            int x = at.X + (int)Math.Round(Math.Cos(angle) * r), y = at.Y + (int)Math.Round(Math.Sin(angle) * r);
-            if (player.Layout.Walkable is { } walks && !walks(x, y)) (x, y) = at;
+            var (x, y) = ScatterDropPosition(player, at, rng);
             var ground = new WorldItemObject(x, y, drop.Item);
             uint id = player.Instance.Ground.Add(ground, player);
             await SendGroundItem(player, id, ground,

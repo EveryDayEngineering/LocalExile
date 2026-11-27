@@ -13,14 +13,22 @@ public static class AuraCatalog
         int SupportEffectPct = 0, bool AffectsSelf = true, string? Stance = null, int? ExternalEffectPct = null,
         bool ReservesLife = false, int ReservationEfficiencyPct = 0, bool IsHerald = false,
         int LifeFlat = 0, int LifePercent = 0,
-        int ArtVariation = 0, bool HideVisual = false, ushort? SourceVisual = null, ushort? BuffVisual = null)
+        int ArtVariation = 0, bool HideVisual = false, ushort? SourceVisual = null, ushort? BuffVisual = null,
+        int PerAuraEffectPct = 0,
+        // Commander of Darkness (Necromancer): the caster's stamped values, read from its own passive stats when the
+        // aura is reconciled (OwnAuras). They ride the record so the allies and minions the aura reaches can use them
+        // without reading the caster's connection; 0 when the caster has not allocated the node.
+        int CommanderAttackCastSpeedPct = 0, int CommanderElementalResistancePct = 0, int CommanderDamagePct = 0)
     {
         public object? StanceOwner { get; init; }
+        public bool SelfOnly { get; init; }
+        public int MoreEffectPct { get; init; }
+        public bool FixedManaReservation { get; init; }
     }
 
     // The source supplies the ground art; the received buff supplies the HUD icon and active-skill association.
     // Both are the aura's (one row, one source), told apart by the source flag; they end together.
-    public static IEnumerable<Buff> Buffs(Aura aura, uint player, ushort? action, byte? receivedDisplayState = null)
+    public static IEnumerable<Buff> Buffs(Aura aura, uint player, ushort? action, byte? receivedDisplayState = null, ushort tag = 0)
     {
         // Both source and received buffs instantiate these native behaviours, which read two words unchecked.
         uint[]? behaviourData = aura.EffectId switch
@@ -30,13 +38,13 @@ public static class AuraCatalog
             _ => null,
         };
         if (aura.SourceBuff is not null)
-            yield return new(aura.BuffRow, player, aura.SkillId, AuraSource: true, DisplayState: 0, Visual: aura.SourceVisual, List: behaviourData);
+            yield return new(aura.BuffRow, player, aura.SkillId, AuraSource: true, DisplayState: 0, Visual: aura.SourceVisual, List: behaviourData, Tag: tag);
         // An enemy hex aura has a source on its caster, never a received self curse.
         if (!CurseCatalog.Hex(aura.EffectId))
             // TempestShieldBuff's native behaviour reads the art variation and hide-user-buff flag
             // from the first two list entries without checking its length (0x1417a9410).
             yield return new(aura.BuffRow, player, aura.SkillId, ActiveSkill: action is ushort hash ? (aura.SkillId, hash) : null,
-                DisplayState: receivedDisplayState, Visual: aura.BuffVisual, List: behaviourData);
+                DisplayState: receivedDisplayState, Visual: aura.BuffVisual, List: behaviourData, Tag: tag);
     }
 
     /// <summary>Whether a buff row is one of the auras' (a player's own aura buffs are replaced as one group).</summary>
@@ -130,12 +138,46 @@ public static class AuraCatalog
 
     public static ushort BuffRow(string effectId) => BuffRows[Family(effectId)];
 
+    /// <summary>The per-aura effect stat for each aura family, by the client's Stats ids (Stat.g.cs is
+    /// generated from the client's Stats table). One place: the generic aura effect never reads these, and
+    /// Value() adds the stamped term, so no caller reads them again. Malevolence's stat is named for
+    /// Delirium, not the skill ("delirium_aura_effect_+%"); the other fourteen spell the family name in
+    /// lower snake case. The three out-of-scope rows (minions_have_..., banner_aura_effect_+%,
+    /// mine_aura_effect_+%) are not here: minions, banners and mines scale elsewhere.</summary>
+    public static readonly IReadOnlyDictionary<string, uint> PerAuraEffectStats =
+        new Dictionary<string, uint>(StringComparer.Ordinal)
+        {
+            ["Anger"] = Stat.AngerAuraEffectPlusPct,
+            ["Malevolence"] = Stat.DeliriumAuraEffectPlusPct,
+            ["Hatred"] = Stat.HatredAuraEffectPlusPct,
+            ["Wrath"] = Stat.WrathAuraEffectPlusPct,
+            ["Zealotry"] = Stat.ZealotryAuraEffectPlusPct,
+            ["Determination"] = Stat.DeterminationAuraEffectPlusPct,
+            ["Discipline"] = Stat.DisciplineAuraEffectPlusPct,
+            ["Grace"] = Stat.GraceAuraEffectPlusPct,
+            ["Pride"] = Stat.PrideAuraEffectPlusPct,
+            ["Precision"] = Stat.PrecisionAuraEffectPlusPct,
+            ["Haste"] = Stat.HasteAuraEffectPlusPct,
+            ["PurityOfElements"] = Stat.PurityOfElementsAuraEffectPlusPct,
+            ["PurityOfFire"] = Stat.PurityOfFireAuraEffectPlusPct,
+            ["PurityOfIce"] = Stat.PurityOfIceAuraEffectPlusPct,
+            ["PurityOfLightning"] = Stat.PurityOfLightningAuraEffectPlusPct,
+        };
+
+    /// <summary>One aura's own named effect term from the caster's raw sources (the reconcile stamps it, so
+    /// the value rides the record to allies and minions). 0 when the family has no named stat or the caster
+    /// has none.</summary>
+    public static int PerAuraEffectPctFor(Aura aura, IReadOnlyDictionary<uint, int> sources) =>
+        PerAuraEffectPctFor(aura.EffectId, sources);
+
+    /// <summary>One aura's own named effect term from the caster's raw sources, by effect id.</summary>
+    public static int PerAuraEffectPctFor(string effectId, IReadOnlyDictionary<uint, int> sources) =>
+        PerAuraEffectStats.TryGetValue(Family(effectId), out uint key) ? sources.GetValueOrDefault(key) : 0;
+
     /// <summary>The character stat that exempts a supported aura family from Mana reservation. The shipped rows use the
     /// lower snake-case effect family (for example EnvyNoReservationUnique__1 carries envy_reserves_no_mana).</summary>
     public static uint NoManaReservationStat(string effectId)
     {
-        if (Family(effectId) == "AspectOfTheAvian") return Stat.BirdAspectReservesNoMana;
-        if (Family(effectId) == "AspectOfTheSpider") return Stat.SpiderAspectReservesNoMana;
         if (Family(effectId) == "AspectOfTheCrab") return Stat.Of("crab_aspect_reserves_no_mana");
         string family = Family(effectId);
         var stat = new System.Text.StringBuilder(family.Length + 16);
@@ -209,7 +251,8 @@ public static class AuraCatalog
         double flat = 0, percent = 0;
         foreach (var aura in auras)
         {
-            double efficiency = Math.Max(-99L, (long)efficiencyPct + aura.ReservationEfficiencyPct) / 100.0 + 1;
+            double efficiency = !life && aura.FixedManaReservation ? 1
+                : Math.Max(-99L, (long)efficiencyPct + aura.ReservationEfficiencyPct) / 100.0 + 1;
             var (flatCost, percentCost) = life
                 ? ExplicitLife(aura) ? (aura.LifeFlat, aura.LifePercent) : (aura.ManaFlat, aura.ManaPercent)
                 : (aura.ManaFlat, aura.ManaPercent);
@@ -235,10 +278,19 @@ public static class AuraCatalog
         int fireMax = 0, coldMax = 0, lightningMax = 0, chaosMax = 0;
         int accuracy = 0, criticalChance = 0, attackSpeed = 0, movementSpeed = 0;
         int armour = 0, evasion = 0, energyShield = 0, armourMore = 0, evasionMore = 0, spellCrit = 0;
+        int commanderSpeed = 0, commanderResistance = 0;
         foreach (var group in auras.GroupBy(StatFamily))
         {
             var aura = group.First();
             int Strongest(uint name) => group.Max(a => Value(skills, stats, a, name, auraEffectPct + a.SupportEffectPct));
+            int groupCommanderSpeed = 0;
+            foreach (var candidate in group)
+                if (CommanderEligible(candidate, skills))
+                {
+                    groupCommanderSpeed = Math.Max(groupCommanderSpeed, CommanderSpeed(candidate, auraEffectPct));
+                    commanderResistance = Math.Max(commanderResistance, candidate.CommanderElementalResistancePct);
+                }
+            commanderSpeed += groupCommanderSpeed;
             switch (Family(aura.EffectId))
             {
                 case "Determination":
@@ -285,6 +337,10 @@ public static class AuraCatalog
                     break;
             }
         }
+        // Commander of Darkness: each eligible aura family grants the caster's speed (scaled by that aura's effect,
+        // rounded down per aura), and the resistance once for any aura affecting the recipient.
+        attackSpeed += commanderSpeed;
+        fire += commanderResistance; cold += commanderResistance; lightning += commanderResistance;
         return new CharacterStats.Bonus(FireResistance: fire, ColdResistance: cold, LightningResistance: lightning,
             ChaosResistance: chaos, FireMaxResistance: fireMax, ColdMaxResistance: coldMax,
             LightningMaxResistance: lightningMax, ChaosMaxResistance: chaosMax,
@@ -330,14 +386,26 @@ public static class AuraCatalog
     /// effect. Heralds' buff stats are scaled by <paramref name="heraldEffectPct"/> instead ("X% increased Effect of
     /// Herald Buffs on you"); the character's own stat value is passed by the caller.</summary>
     public static IEnumerable<(uint Key, int Value)> RawStats(IEnumerable<Aura> auras, int auraEffectPct,
-        SkillCatalog skills, StatCatalog stats, int heraldEffectPct = 0)
+        SkillCatalog skills, StatCatalog stats, int heraldEffectPct = 0) =>
+        RawStats(auras, auraEffectPct, skills, stats, heraldEffectPct, extraEffect: null);
+
+    public static IEnumerable<(uint Key, int Value)> RawStats(IEnumerable<Aura> auras, int auraEffectPct,
+        SkillCatalog skills, StatCatalog stats, int heraldEffectPct, Func<Aura, int>? extraEffect)
     {
         var result = new Dictionary<uint, int>();
+        int commanderCastSpeed = 0, commanderDamage = 0;
         foreach (var group in auras.GroupBy(StatFamily))
         {
             var family = new Dictionary<uint, int>();
+            int groupCommanderSpeed = 0;
             foreach (var aura in group)
             {
+                int addedEffect = ActorScale.Saturate((long)(aura.IsHerald ? heraldEffectPct : 0) + (extraEffect?.Invoke(aura) ?? 0));
+                if (CommanderEligible(aura, skills))
+                {
+                    groupCommanderSpeed = Math.Max(groupCommanderSpeed, CommanderSpeed(aura, auraEffectPct));
+                    commanderDamage = Math.Max(commanderDamage, aura.CommanderDamagePct);
+                }
                 switch (aura.EffectId)
                 {
                     case "AvianMightShared":
@@ -443,14 +511,38 @@ public static class AuraCatalog
                 void Add(uint name, uint? source = null)
                 {
                     if (!(name is var key)) return;
-                    int value = Value(skills, stats, aura, source ?? name, auraEffectPct + aura.SupportEffectPct,
-                        aura.IsHerald ? heraldEffectPct : 0);
+                    int value = Value(skills, stats, aura, source ?? name, auraEffectPct + aura.SupportEffectPct, addedEffect);
                     family[key] = family.TryGetValue(key, out int previous) ? Math.Max(previous, value) : value;
                 }
             }
             foreach (var (key, value) in family) result[key] = ActorScale.Add(key, result.GetValueOrDefault(key), value);
+            commanderCastSpeed += groupCommanderSpeed;
         }
+        // Commander of Darkness: the speed per eligible aura family (as in Bonus) reaches cast speed here, and the
+        // damage once for any aura affecting the recipient, unscaled by aura effect.
+        if (commanderCastSpeed != 0)
+            result[Stat.CastSpeedPlusPct] = ActorScale.Add(Stat.CastSpeedPlusPct, result.GetValueOrDefault(Stat.CastSpeedPlusPct), commanderCastSpeed);
+        if (commanderDamage != 0)
+            result[Stat.DamagePlusPct] = ActorScale.Add(Stat.DamagePlusPct, result.GetValueOrDefault(Stat.DamagePlusPct), commanderDamage);
         return result.Select(kv => (kv.Key, kv.Value));
+    }
+
+    /// <summary>Whether an aura carries Commander of Darkness grants: an aura skill (<see cref="SkillCatalog.IsAura"/>)
+    /// that affects you and allies, excluding enemy-affecting auras (<c>AuraAffectsEnemies</c>: Pride, Flesh and Stone,
+    /// Summon Skitterbots, mines) and hexes. Heralds and Aspects are not aura skills.</summary>
+    public static bool CommanderEligible(Aura aura, SkillCatalog skills) =>
+        skills.IsAura(aura.Effect) && !skills.HasType(aura.Effect, "AuraAffectsEnemies") && !CurseCatalog.Hex(aura.EffectId);
+
+    /// <summary>One aura's Commander of Darkness speed grant: the caster's stamped value, scaled by that aura's
+    /// own effect (its ExternalEffectPct, else the caller's aura effect plus the aura's support effect, plus its
+    /// per-aura effect stat, as <see cref="Value"/> reads them) and rounded down, per aura. Call only for an
+    /// eligible aura.</summary>
+    static int CommanderSpeed(Aura aura, int auraEffectPct)
+    {
+        int effect = (aura.ExternalEffectPct ?? auraEffectPct + aura.SupportEffectPct) + aura.PerAuraEffectPct;
+        int value = Math.Max(0, aura.CommanderAttackCastSpeedPct);
+        return (int)Math.Clamp((decimal)value * Math.Max(0, 100 + effect)
+            * (100 + aura.MoreEffectPct) / 10_000m, 0, int.MaxValue);
     }
 
     private static int Value(SkillCatalog skills, StatCatalog stats, Aura aura, uint name, int auraEffectPct,
@@ -458,14 +550,21 @@ public static class AuraCatalog
     {
         if (!(name is var key)) return 0;
         auraEffectPct = aura.ExternalEffectPct ?? auraEffectPct;
+        // The aura's own named effect, stamped at reconcile: it joins the generic effect here, the one place
+        // every aura stat scales through, so Bonus, RawStats, ResistanceStats, Pride and Flesh and Stone all
+        // read it without a second lookup. ExternalEffectPct never carries it (the stamps add only the generic
+        // effect plus support), so it is added once, never twice.
+        auraEffectPct += aura.PerAuraEffectPct;
         if (!skills.IsAura(aura.Effect)) auraEffectPct = 0;
         auraEffectPct += extraEffectPct;
         int value = EffectStats(aura, skills).FirstOrDefault(kv => kv.Item1 == key).Item2;
         // PoB ModStore.ScaleAddList truncates these integer defence-aura stats before character-wide scaling.
         // Decimal preserves the exact hundredths from the integer aura-effect percentage.
         if (Family(aura.EffectId) is "Discipline" or "Determination" or "Grace")
-            return (int)Math.Clamp(decimal.Truncate(value * Math.Max(0m, 100m + auraEffectPct) / 100m), int.MinValue, int.MaxValue);
-        return (int)Math.Round(value * Math.Max(0, 100 + auraEffectPct) / 100.0, MidpointRounding.AwayFromZero);
+            return (int)Math.Clamp(decimal.Truncate(value * Math.Max(0m, 100m + auraEffectPct)
+                * (100 + aura.MoreEffectPct) / 10_000m), int.MinValue, int.MaxValue);
+        return (int)Math.Clamp(Math.Round(value * (double)Math.Max(0, 100 + auraEffectPct)
+            * (100 + aura.MoreEffectPct) / 10_000.0, MidpointRounding.AwayFromZero), int.MinValue, int.MaxValue);
     }
 
     static IReadOnlyList<(uint Key, int Value)> EffectStats(Aura aura, SkillCatalog skills) =>

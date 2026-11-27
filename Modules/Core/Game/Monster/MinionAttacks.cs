@@ -15,7 +15,7 @@ public static partial class Game
 
     /// <summary>
     /// The monster a fighting minion goes for this AI step: the living hostile one nearest it within its aggro range, of it
-    /// and of the player (it does not leave him for a distant pack), not lurking unrisen. Null when there is none or the
+    /// and of the player (it does not leave him for a distant pack), one a minion may target (MinionMayTarget: a lurking one is). Null when there is none or the
     /// player is dead; it then follows him. In the area's frame.
     /// </summary>
     public static MinionTarget? MinionTargetLocked(Player player, uint id, SpawnedMonster m, (int X, int Y) at,
@@ -31,11 +31,11 @@ public static partial class Game
         double nearest = double.MaxValue;
         foreach (var (targetId, t) in player.Area.Monsters)
         {
-            if (targetId == id || !t.Hostile || t.Dead || t.Life == 0 || double.IsPositiveInfinity(t.BusyUntil)) continue;
+            if (targetId == id || !MinionMayTarget(t)) continue;
             var to = t.Walk.Position(now);
             double d = Dist(to, at);
             bool prey = stats is not null && IsPrey(player, stats, targetId, t, now);
-            if (!prey && (d >= nearest || d > range || Dist(to, playerAt) > ownerRange)) continue;
+            if (!prey && (d >= nearest || d > range || !m.TemporarilyAllied && Dist(to, playerAt) > ownerRange)) continue;
             nearest = d;
             double reach = MinionReach(a, t), f = d > 0 ? Math.Max(0, reach - 1) / d : 0;
             best = new(targetId, t, to, d <= reach,
@@ -65,15 +65,18 @@ public static partial class Game
         MonsterAttack? attack = null, int? accuracy = null)
     {
         var t = targetMonster;
-        if (!CurrentGameWork || (attack ?? m.Attack) is not { } a || m.Dead || !player.Minions.Fights(id) && !m.AlliedFighter || !player.Area.Monsters.TryGetValue(id, out var self)
+        if (!CurrentGameWork || (attack ?? m.Attack) is not { } a || m.Dead || !player.Minions.Fights(id) && !m.FightsForPlayers || !player.Area.Monsters.TryGetValue(id, out var self)
             || !ReferenceEquals(self, m) || t.Dead || t.Life == 0 || !t.Hostile
             || !player.Area.Monsters.TryGetValue(targetId, out var current) || !ReferenceEquals(current, t)) return null;
         var at = m.Walk.Position(now);
         if (checkReach && Dist(at, t.Walk.Position(now)) > MinionReach(a, t) + 2) return null;
-        int hitAccuracy = accuracy ?? m.Mods.Effects.Accuracy(Monsters.BaseAccuracy(m.Level) ?? 0);
-        int evasion = UnderBlind(player, targetId, t.Mods.Effects.Evasion(Monsters.BaseEvasion(t.Level) ?? 0));
-        if (!DamageModel.Hits(DamageModel.AccuracyHitChance(evasion, hitAccuracy), random.Next(100)) || MonsterBlocks(t, random, spell: false))
-            return null;
+        if (!TauntPreventsAttackEvasion(player, t, now))
+        {
+            int hitAccuracy = accuracy ?? m.Mods.Effects.Accuracy(Monsters.BaseAccuracy(m.Level) ?? 0);
+            int evasion = UnderBlind(player, targetId, t.Mods.Effects.Evasion(Monsters.BaseEvasion(t.Level) ?? 0));
+            if (!DamageModel.Hits(DamageModel.AccuracyHitChance(evasion, hitAccuracy), random.Next(100))) return null;
+        }
+        if (MonsterBlocks(t, random, spell: false)) return null;
         var supported = BeastSupportedAttack(player, id, m, a, now);
         var offense = supported?.Attack.Damage ?? a.Damage;
         // A minion the player summoned takes his minion modifiers; a shrine's ally is not his to scale (GGG: "You are not
@@ -84,9 +87,15 @@ public static partial class Game
             new GameServer.Core.World.DamageRange(Flat("minimum"), Flat("maximum")).Scale(Math.Max(0, 1 + m.Mods.Effects[Stat.DamagePlusPct] / 100.0)));
         if (supported is not null && player.Beasts.Active is { } companion)
             offense = offense.Scale(MeatShieldDamage(player, companion.SkillStats, t, now));
-        var mitigated = DamageModel.Mitigate(offense.Roll(random), type => MonsterHitResistance(t, type, default, now));
-        int damage = MonsterTakesMitigated(t, mitigated, spell: false, now: now);
-        if (ApplyMonsterHitLocked(player, t, damage, allyAt: at) is not { } hit) return null;
+        var mitigated = MitigateMonsterHit(t, offense.Roll(random), now,
+            cannotPenetrateOrIgnore: m.Mods.Effects[Stat.CannotPenetrateOrIgnoreElementalResistances]);
+        bool ignorePhysical = MinionIgnoresPhysicalReduction(mitigated, m.Effects, t, random, supported?.Stats);
+        int damage = MonsterTakesMitigated(t, mitigated, spell: false, now: now, ignorePhysicalReduction: ignorePhysical);
+        var cull = (player.Minions.Owns(id, m) ? MinionIgniteKillRule(PlayerStatValues(player), t, now) : default)
+            with { Threshold = MinionCullLocked(player, null, at, now).Threshold };
+        int chaosDamage = MonsterHitChaosDamage(t, mitigated, spell: false, now, damage, ignorePhysicalReduction: ignorePhysical);
+        if (ApplyMonsterHitLocked(player, t, damage, rampageSource: null, playerStats: null, allyAt: at,
+            cull: cull, cullPlayer: null, chaosDamage: chaosDamage) is not { } hit) return null;
         if (!t.Dead && damage > 0 && supported is not null && player.Beasts.Active is { } beast)
             MinionExposureOnHitLocked(beast.SkillStats, t, mitigated, now, random);
         return (hit, damage, HitCode(mitigated));
@@ -121,7 +130,8 @@ public static partial class Game
         var (_, m, from, targetId, targetMonster, toAt, contactAt) = attack;
         var target = new MinionTarget(targetId, targetMonster, toAt, true, toAt);
         bool Current() => CurrentGameWork && ReferenceEquals(CombatLifetime, rules) && !player.Closed && !player.LeavingArea
-            && (player.Minions.Fights(id) || m.AlliedFighter)
+            && (player.Minions.Fights(id) || m.FightsForPlayers)
+            && TemporaryAllyAttackCurrent(attack, AreaTime(player))
             && player.Area.Monsters.TryGetValue(id, out var held) && ReferenceEquals(held, m) && !m.Dead
             && player.Minions.Attacks.TryGetValue(id, out var pending) && ReferenceEquals(pending, attack);
         if (!Current()) return;
@@ -174,7 +184,12 @@ public static partial class Game
                         player.Minions.OutputQueue.Add(new(MinionActionHit(id, target.Id, accepted.HitCode,
                             HitAngle(to.X - at.X, to.Y - at.Y)),
                             $"0x01af minion 0x{id:x} hit on monster 0x{target.Id:x}", target.Id, target.Monster, WorldId: id));
-                        CommitMinionHitLocked(player, target.Id, target.Monster, accepted.Hit, accepted.Damage, now, $"minion 0x{id:x} ({m.Label})");
+                        bool owned = player.Minions.Owns(id, m);
+                        var fighter = owned ? OwnedFighter(player, id) : null;
+                        IReadOnlyDictionary<uint, int>? skill = fighter?.Own;
+                        if (owned && skill is null && player.Beasts.Active is { } beast && beast.Id == id) skill = beast.SkillStats;
+                        CommitMinionHitLocked(player, target.Id, target.Monster, accepted.Hit, accepted.Damage, now,
+                            $"minion 0x{id:x} ({m.Label})", source: owned ? m : null, skill: skill, fighter: fighter);
                     }
                     break;
                 }

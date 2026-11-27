@@ -19,12 +19,17 @@ public sealed partial class Connection(Player player)
     Session session = Session.None;
     /// <summary>The client's address, for logs.</summary>
     public string Remote => Session.Remote;
-    /// <summary>Whether a client is connected (a test's or a tool's player has none).</summary>
+    /// <summary>Whether the rules run for it: a client is connected, or the server drives it (a test's or a tool's player has
+    /// neither).</summary>
     public bool Connected => Session.Connected;
+    /// <summary>Set for a player the server drives, which has no client (Program.DriveByServer): what it takes part in.</summary>
+    public ServerDriven? Driven { get; internal set; }
     /// <summary>Drops the client's connection; its reading ends and the connection closes.</summary>
     public void Disconnect() => Session.Stream?.Close();
     /// <summary>The key a ticket of this connection's keyring gives (the next instance's connect, S→C 0x14).</summary>
     public byte[] TicketKey(uint ticket) => Session.Keyring.Key(ticket);
+    /// <summary>The ticket-bound 8-byte Data8 nonce for S→C 0x27, verified against C→S 0x0E SipHash-2-4.</summary>
+    public byte[] TicketData8(uint ticket) => Session.Keyring.Data8(ticket);
     public readonly ConnectionPerformance Performance = new();
     // Why the server closed the connection (the DISCONNECT line).
     public volatile string? CloseReason;
@@ -37,6 +42,7 @@ public sealed partial class Connection(Player player)
     public bool PlayerObjectCreated;
     public readonly HashSet<int> StashTabsSent = [];
     public readonly HashSet<int> GuildStashTabsSent = [];
+    public readonly HashSet<int> TradeStashTabsSent = [];
     // The area transitions created on this instance's client (ids), and those a script showed before their quest flag
     // (Game.TransitionShown).
     public HashSet<uint> ShownTransitions = [];
@@ -45,7 +51,7 @@ public sealed partial class Connection(Player player)
     // The mode-only C→S messages this connection (one area) has had, by mode (ClientPackets, 07 §6). A client sends
     // only one mode's, so the first one is the mode the handlers serve; one of each is a fault to report. Until then a
     // client is served in Lockstep, the default way of playing: the mode with no desync, which a local server's latency
-    // suits and Auto picks on it. A server-controlled player drives itself with predictive messages, so it is predictive.
+    // suits and Auto picks on it. Whoever drives a player with no client sets the mode of the messages it gives it.
     readonly Lock _modeLock = new();
     readonly SortedSet<ushort> _predictiveIds = [], _lockstepIds = [];
     volatile bool _modeSeen, _lockstep;
@@ -53,9 +59,12 @@ public sealed partial class Connection(Player player)
     // Set: the mode is known (a test, or a connection whose mode is given).
     public bool LockstepClient
     {
-        get => _modeSeen ? _lockstep : !player.Controlled;
+        get => !_modeSeen || _lockstep;
         set { _lockstep = value; _modeSeen = true; }
     }
+
+    /// <summary>Whether this connection has established that its client is in lockstep.</summary>
+    public bool LockstepConfirmed => _modeSeen && _lockstep;
 
     /// <summary>Notes a C→S message from the client's wire (not the server's own made-up inputs). Returns the ids of
     /// both modes the first time this area has had messages of both, else null.</summary>

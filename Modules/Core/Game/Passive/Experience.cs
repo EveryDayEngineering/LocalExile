@@ -20,8 +20,15 @@ public static partial class Game
             partyMultiplier: partyMultiplier);
         uint beforePenalty = Progression.MonsterExperience(baseExperience, multiplierPercent, rarity, playerLevel,
             monsterLevel, levelPenalty: false, partyMultiplier: partyMultiplier);
-        return (GameEvents.RunExperience(PlayerOf(player), monster, character),
-            GameEvents.RunExperience(PlayerOf(player), monster, beforePenalty));
+        var owner = PlayerOf(player);
+        // "#% increased Experience gain": one stat read per kill per player.
+        if (PlayerStat(owner, Stat.ExperienceGainPlusPct) is int gain and not 0)
+        {
+            uint Scaled(uint xp) => (uint)Math.Clamp(xp * (100L + gain) / 100, 0, uint.MaxValue);
+            (character, beforePenalty) = (Scaled(character), Scaled(beforePenalty));
+        }
+        return (GameEvents.RunExperience(owner, monster, character),
+            GameEvents.RunExperience(owner, monster, beforePenalty));
     }
 
     public sealed class CharacterLevelUpdates
@@ -99,6 +106,32 @@ public static partial class Game
         if (HardcoreProgressBlocked(player)) return;
         var result = await SynchronizeAccountLevel(player, control);
         if (!result.Ok) Console.WriteLine($"[gateway] {player.Connection.Remote} current level not saved to the account: {result.Error}");
+    }
+
+    /// <summary>Sets the character's level (<c>1..100</c>), persists its base experience, publishes 0x02bc/0x01b3/0x0033,
+    /// fires <see cref="GameEvents.LevelUp"/> when raising level, and synchronizes Auth's <c>set_level</c>.</summary>
+    public static async Task<bool> SetCharacterLevel(Player player, int level, string why = "level change",
+        Func<ControlRequest, Task<ControlResponse>>? control = null)
+    {
+        if (level is < 1 or > 100) return false;
+        var updates = LevelUpdatesFor(player);
+        ExperienceChange? change;
+        lock (updates.Gate)
+        {
+            if (HardcoreProgressBlocked(player)) return false;
+            uint before = CurrentExperience(player), after = CharacterStats.ExperienceFor(level);
+            CharacterSaves.SetExperience(CharacterName(player), after);
+            player.Character.Experience = after;
+            change = new(++updates.Revision, before, after, true, Reset: true);
+        }
+        await PublishExperienceChange(player, change, why);
+        if (HardcoreProgressBlocked(player)) return false;
+        if (player.Ticket != 0 || control is not null)
+        {
+            var result = await SynchronizeAccountLevel(player, control);
+            if (!result.Ok) Console.WriteLine($"[gateway] {player.Connection.Remote} current level not saved to the account: {result.Error}");
+        }
+        return true;
     }
 
     // Auth has unconditional set_level writes. Serialize every Gateway producer for this character, including resets

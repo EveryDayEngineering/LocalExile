@@ -21,6 +21,21 @@ public static partial class Game
             Add(Stat.MinionAttackSpeedPlusPct, 10);
             Add(Stat.MinionCastSpeedPlusPct, 10);
         }
+        if (player.PlayerLife > 0 && GolemStat(sources, Stat.SummonedPhantasmsGrantBuff) > 0)
+        {
+            double now = AreaTime(player), nextExpiry = double.PositiveInfinity;
+            long min = 0, max = 0;
+            foreach (var fighter in player.Summons.Fighters.Values)
+                if (PhantasmGrantsMight(player, fighter, now, out double until))
+                {
+                    min += GolemStat(fighter.Own, Stat.PhantasmMinimumAddedPhysicalDamageToGrant);
+                    max += GolemStat(fighter.Own, Stat.PhantasmMaximumAddedPhysicalDamageToGrant);
+                    nextExpiry = Math.Min(nextExpiry, until);
+                }
+            Add(Stat.SpellMinimumAddedPhysicalDamage, ActorScale.Saturate(min));
+            Add(Stat.SpellMaximumAddedPhysicalDamage, ActorScale.Saturate(max));
+            if (double.IsFinite(nextExpiry)) StatsChangeAt(nextExpiry, () => AreaTime(player));
+        }
         foreach (var name in new[] { "damage", "maximum_life" })
             Add(Stat.Of("active_skill_non_reaper_minion_" + name + "_+%_final"), player.Summons.Fighters.Values
                 .Where(g => g.Definition.Kind == "Reaper" && !g.Monster.Dead)
@@ -52,22 +67,47 @@ public static partial class Game
     public static void HolyRelicRegenerationLocked(Player player, GolemState.Golem relic, GolemState.Ability nova, double now)
     {
         double duration = GolemStat(nova.Stats, Stat.BaseSkillEffectDuration) / 1000d;
-        double until = now + duration;
+        if (duration <= 0) return;
         var centre = relic.Monster.Walk.Position(now);
-        int rate = GolemStat(relic.Own, Stat.HolyRelicNovaLifeRegenerationRatePerMinute);
-        if (rate > 0 && Dist(centre, player.Walk.Position(now)) <= nova.Radius)
+        double effect = Math.Max(0, 1 + GolemStat(relic.Own, Stat.SkillBuffEffectPlusPct) / 100d);
+        int Rate(uint key) => ActorScale.Saturate((long)Math.Round(GolemStat(relic.Own, key) * effect));
+        int playerRate = Rate(Stat.HolyRelicNovaLifeRegenerationRatePerMinute);
+        int minionRate = Rate(Stat.HolyRelicNovaMinionLifeRegenerationRatePerSecond);
+        void Receive(Player ally, double at)
         {
-            bool changed = player.Summons.HolyRegenerationPerMinute != rate || now >= player.Summons.HolyRegenerationUntil;
-            player.Summons.HolyRegenerationPerMinute = rate; player.Summons.HolyRegenerationUntil = until;
-            player.Area.Buffs.ClearRow(player.Id, 1181);
-            player.Summons.HolyBuff = 1;
-            player.Area.Buffs.Set(player.Id, new(1181, relic.Id, U68: Buff.Seconds(duration)));
-            if (changed) player.Minions.StatRevision++;
+            var state = ally.Summons;
+            double until = at + duration;
+            if (playerRate > 0 && ally.PlayerLife > 0 && Dist(centre, ally.Walk.Position(at)) <= nova.Radius)
+            {
+                bool changed = state.HolyRegenerationPerMinute != playerRate || at >= state.HolyRegenerationUntil;
+                state.HolyRegenerationPerMinute = playerRate;
+                state.HolyRegenerationUntil = until;
+                ally.Area.Buffs.ClearRow(ally.Id, 1181);
+                state.HolyBuff = 1;
+                ally.Area.Buffs.Set(ally.Id, new(1181, relic.Id, U68: Buff.Seconds(duration)));
+                if (changed) ally.Minions.StatRevision++;
+            }
+            if (minionRate <= 0) return;
+            foreach (var minion in UtilityFighters(ally))
+                if (GolemCurrent(ally, minion) && Dist(centre, minion.Monster.Walk.Position(at)) <= nova.Radius)
+                {
+                    minion.Regeneration += HolyRelicRecoveryBetween(minion, minion.LastStep, at);
+                    minion.HolyRegenerationSince = at;
+                    minion.HolyRegenerationUntil = until;
+                    minion.HolyRegenerationPerSecond = minionRate;
+                }
         }
-        foreach (var ally in player.Golems.All.Values.Concat(player.Summons.Fighters.Values).Concat(player.Reservations.Fighters.Values))
-            if (!ally.Monster.Dead && Dist(centre, ally.Monster.Walk.Position(now)) <= nova.Radius)
-            { ally.HolyRegenerationUntil = until; ally.HolyRegenerationPerSecond = GolemStat(relic.Own, Stat.HolyRelicNovaMinionLifeRegenerationRatePerSecond); }
+        Receive(player, now);
+        foreach (var ally in player.Instance.PlayersExcept(player.Id))
+            if (!ally.Closed && !ally.LeavingArea && ReferenceEquals(player.Instance, ally.Instance))
+                Receive(ally, AreaTime(ally));
     }
+
+    static double HolyRelicRecoveryBetween(GolemState.Golem minion, double from, double to) =>
+        Math.Max(0, Math.Min(to, minion.HolyRegenerationUntil) - Math.Max(from, minion.HolyRegenerationSince))
+            * minion.HolyRegenerationPerSecond;
+
+    const double ReaperConsumeRange = 15;
 
     static bool ReaperConsumeLocked(Player player, GolemState.Golem reaper, double now)
     {
@@ -80,10 +120,11 @@ public static partial class Game
         int effect = reaper.Monster.Life < reaper.Monster.MaxLife * .75 ? 12032 : 12033;
         if (effect == 12033 && now < reaper.SummonedAt + 25) return false;
         if (reaper.Abilities.FirstOrDefault(a => a.Effect == effect) is not { } consume || !GolemReady(reaper, consume, now)) return false;
+        var from = reaper.Monster.Walk.Position(now);
         var meal = player.Golems.All.Values.Concat(player.Summons.Fighters.Values).Concat(player.Reservations.Fighters.Values)
             .Where(g => g != reaper && g.Definition.Kind is not ("Reaper" or "SkitterCold" or "SkitterLightning" or "Agony")
-                && !g.Monster.Dead && g.Monster.Life > 0 && Dist(g.Monster.Walk.Position(now), reaper.Monster.Walk.Position(now)) <= 15)
-            .MinBy(g => Dist(g.Monster.Walk.Position(now), reaper.Monster.Walk.Position(now)));
+                && !g.Monster.Dead && g.Monster.Life > 0 && Dist(g.Monster.Walk.Position(now), from) <= ReaperConsumeRange)
+            .MinBy(g => Dist(g.Monster.Walk.Position(now), from));
         if (meal is null) return false;
         GolemReserveLocked(player, reaper, consume, meal.Id, meal.Monster, meal.Monster.Walk.Position(now), now);
         return true;
@@ -91,7 +132,10 @@ public static partial class Game
 
     static void ReaperConsumedLocked(Player player, GolemState.Golem reaper, GolemState.Action action, double now)
     {
-        if (OwnedFighter(player, action.Target) is not { } meal || meal.Monster.Dead || meal.Monster.Life == 0) return;
+        if (OwnedFighter(player, action.Target) is not { } meal
+            || !ReferenceEquals(action.Victim, meal.Monster) || !GolemCurrent(player, meal)
+            || meal.Monster.Dead || meal.Monster.Life == 0
+            || Dist(meal.Monster.Walk.Position(now), reaper.Monster.Walk.Position(now)) > ReaperConsumeRange) return;
         GolemDieLocked(player, meal, now);
         reaper.Monster.Life = (uint)Math.Min(reaper.Monster.MaxLife, reaper.Monster.Life + reaper.Monster.MaxLife / 2L);
         reaper.WrathUntil = now + GolemStat(action.Ability.Stats, Stat.BaseSkillEffectDuration) / 1000d;

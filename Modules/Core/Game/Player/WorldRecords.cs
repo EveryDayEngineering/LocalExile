@@ -62,6 +62,17 @@ public static partial class Game
         return SendWorldRecord(player, id, bytes, log);
     }
 
+    /// <summary>S→C 0x2c8 to the player's client (InstanceProtocol.ActionData) as a world record of the object: data for the
+    /// action the object runs, matched by its action type, skill id, sequence and sub-id.</summary>
+    public static Task SendActionData(Player player, uint id, ushort actionType, ushort skillId, ushort sequence, byte subId,
+        ReadOnlySpan<byte> payload, string? log = null) =>
+        SendWorldRecord(player, id, InstanceProtocol.ActionData(id, actionType, skillId, sequence, subId, payload), log);
+
+    /// <summary>S→C 0x2bc to the object's Actor (InstanceEntities.ActorCurrentAction) as a world record: the action it runs
+    /// now, replacing the client's current one. <paramref name="actorIndex"/> is the Actor's index in the object's components.</summary>
+    public static Task SendCurrentAction(Player player, uint id, byte actorIndex, ActorAction action, string? log = null) =>
+        SendWorldRecord(player, id, InstanceEntities.ActorCurrentAction(id, actorIndex, action), log);
+
     public static Task SendWorldRemoval(IPlayer modPlayer, uint id, string? log = null)
     {
         var player = PlayerOf(modPlayer);
@@ -200,6 +211,40 @@ public static partial class Game
         return SendWorldBatch(player, [target], _ => records() is { } batch
             ? new(batch.Where(p => p.Length > 0).Select(p => PresentedRecord(target, p, log)).ToArray()) : null,
             still);
+    }
+
+    // A terminal projection can carry the projectile's final position immediately before its removal.
+    // Keep those records separate when the area will publish them to its viewers at the frame boundary.
+    static Task SendWorldRecordsEndingInRemoval(Player player, uint id, Func<byte[][]?> records, string? log)
+    {
+        if (!player.Connection.LockstepClient && !InAreaFrame(player))
+        {
+            var viewer = Program.ViewOf.Value;
+            return Send(player, [], log, atGate: () =>
+            {
+                if (records() is not { Length: > 0 } batch) return null;
+                if (viewer is null && player.Area.Delta.ViewerOf(id, player) is null)
+                {
+                    foreach (var update in batch[..^1])
+                        if (update.Length > 0) player.Area.Objects.RecordDirect(id, update, AreaDelta.Kind.World, player, log);
+                    player.Area.Objects.RecordDirect(id, batch[^1], AreaDelta.Kind.Remove, player, log);
+                }
+                return [.. batch.SelectMany(record => record)];
+            });
+        }
+
+        var target = player.Connection.WorldOutput.PublishedObject(id);
+        return SendWorldBatch(player, [target], _ =>
+        {
+            if (records() is not { Length: > 0 } batch) return null;
+            List<OutputRecord> output = [];
+            foreach (var update in batch[..^1])
+                if (update.Length > 0) output.Add(PresentedRecord(target, update, log));
+            var removal = batch[^1].ToArray();
+            BinaryPrimitives.WriteUInt32BigEndian(removal.AsSpan(6), uint.MaxValue);
+            output.Add(OutputRecord.Remove(target, WorldOrder.Last, removal, log));
+            return new([.. output]);
+        });
     }
 
     public static async Task SendWorldRemoval(Player player, uint id, string? log = null, Func<bool>? still = null, Func<byte[]?>? atGate = null)

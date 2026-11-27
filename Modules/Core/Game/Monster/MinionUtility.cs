@@ -26,17 +26,39 @@ static partial class Game
             if (!player.Paused && AreaTime(player) >= release)
             {
                 if (effect == "SignalPrey") return SignalPreyLocked(player, source, gem, aim, target, release);
-                if (recall) RecallMinionsLocked(player, gem, release);
-                else StartOfferingLocked(player, source, gem, effect!, aim, target, release);
+                if (!recall) return StartOfferingLocked(player, source, gem, effect!, aim, target, release);
+                RecallMinionsLocked(player, gem, release);
                 return true;
             }
             await AreaWait(PlayerUpdateRole.Minions, 25);
         }
     }
 
+    static void QueueUtilityEffect(Player player, (int X, int Y) at, string art, double seconds, string log,
+        uint parent = 0, byte flags0 = EffectObject.FixedRotation)
+    {
+        uint effectId = player.TakeObjectId();
+        var obj = new EffectObject(at.X, at.Y, art)
+        {
+            AnimatedFlags = 9,
+            Flags0 = flags0,
+            Parent = parent,
+        };
+        AddTemporarySkillEffect(player, effectId, seconds);
+        player.Minions.OutputQueue.Add(new(InstanceEntities.CreateObject(effectId,
+            InstanceEntities.ObjectTypeHash(EffectObject.TypePath), obj.Blob()), log, WorldId: effectId, CreatesObject: true));
+        player.Minions.OutputQueue.Add(new(InstanceProtocol.EnterWakeZone(effectId), log + " wake", WorldId: effectId));
+        player.Minions.OutputQueue.Add(new(InstanceProtocol.AnimationUpdate(effectId, 0, 0, 1), log + " play", WorldId: effectId));
+    }
+
     internal static void RecallMinionsLocked(Player player, SupportedGem gem, double now)
     {
         var playerStats = CharacterPlayerStats(player);
+        var playerPos = player.Walk.Position(now);
+        QueueUtilityEffect(player, playerPos, "Metadata/Effects/Spells/convocation/convocation_player.ao",
+            1.5, "Convocation caster effect", parent: player.Id);
+        QueueUtilityEffect(player, playerPos, "Metadata/Effects/Spells/convocation/convocation.ao",
+            1.5, "Convocation effect");
         double duration = SkillDurationModifiers.Seconds(GolemStat(gem.Stats, Stat.BaseSkillEffectDuration),
             n => GolemStat(playerStats, n), n => GolemStat(gem.Stats, n));
         double rate = GolemStat(gem.Stats, Stat.LifeRegenerationRatePerMinutePct)
@@ -44,7 +66,8 @@ static partial class Game
         foreach (var minion in player.Minions.All)
         {
             var m = minion.Monster;
-            if (m.Dead || m.Life == 0 || player.Summons.Definitions.GetValueOrDefault(minion.Id) is { Follows: false }) continue;
+            if (m.Dead || m.Life == 0 || player.Summons.Definitions.GetValueOrDefault(minion.Id) is { Follows: false }
+                || OwnedFighter(player, minion.Id) is { } whispering && HearsWhispers(whispering, now)) continue;
             var at = NextToPlayer(player);
             m.Walk = player.NewMonsterWalk(minion.Id, at.X, at.Y, Math.Max(m.Walk.Speed, 1), LivingCollision.Size(m), false);
             m.ActionGeneration++; m.LastTarget = null; m.BusyUntil = now;
@@ -61,24 +84,45 @@ static partial class Game
     internal static bool StartOfferingLocked(Player player, ushort source, SupportedGem gem, string effect,
         (int X, int Y) aim, uint target, double now)
     {
-        bool Usable(SpawnedMonster m) => m.Hostile && m.Dead && !m.CorpseConsumed && !m.Ailments.Shattered
-            && m.Variety?.LifeData.IsUsableAsCorpse(m.Life) == true;
+        var playerStats = CharacterPlayerStats(player);
+        bool livingZombies = GolemStat(playerStats, Stat.RaisedZombiesAreUsableAsCorpsesWhenAlive) > 0;
+        GolemState.Golem? LivingZombie(SpawnedMonster corpse) => livingZombies && !corpse.Dead && corpse.Life > 0
+            && player.Summons.Fighters.GetValueOrDefault(corpse.ObjectId) is { Definition.Kind: "Zombie" } zombie
+            && ReferenceEquals(zombie.Monster, corpse) && GolemCurrent(player, zombie) ? zombie : null;
+        bool Usable(SpawnedMonster m) => !m.CorpseConsumed && !m.Ailments.Shattered
+            && (LivingZombie(m) is not null || m.Hostile && m.Dead
+                && CorpseTypeAllowsUse(m, minionSkill: SkillsFor(player).HasType(gem.Effect, "Minion"),
+                    cannotUseSpectreCorpses: GolemStat(gem.Stats, Stat.CannotUseSpectreCorpses) != 0));
         var first = player.Area.Monsters.GetValueOrDefault(target);
         if (first is null || !Usable(first)) first = player.Area.Monsters.Values.Where(Usable)
             .Where(m => Dist(m.Walk.Position(now), aim) <= 15).MinBy(m => Dist(m.Walk.Position(now), aim));
-        var playerStats = CharacterPlayerStats(player);
         if (first is null && GolemStat(playerStats, Stat.OfferingSkillsDoNotRequireCorpses) == 0) return false;
         var centre = first?.Walk.Position(now) ?? aim;
         var corpses = player.Area.Monsters.Where(p => Usable(p.Value) && Dist(p.Value.Walk.Position(now), centre) <= 15)
             .OrderBy(p => ReferenceEquals(p.Value, first) ? 0 : 1).ThenBy(p => Dist(p.Value.Walk.Position(now), centre)).Take(5).ToArray();
+        string dir = effect == "FleshOffering" ? "offering_offensive" : effect == "BoneOffering" ? "offering_defensive" : "offering_spirit";
+        string burstAo = $"Metadata/Effects/Spells/{dir}/goresplosion.ao";
+        string castAo = $"Metadata/Effects/Spells/{dir}/offering_offensive_souls.ao";
+        string auraAo = effect == "FleshOffering"
+            ? $"Metadata/Effects/Spells/{dir}/offering_offensive_effect.ao"
+            : $"Metadata/Effects/Spells/{dir}/rig.ao";
         foreach (var (id, corpse) in corpses)
         {
+            var corpseAt = corpse.Walk.Position(now);
             corpse.CorpseConsumed = true;
             NoteCorpseConsumedLocked(player, corpse);
             player.RecentEvents.Record(StatConditions.ConsumedCorpse, now);
-            if (!corpse.CreatedAsCorpse)
+            if (LivingZombie(corpse) is { } zombie)
+            {
+                GolemDieLocked(player, zombie, now, emitLife: false);
+                RemoveSummonLocked(player, zombie, now);
+            }
+            else if (!corpse.CreatedAsCorpse)
                 player.Minions.OutputQueue.Add(new(InstanceProtocol.RemoveObject(id), "Offering corpse consumed"));
+            QueueUtilityEffect(player, corpseAt, burstAo, 1.5, "Offering corpse burst");
         }
+        QueueUtilityEffect(player, centre, castAo, 1.5, "Offering souls effect");
+        QueueUtilityEffect(player, centre, auraAo, 1.5, "Offering area effect");
         int extra = Math.Max(0, corpses.Length - 1);
         string kind = effect == "FleshOffering" ? "flesh" : effect == "BoneOffering" ? "bone" : "spirit";
         double duration = SkillDurationModifiers.Seconds(GolemStat(gem.Stats, Stat.BaseSkillEffectDuration)

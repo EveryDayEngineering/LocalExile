@@ -3,6 +3,11 @@
 ## Resolution
 
 `GemSupports` reads native GrantedEffects, ActiveSkills and GrantedEffectsPerLevel tables.
+
+Fissure and Crystalfall publish the active companion from `GemEffects.GrantedEffect2`. The native trigger uses
+`0x01ce` and the companion's skill ID. Fissure's `VolcanicSlam` uses behaviour variation 2. Its detached parent
+(ID 1) calls `0x141bee4b0` to seed the radial cracks from the sequence, actor and crack count. Falling Crystal's
+`CrystalFallSlam` uses `0x1414b3ad0` to start the 0.95-second fall and `0x1414b37a0` to land it at the hit's position.
 Physical support gems only affect usable gems in the same equipped item and link group.
 Item mods also contribute the support effects referenced by their `GrantedEffectsPerLevelKeys` to gems in that item.
 `SupportsGemsOnly` is retained from GrantedEffects. It excludes meta supports from item-granted non-gem actives while
@@ -53,7 +58,9 @@ take `support_lifetap_damage_+%_final_while_buffed` and flasks recover 20% incre
 same Life cost.
 The Blood Magic keystone (the passive tree node or an item's `keystone_blood_magic`, for example Malachai's Awakening)
 converts every skill's whole Mana cost to Life the same way, without Lifetap's multiplier, counter or buff; a skill is
-refused when its Life cost is not below current Life. Mana reservation is unchanged.
+refused when its Life cost is not below current Life. It also removes all Mana (maximum 0, like `no_mana` and
+`base_no_mana`), gives 10% more maximum Life and moves every skill's Mana reservation to Life. Only the reminder text
+(`ReminderTextKeystoneBloodMagic`) states these: the node and the item mods carry just `keystone_blood_magic`.
 Overheat Support consumes all of the player's Fortification once per use, at the start of the use (before its hit or
 any projectile it releases), and stores per skill `(1 + per_3 * floor(consumed / 3) / 100)` as more Ailment damage for
 that use's ailments. It is an exceptional gem: `support_overheat_ailment_damage_+%_final_per_3_fortification_consumed`
@@ -161,9 +168,10 @@ hit and attack rate. Invoking those calculators with a fixed 100-damage hit at t
 100 average damage and 200 DPS with zero, two or three repeats and their 22/44/66% bonuses. The server's
 panel preserves that per-hit convention for both hands.
 
-Melee Splash hits the enemies around each struck one for the
-support's less damage; its radius is the 14-unit base (poewiki) grown by the area modifier and
-`melee_splash_area_of_effect_+%_final` (`MeleeSplash`).
+Melee Splash hits the enemies around each struck one of a Melee Strike skill (from `melee_splash` such as Tribal Fury,
+a support gem, an item/enchant, or a tincture), applying any splash damage multiplier (`support_melee_splash_damage_+%_final_for_splash`,
+none for Tribal Fury); its radius is the 14-unit base (poewiki) grown by increased area (including
+`melee_splash_area_of_effect_+%`) and more area multipliers (including `melee_splash_area_of_effect_+%_final`) (`MeleeSplash`).
 
 Spell Cascade repeats a supported area spell in a line: one extra area per side along the caster-to-target
 direction (`support_spell_cascade_number_of_cascades_per_side`, 1) and, with `support_spell_cascade_sideways`
@@ -331,3 +339,16 @@ The falling arrow of a rain skill is one clip, index 0, that reaches the ground 
 `rain_of_arrows/rig.ao` (no default animation) at 0.218 s, `blast_rain/arrow_drop.ao` at its contact, 0.333 s.
 The existing spell volley and Spark wander/duration specialization still runs before server presentation is selected.
 Native targeting, visual parity and threshold timing require client verification.
+
+## Native linked spell payloads
+
+3.29.3d skill rows supply the offset pulse and split counts for Shock Nova of Procession and Arc of Surging,
+Glacial Cascade's burst sequence and last-burst multiplier, and the target limit for Lightning Conduit of the Heavens.
+The server estimates lance hitboxes, ring spacings, cascade spacings and the first single-meteor delay.
+The base Cascade knocks enemies along the burst axis.
+
+The catalogue combines repeated per-level stat entries, including the cold adjustment for Vortex of Projection.
+Its ground can replace nearby Frostbolts. Manabond pays a share of maximum Mana and reads unreserved Mana at contact.
+The client action 0x7dad uses an 18-cell base centre radius (3.29.3c, 0x141c90950). Each full quarter of unreserved Mana
+adds six cells to the reach of its four extensions. Mana-less proxies use full reach and gain zero missing-Mana damage.
+Triggered Firestorm uses the same storm and impact objects as the placed release.

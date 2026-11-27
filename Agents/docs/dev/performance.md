@@ -67,6 +67,7 @@ One scenario per process (catalogues load once per process). Results go to stdou
 | `single` | one player's Gateway: the startup loads (`GameData.Open`), then the town, a combat area (The Coast, its packs) and a boss area (The Twilight Strand, Hillock), each entered and held as a connection does; after each, the heap, its large-object part and private bytes. The runtime files come from the extracted game pack |
 | `idle` | one player standing in town with the per-connection loops a connection starts (recovery, player tick, charges, rage, server frames, monster AI â€¦): process CPU, allocation and bytes sent per second |
 | `sweep` | one level 20 Ice Nova (`AreaSkillHit`, every packet encrypted and sent) on 100, 300 and 500 monsters inside its radius, with huge life (hits only, no deaths); then the per-call cost of each input the sweep's loop reads (player stats, hit, crit chance and multiplier, the roll and mitigation, charges, leech, the hit's sends) |
+| `statflips` | one player's stat builds (`CharacterPlayerStats`) in two stages that flip one input at a time: poison stacks on and off while standing still, then moving on and off while never poisoned. Each stage reports the sources sum's cache misses per build, the miss reasons, and the time and allocation per build on a flip build against a steady one. `Game_PERF_CYCLES=N` sets the flip cycles per stage (default 10); `Game_PERF_CHARACTER` runs it on a saved character's gear (which must carry no conditional stats); `Game_PERF_STATFLIPS_STAGE=poison|moving|both` picks the stages (default both) |
 
 The busy instance is the same in every run (fixed placement, no buried monsters, which rise on a wall-clock watch);
 `PopulateArea` is not, because it seeds placement with the process's randomized `HashCode`. Timings on a shared
@@ -238,6 +239,30 @@ Now the Gateway keeps its data the way a game server does (TrinityCore loads its
 - **The HardMode data set** (Ruthless leagues) is built by `Game.LoadHardModeData` when the first character of such a
   league logs in, in the Game module's admission and before that character loads. The same step builds that league's
   drops. That login waits a few seconds once; a server whose players never play Ruthless never builds it.
+
+## Kill path, movement, and save latency (2026-11-21)
+
+- **Kill path & catalogs**: `IncreasedItemRarity`, `ItemQuantityFactor`, `ExplodeOnKill`, `SoulEaterRecords`,
+  `GainFlaskCharges`, `CommitProjectileFlaskGain`, and `CommitProjectileCritFlasks` read `PlayerStatValues` without
+  copying the stat graph; `CommitProjectileKill` skips queuing `MonsterKilled` and `ExplodeOnKill` when inactive and
+  coalesces flask bar updates in `ProjectileSession`; `CommitGemExperience` scans socketed gems in a single pass;
+  `StepCursesLocked` skips uncursed/unmodified monsters without allocating `MonsterCurses` or `StatGraph`;
+  `SetQuestFlags`/`CommitQuestFlags` fast-return on empty flag sets; `LesserShrines` caches the equipped Gull grant per
+  active equipment snapshot; `WardBreakPresentation` skips the first-tick empty baseline; `PassiveBuffAuras.For` uses
+  a zero-allocation loop; `BossMods.Parse` reads only the `Mods` rows referenced by `MonsterVarieties`; `ItemRolls`
+  indexes affixes by `ModDomain` at construction; `VendorRecipes` precomputes `ModType` tables and indexes essences and
+  base types once.
+- **Movement & pathing**: `Player.Blockers` caches an immutable `BlockerSet` until stationary, monster, or peer bodies
+  move (avoiding a 512 KB flat-grid allocation and rebuild on every Move tick); `BlockerSet` allocates its 2D grid on
+  first in-range blocker and prunes queries against its bounding box; `ClientPathfinder` skips invariant `ellipse`,
+  `walkable`, `InObjectAt`, and unguided `Heuristic` work on already-opened nodes and adds `LineRest` for `PlayerWalk`;
+  `InstancePresence.PlayersExcept` fast-returns `[]` in solo instances; `0x0025` skips `SkillAcknowledgementAllowed`,
+  ranged-weapon lookup, and `SingleUseCooldowns` LINQ scans on `Move`.
+- **Saves & stash**: `SaveRows` caches `stash_tab_headers` and `stash_module_data` fingerprints per `SaveDatabase`
+  (synced to SQLite `data_version` via `SaveDatabase.ExternalVersion` and cleared on rollback), partitions character
+  items by inventory row, updates inventories without reloading the whole character save (`WriteCharacterInventories`),
+  and flushes experience with a single-row `UPDATE` (`WriteCharacterExperience`), integrating with `Saves` pinned-session
+  caching.
 
 ## Where the remaining cost is
 

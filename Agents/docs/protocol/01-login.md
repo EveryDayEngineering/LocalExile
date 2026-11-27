@@ -82,8 +82,12 @@ C#: `LoginWire.cs` (`LoginWriter`, `LoginReader`), `LoginMessages.cs` (records +
 | S→C | 0x1b | raw64 server time, vec32⟨LeagueEntry⟩, u8 flags | push after login: **the league list** (§7). The client then moves to the character screen |
 | C→S | 0x12 | wstr name, wstr league, u32, u32, wstr start state, bytes[32] | **create character** (§7) |
 | S→C | 0x13 | u16 result, bool | create-character result (§7) |
+| C→S | 0x0a | bytes[32] old digest, bytes[32] new digest | **change password** (`0x140cf30c0`); verifies old digest, rotates verifier, invalidates saved logins |
+| S→C | 0x0b | u16 result | change-password result (`0x140cf3650`): 0 success, 6 invalid password |
 | C→S | 0x0c | wstr name, u8 (0 live) | **delete character**, sent after the delete screen's confirmation (`0x140cfaf60`) |
 | S→C | 0x0d | u16 result | delete result: 0 closes the delete screen back to the list (`0x140cfb5b0`, listener +0xa90); non-zero shows the BackendErrors text |
+| C→S | 0x3d | wstr old name, wstr new name, bool flag | **rename character** (`0x1406a6950`, `0x140d16a40`); updates account row and `character_saves.name` atomically |
+| S→C | 0x3e | u16 result, bool flag | rename-character result (`0x140d26970`): 0 after refreshed `0x15` list; echoes request flag |
 | C→S | 0x19 | — | "leagues with progress" (migration), answered with S→C 0x1a |
 | C→S | 0x18 | — | character screen opened (`0x140d13090`) |
 | S→C | 0x15 | vec8⟨Entry15⟩, u8, u8, blob | character list shown on the character screen (`0x140d125c0`); the first u8 (→ screen +0x280) is sent as the index of the last played character (Play updates `LastPlayedUtc`); verified live 2026-10-22: the screen selects it |
@@ -130,11 +134,19 @@ password digests, tokens, tickets and machine ids redacted.
 | Receives | Sends |
 |---|---|
 | 0x03 | `AccountService.LoginWithClientDigest`. Unknown account → 0x04 result 5, wrong password → 6, then the server **closes** the connection (the client ignores Log In while a failed connection stays open). Good → 0x04 result 0, Flags0 0x20, the account name as data, then 0x1b with the leagues (`LeagueCatalog`) |
+| 0x0a | `AccountService.ChangePasswordWithClientDigest`: verifies old digest, saves new salted PBKDF2 verifier and returns 0x0b (0 ok, 6 invalid) |
 | 0x18 | 0x15 with the account's characters (level, class, league) and 24 character slots |
 | 0x12 | creates the character (§7): 0x15, then 0x13 result 0; or 0x13 with an error |
-| 0x19 | 0x1a result 0, no leagues |
+| 0x0c | deletes the character: 0x15, then 0x0d result 0; or 0x0d 16 |
+| 0x3d | `AccountService.RenameCharacter`: renames character and save atomically; returns refreshed 0x15 + 0x3e (0 ok, 16/21/22/23/24 on error) |
+| 0x19 | 0x1a result 0 with `(source, parent)` pairs of loaded non-Void leagues with progress |
+| 0x1c | 0x1b (`Append = true`) with private-league page sliced by `(offset = B, limit = A)` (`0x1421473d0`, `0x1421466d4`) |
+| 0x3f / 0x40 | single-character migration (`0x3f`) returns refreshed `0x15` + `0x44` result 0; bulk Migrate All (`0x40`, `0x1408b4220` / `0x140d26870`) returns `0x44` code `569` (`ActionTemporarilyDisabled`, `0x140d16fa0`) without moving characters until league-wide stash/progress migration is implemented |
 | 0x0e | 0x14: `127.0.0.1:6112`, address, area `0x235c`, `ticket = Keyring.NewTicket()`, `key = Keyring.Key(ticket)` |
 | anything else | nothing |
+
+The login screen's New Account button (`0x140d04b97`) invokes `ShellExecuteW` to launch the website URL and sends no
+login TCP message.
 
 Accounts come from the save database `data/characters.db` (shared with `GameServer.Host` and the Gateway, [saves](../saves.md)). Each account stores a verifier
 for the client digest. `InstanceKeyring` (`Protocol/Instance/InstanceProtocol.cs`) loads or creates
@@ -208,7 +220,15 @@ with the same name starts with its class's kit, and the Gateway drops items it s
 has no save any more.
 
 **S→C 0x1a** (u16 result, vec32⟨LeagueEntry⟩) answers C→S 0x19, the "leagues with progress" (migration) list
-(listener 0x140d171a0).
+(listener 0x140d171a0). **C→S 0x3f** (wstr character name, `0x1421476c0`) migrates one eligible character to its
+parent league, returning a refreshed `0x15` character list and **S→C 0x44** (`u16` result; listener `+0x690` →
+`0x140d16fa0` shows `MigrationFailedTitle` on non-zero). **C→S 0x40** (Migrate All, wstr league name, `0x1421477b0`,
+callers `0x1408b4220` / `0x140d26870`) currently returns `0x44` with `BackendErrors` row 568 + 1 (`569`,
+`ActionTemporarilyDisabled`) without moving any characters so league stash and progression are not stranded.
+**C→S 0x1c** (`u16` limit, `u16` offset defaulting to `login+0xe58`, `0x1421473d0`) requests additional private-league
+entries, answered by `S→C 0x1b` with `Append = true`. Private leagues configured with `private`, `password`, and
+optional `startTime`/`endTime`/`registerTime` set `Flags0` bit 0 / bit 4 and `Flags2` bit 0, and verify
+`CreateCharacter.PasswordDigest`.
 
 **In game.** Auth gives the Gateway the character's league, hardcore flag, class and level (`ControlResponse`); `/set_level`
 changes the level through the control op `set_level` ([10](10-chat-and-commands.md)). The league is

@@ -22,8 +22,19 @@ public sealed record Buff(ushort Row, uint Source = 0, ushort SourceSkill = 0, I
     /// <summary>The client's u68: a countdown of this many seconds from the instance's creation.</summary>
     public static uint Seconds(double seconds) => BitConverter.SingleToUInt32Bits((float)Math.Max(0, seconds));
 
-    public byte[] Add(uint entity, ushort instance) => InstanceEntities.AddBuff(entity, instance, Row, Source, SourceSkill,
-        Values, U68, F6c, Visual, ActiveSkill, AuraSource, DisplayState, Stacks, U82, List);
+    /// <summary>The bytes of this buff for <paramref name="entity"/> on <paramref name="instance"/>. Shapes every
+    /// definition-driven tail field to the exact layout the <c>0x01c1</c> reader expects: <c>IsRecovery</c> rows always
+    /// carry exactly <c>GrantedStats.Count</c> u32 values (<see cref="BuffRows.WireValues"/>), <c>__col44</c> rows
+    /// always carry u82 (<see cref="BuffRows.WireU82"/>), and rows whose native client behaviour dereferences
+    /// <c>Buff+0x80</c> unchecked always receive at least their minimum list words (<see cref="BuffRows.WireList"/>).
+    /// Callers can supply or omit any of these safely, as <see cref="BuffRows.Spec"/> does.</summary>
+    public byte[] Add(uint entity, ushort instance)
+    {
+        var info = BuffRows.Of(Row);
+        return InstanceEntities.AddBuff(entity, instance, Row, Source, SourceSkill,
+            BuffRows.WireValues(info, Values), U68, F6c, Visual, ActiveSkill, AuraSource, DisplayState, Stacks,
+            BuffRows.WireU82(info, U82), BuffRows.WireList(info, List));
+    }
 }
 
 /// <summary>
@@ -38,8 +49,9 @@ public sealed class AreaBuffs(GameArea area)
     // (flags bit0) or the buff it gives.
     readonly record struct Key(uint Entity, ushort Row, uint Source, bool AuraSource, ushort Tag);
 
-    // What the area wrote, with when its countdown runs out on the client (which then ends it itself).
+    // What the area wrote, with the server clock's expiry. The client can still show the icon at zero.
     readonly Dictionary<Key, (ushort Instance, Buff Buff, double Ends)> written = [];
+    readonly PriorityQueue<(Key Key, ushort Instance), double> expiries = new();
     readonly Dictionary<Key, Buff?> pending = [];
     readonly Lock gate = new();
     ushort next = 1;
@@ -82,9 +94,13 @@ public sealed class AreaBuffs(GameArea area)
     }
 
     /// <summary>Whether the entity has that buff now (as set this frame, or written and not run out).</summary>
-    public bool Has(uint entity, ushort row, uint source = 0, bool auraSource = false, ushort tag = 0)
+    public bool Has(uint entity, ushort row, uint source = 0, bool auraSource = false, ushort tag = 0) =>
+        Get(entity, row, source, auraSource, tag) is not null;
+
+    /// <summary>The active buff under the same key used by <see cref="Set"/> and <see cref="Clear"/>.</summary>
+    public Buff? Get(uint entity, ushort row, uint source = 0, bool auraSource = false, ushort tag = 0)
     {
-        lock (gate) return Current(new(entity, row, source, auraSource, tag)) is not null;
+        lock (gate) return Current(new(entity, row, source, auraSource, tag));
     }
 
     /// <summary>Whether the entity has a buff of that row now, from any source.</summary>
@@ -95,13 +111,35 @@ public sealed class AreaBuffs(GameArea area)
                 || written.Any(w => w.Key.Entity == entity && w.Key.Row == row && w.Value.Ends > area.Time && !pending.ContainsKey(w.Key));
     }
 
+    /// <summary>The live buff on <paramref name="entity"/> published under wire <paramref name="instance"/>, or null
+    /// when no active buff matches (expired or already cleared).</summary>
+    public Buff? Find(uint entity, ushort instance)
+    {
+        if (instance == 0) return null;
+        lock (gate)
+        {
+            double now = area.Time;
+            foreach (var (key, entry) in written)
+                if (key.Entity == entity && entry.Instance == instance && entry.Ends > now)
+                    return pending.TryGetValue(key, out var next) ? next : entry.Buff;
+        }
+        return null;
+    }
+
     /// <summary>A client that joins the area is written every buff the area's entities have, with their instances.</summary>
     public void Join(Player player)
     {
         area.AssertOwner();
         lock (gate)
+        {
+            double now = area.Time;
             foreach (var (key, (instance, buff, ends)) in written)
-                if (ends > area.Time) area.Delta.Add(key.Entity, buff.Add(key.Entity, instance), null, only: player);
+            {
+                if (ends <= now) continue;
+                var current = double.IsFinite(ends) ? buff with { U68 = Buff.Seconds((ends - now) * CountdownRate(buff)) } : buff;
+                area.Delta.Add(key.Entity, current.Add(key.Entity, instance), null, only: player);
+            }
+        }
     }
 
     /// <summary>The entity's buffs of one kind (<paramref name="group"/>: a player's own auras, say) are these now, kept as
@@ -153,19 +191,28 @@ public sealed class AreaBuffs(GameArea area)
         }
     }
 
+    static double CountdownRate(Buff buff) => buff.F6c is > 0 and var rate ? rate : 1;
+
     public void Publish()
     {
         area.AssertOwner();
         lock (gate)
         {
-            if (pending.Count == 0) return;
+            if (pending.Count == 0 && expiries.Count == 0) return;
             double now = area.Time;
+            // A refresh or explicit removal may have superseded a queued deadline.
+            while (expiries.TryPeek(out var expired, out double deadline) && deadline <= now)
+            {
+                expiries.Dequeue();
+                if (!written.TryGetValue(expired.Key, out var current)
+                    || current.Instance != expired.Instance || current.Ends != deadline) continue;
+                written.Remove(expired.Key);
+                area.Delta.Add(expired.Key.Entity, InstanceEntities.RemoveBuff(expired.Key.Entity, expired.Instance));
+            }
             foreach (var (key, buff) in pending)
             {
                 uint entity = key.Entity;
                 bool had = written.TryGetValue(key, out var was);
-                // A countdown that ran out ended the buff on the client already.
-                if (had && was.Ends <= now) { written.Remove(key); had = false; }
                 if (buff is null)
                 {
                     if (!had) continue;
@@ -173,17 +220,20 @@ public sealed class AreaBuffs(GameArea area)
                     area.Delta.Add(entity, InstanceEntities.RemoveBuff(entity, was.Instance));
                     continue;
                 }
-                if (had && was.Buff.Same(buff)) continue;
-                // The client runs a buff's countdown from its instance's creation: a new duration is a new instance.
-                if (had && was.Buff.U68 != buff.U68 && !buff.KeepInstance)
+                bool timed = buff.U68 is not null;
+                if (had && !timed && was.Buff.Same(buff)) continue;
+                // The client runs a buff's countdown from its instance's creation: a timed refresh (even with the same
+                // U68) or duration change needs a new instance unless KeepInstance updates it in place.
+                if (had && (timed || was.Buff.U68 is not null) && !buff.KeepInstance)
                 {
                     area.Delta.Add(entity, InstanceEntities.RemoveBuff(entity, was.Instance));
                     had = false;
                 }
                 ushort instance = had ? was.Instance : Take();
-                double ends = buff.U68 is uint u68 ? now + BitConverter.UInt32BitsToSingle(u68) / (buff.F6c is > 0 and var rate ? rate : 1)
+                double ends = buff.U68 is uint u68 ? now + BitConverter.UInt32BitsToSingle(u68) / CountdownRate(buff)
                     : double.PositiveInfinity;
                 written[key] = (instance, buff, ends);
+                if (double.IsFinite(ends)) expiries.Enqueue((key, instance), ends);
                 area.Delta.Add(entity, buff.Add(entity, instance));
             }
             pending.Clear();

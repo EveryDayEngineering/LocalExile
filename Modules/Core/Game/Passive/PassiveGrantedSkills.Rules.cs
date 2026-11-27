@@ -16,6 +16,9 @@ public static partial class Game
     static PassiveGrantedSkills RuthlessGrantedSkills = default!;
     static PassiveGrantedSkills NewGrantedSkills(bool ruthless) => new(ruthless ? HardModeSkills : Skills, ruthless: ruthless);
 
+    public static IReadOnlyList<PassiveGrantedSkills.Grant> PassiveSkillGrants(Player player, IEnumerable<ushort> nodes) =>
+        (LeagueFor(player).HardMode ? RuthlessGrantedSkills : GrantedSkills).For(nodes);
+
     /// <summary>The skills the player's allocated passives grant whose node carries this trigger stat
     /// (<c>has_trigger_on_crit_by_unique_enemy</c> and the like; the level row's AdditionalFlags name the same trigger).
     /// A tattoo that replaces such a node (the Loyalty summons) is a grant of its own: its
@@ -75,7 +78,7 @@ public static partial class Game
         ushort[] nodes;
         nodes = [.. player.Character.Passives, .. player.Character.MainAscendancy.Allocated];
         return [.. (LeagueFor(player).HardMode ? RuthlessGrantedSkills : GrantedSkills).For(nodes)
-            .Where(g => AuraCatalog.Supported(g.EffectId)
+            .Where(g => AuraCatalog.Supported(g.EffectId) || IsRelicSkill(g.EffectId)
                 || GameEvents.GrantedSkillExecutable.For(player).Any(accept => accept(player, g.EffectId)))];
     }
 
@@ -131,35 +134,42 @@ public static partial class Game
     /// <summary>
     /// A hit or kill that may trigger Summon Elemental Relic, in the area's frame: a kill, and a hit with damage on a
     /// rare or unique monster, each roll the skill's skill_triggered_by_nearby_allies_kill_or_hit_rare_unique_%_chance (25)
-    /// once, by the living player or by his minion at <paramref name="allyAt"/> within the buff's radius of him. A success
+    /// once, by the player, a nearby ally, or a living minion at <paramref name="allyAt"/>. A success
     /// spends the skill's 0.3 s cooldown (with cooldown recovery; a roll while it recovers is not made) and queues the
     /// summon for the minion step. True when one was queued.
     /// </summary>
     public static bool TriggerElementalRelicLocked(Player player, SpawnedMonster target, bool hit, bool killed,
         (int X, int Y)? allyAt = null)
     {
-        if (!CurrentGameWork || !target.Hostile || player.PlayerLife == 0 || player.Closed || player.LeavingArea) return false;
-        bool queued = false;
-        if (hit && target.Rarity is MonsterRarity.Rare or MonsterRarity.Unique) queued = Roll();
-        if (killed) queued |= Roll();
+        bool rareHit = hit && target.Rarity is MonsterRarity.Rare or MonsterRarity.Unique;
+        if (!CurrentGameWork || !target.Hostile || player.PlayerLife == 0 || player.Closed || player.LeavingArea
+            || !rareHit && !killed) return false;
+        var contact = allyAt ?? player.Walk.Position(AreaTime(player));
+        bool queued = RollFor(player, allyAt);
+        foreach (var ally in player.Instance.PlayersExcept(player.Id))
+            if (ally.PlayerLife > 0 && !ally.Closed && !ally.LeavingArea && ReferenceEquals(player.Instance, ally.Instance))
+                queued |= RollFor(ally, contact);
         return queued;
 
-        bool Roll()
+        bool RollFor(Player recipient, (int X, int Y)? at)
         {
-            if (RelicTriggerOf(player) is not { } relic) return false;
+            if (RelicTriggerOf(recipient) is not { } relic) return false;
             var (grant, radius) = relic;
-            double now = AreaTime(player);
-            if (allyAt is { } ally && Dist(ally, player.Walk.Position(now)) > radius) return false;
-            if (now < player.SkillReadyAt.GetValueOrDefault(grant.Effect) - 1e-9) return false;
-            var own = SkillsFor(player).EffectStats(grant.Effect, grant.Level).ToDictionary(s => s.Item1, s => s.Item2);
+            double now = AreaTime(recipient);
+            if (at is { } ally && Dist(ally, recipient.Walk.Position(now)) > radius) return false;
+            if (now < recipient.SkillReadyAt.GetValueOrDefault(grant.Effect) - 1e-9) return false;
+            var skills = SkillsFor(recipient);
+            var own = skills.EffectStats(grant.Effect, grant.Level).ToDictionary(s => s.Item1, s => s.Item2);
             int chance = Stat.SkillTriggeredByNearbyAlliesKillOrHitRareUniquePctChance is var c ? own.GetValueOrDefault(c) : 0;
-            if (player.Minions.Random.Next(100) >= chance) return false;
-            if (SingleUseCooldown.ForSkill(SkillsFor(player), Stats, grant.Effect, grant.Level, CharacterPlayerStats(player), own)
+            bool success = rareHit && recipient.Minions.Random.Next(100) < chance
+                || killed && recipient.Minions.Random.Next(100) < chance;
+            if (!success) return false;
+            if (SingleUseCooldown.ForSkill(skills, Stats, grant.Effect, grant.Level, CharacterPlayerStats(recipient), own)
                 is not { } plan) return false;
-            var state = CooldownStateLocked(player, grant.Effect, plan, now);
+            var state = CooldownStateLocked(recipient, grant.Effect, plan, now);
             if (!state.TryUse(now, plan)) return false;
-            player.SkillReadyAt[grant.Effect] = now + state.RemainingSeconds;
-            player.Minions.PendingRelics++;
+            recipient.SkillReadyAt[grant.Effect] = now + state.RemainingSeconds;
+            recipient.Minions.PendingRelics++;
             return true;
         }
     }
@@ -327,15 +337,17 @@ public static partial class Game
             var types = Supports.Of(skill.Effect)?.Types.ToHashSet();
             long additionalIncreased = PlayerHitDamage.VsBlindedDamageStat is var damageKey
                 ? (long)playerStats.GetValueOrDefault(damageKey) + own.GetValueOrDefault(damageKey) : 0;
+            int staffSpell = Merged(Stat.SpellStaffDamagePlusPct) is int staff and not 0
+                && WeaponTypeDamage.FamilyOf(WeaponFor(player).ItemClass) == "staff" ? staff : 0;
             AreaSkillDamageProfile Profile(long increased, int webs = 0)
             {
                 increased += SpiderDamageIncrease(Merged, webs);
                 var woven = SpiderRawDamage(raw, Merged, webs, AddedEffectiveness(player, skill.Effect, skill.Level));
                 var hit = context.Hit(PlayerHitDamage.Resolve(woven, Merged, conversion, spell: true,
-                    area: Merged(Stat.IsAreaDamage) != 0, skillTypes: types, additionalIncreased: increased));
+                    area: Merged(Stat.IsAreaDamage) != 0, skillTypes: types, additionalIncreased: increased + staffSpell));
                 var rows = AilmentPanelStats.Compute(new("spell", Spell: true), woven, conversion, Merged, increased);
-                var ignite = MonsterIgnites.Settings.From(rows, "spell", Merged);
-                var poison = MonsterPoisons.Settings.From(rows, "spell", Merged);
+                var ignite = IgniteSettingsFrom(rows, "spell", Merged);
+                var poison = PoisonSettingsFrom(rows, "spell", Merged);
                 double fireFactor = context.OverTime(new(DamageType.Fire, 1, 1)).DamagePerSecond;
                 double chaosFactor = context.OverTime(new(DamageType.Chaos, 1, 1)).DamagePerSecond;
                 return new(hit,
@@ -358,7 +370,9 @@ public static partial class Game
                 Player(VsBlindedCriticalStat));
             int multiplier = CriticalHitMultiplier((long)player.Pools.SpellCriticalStrikeMultiplier
                 + Own(Stat.BaseCriticalStrikeMultiplierPlus), playerStats, own);
-            var gambler = GamblerFor(playerStats);
+            var hitRolls = HitRollsFor(playerStats);
+            var damageRoll = (hitRolls with { DamageMorePct = 0 }).ForSkill(Own, spell: true);
+            long criticalDoubleDamage = HitRollModifiers.CriticalDoubleDamageOf(playerStats, own);
             bool rageGranted = false;
             var deaths = new List<(uint Id, SpawnedMonster M)>();
             var charges = new List<PlayerMinions.AcceptedCharges>();
@@ -374,14 +388,17 @@ public static partial class Game
                     ? Profile(Blinded(player, id) ? additionalIncreased : 0, webs)
                     : Blinded(player, id) ? blindedProfile : normalProfile;
                 if (MonsterBlocks(m, AreaRng(player), spell: true)) continue;
-                var rolled = (gambler with { DamageMorePct = 0 }).ForSkill(Own, spell: true).RollOutgoingHit(profile.Hit, AreaRng(player));
+                var rolled = damageRoll.RollBeforeCritical(profile.Hit, AreaRng(player), criticalDoubleDamage);
                 bool critical = RollCriticalStrike(player, CriticalChanceOn(player, id, chance, vsBlinded, vsProfane), own, attack: false);
+                rolled = damageRoll.CompleteCriticalMultiplier(rolled, AreaRng(player), critical, criticalDoubleDamage);
                 double hitAt = ProjectileWorldTime(player);
-                var (damage, _, mitigated) = MonsterHitDamage(m, rolled, critical, attack: false, hitAt, mods, pen,
-                    gambler.InvertsResistance(AreaRng(player)));
+                int witheredElemental = WitheredElementalHitTaken(m, player.Id, hitAt, playerStats);
+                var (damage, _, mitigated, takenRules) = ResolveMonsterHit(m, rolled, critical, attack: false, hitAt, mods, pen,
+                    hitRolls.InvertsResistance(AreaRng(player)), AreaRng(player), additionalElementalTakenPct: witheredElemental);
                 if (critical) damage = DamageModel.CriticalDamage(damage, CriticalMultiplierOn(m, multiplier, playerStats, own));
-                var stun = OwnerStun(player, m, damage, mitigated, melee: false, spell: true, critical, playerStats, own);
-                var applied = ApplyMonsterHitLocked(player, m, damage);
+                int chaosDamage = MonsterHitChaosDamage(m, mitigated, spell: true, hitAt, damage, takenRules);
+                var stun = OwnerStun(player, skill.Effect, m, damage, mitigated, melee: false, spell: true, critical, playerStats, own);
+                var applied = ApplyTypedMonsterHitLocked(player, m, damage, chaosDamage);
                 if (applied is { StageStarts: true } staged)
                 {
                     CommitBossStage(player, id, m, ProjectileWorldTime(player));
@@ -389,7 +406,8 @@ public static partial class Game
                 }
                 if (applied is not null)
                     AilmentsOnHitLocked(player, id, m, mitigated, spell: true, critical, multiplier, playerStats, own, hitAt,
-                        AreaRng(player), reflected, poison: profile.Poison, blind: BlindHitInput.Capture(playerStats, own));
+                        AreaRng(player), sourceEffect: skill.Effect, reflected: reflected, poison: profile.Poison,
+                        blind: BlindHitInput.Capture(playerStats, own));
                 if (applied is not null && !rageGranted) rageGranted = RageOnHitLocked(player, attack: false, melee: false, critical, own);
                 if (applied is not null && m.Life > 0 && rolled[DamageType.Fire].Max > 0)
                     foreach (var packet in IgniteOnHitLocked(player, id, m, profile.Ignite, critical, hitAt) ?? [])

@@ -39,10 +39,55 @@ public sealed class AreaDelta(GameArea area)
 
     public int Count => records.Count;
 
+    /// <summary>Whether this frame's undrained records already contain a create for <paramref name="entity"/>
+    /// that will be written to <paramref name="player"/> when this frame ends.</summary>
+    public bool HasCreateFor(uint entity, Player player) =>
+        created.Contains(entity) && records.Any(r => r.Kind == Kind.Create && r.Entity == entity && r.For(player));
+
+    /// <summary>Remove a shared object even when its replay was sent only to individual joining players.</summary>
+    public void RemoveSharedObject(uint entity, byte[] bytes, string? log = null)
+    {
+        area.AssertOwner();
+        lock (viewers) viewers.Remove(entity);
+        Add(entity, bytes, log, Kind.Remove);
+    }
+
+    /// <summary>Forgets a departed player from every private-entity viewer list so long-lived areas (such as hideouts)
+    /// do not retain closed sessions.</summary>
+    public void RemoveViewer(Player player)
+    {
+        lock (viewers)
+        {
+            List<uint>? empty = null;
+            foreach (var (entity, list) in viewers)
+            {
+                if (list.Remove(player) && list.Count == 0)
+                    (empty ??= []).Add(entity);
+            }
+            if (empty is not null)
+                foreach (uint entity in empty) viewers.Remove(entity);
+        }
+    }
+
+    /// <summary>Discards undelivered frame delta records once no client remains in the area (for example when a player
+    /// leaves their hideout). Durable state is already committed to Area.Objects / Buffs / Stats / Life and will be
+    /// replayed cleanly via Join on re-entry instead of delivering stale departure records to the next entrant.</summary>
+    public void DiscardPending()
+    {
+        records.Clear();
+        held.Clear();
+        created.Clear();
+    }
+
     public void Add(Record record)
     {
         area.AssertOwner();
-        if (record.Kind == Kind.Create && record.Only is { } owner && record.Except is null && !area.Monsters.ContainsKey(record.Entity))
+        // Shared entities replayed to a joining player (peer players 0x20000000, shared monsters 0x08000000,
+        // dormant monsters, area objects) must never register that joiner as the entity's sole private viewer.
+        if (record.Kind == Kind.Create && record.Only is { } owner && record.Except is null
+            && (record.Entity & 0xF0000000) != 0x20000000 && (record.Entity & 0xF8000000) != 0x08000000
+            && !area.Monsters.ContainsKey(record.Entity) && !area.DormantMonsters.ContainsKey(record.Entity)
+            && !area.Objects.Has(record.Entity))
         {
             lock (viewers)
             {
@@ -72,7 +117,17 @@ public sealed class AreaDelta(GameArea area)
         area.Objects.Written(record);
         if (record.Kind == Kind.Create) created.Add(record.Entity);
         // An object removed takes its components with it (its id may come back as another object).
-        else if (record.Kind == Kind.Remove) { area.Buffs.Removed(record.Entity); area.Stats.Removed(record.Entity); area.Life.Removed(record.Entity); }
+        else if (record.Kind == Kind.Remove)
+        {
+            area.Buffs.Removed(record.Entity); area.Stats.Removed(record.Entity); area.Life.Removed(record.Entity);
+            // A removal in the same frame as the object's create waits for the next frame so it never precedes
+            // or drops below any AfterBirth/World records held for that frame (matching WorldOutput).
+            if (created.Contains(record.Entity))
+            {
+                held.Add(record);
+                return;
+            }
+        }
         // The client applies a frame's creates in its last phase (WorldOrder.Last, 0x142183ce0): a record about an object
         // created in this frame that would be applied before that goes in the next frame.
         else if (record.Kind != Kind.Message && created.Contains(record.Entity) && record.Order.CompareTo(WorldOrder.Last) < 0)
@@ -83,11 +138,29 @@ public sealed class AreaDelta(GameArea area)
         records.Add(record);
     }
 
-    /// <summary>A world record (u16 id, u32 object, u32 order key, u16 checkpoint) as it is: its order from its header.</summary>
-    public void Add(uint entity, byte[] bytes, string? log = null, Kind kind = Kind.World, Player? except = null, Player? only = null) =>
+    /// <summary>A world record (u16 id, u32 object, u32 order key, u16 checkpoint) as it is: its order from its header.
+    /// Active lockstep creates and removals always carry key 0xffffffff (WorldOrder.Last) so they sort in the client's
+    /// create/remove phase regardless of caller defaults.</summary>
+    public void Add(uint entity, byte[] bytes, string? log = null, Kind kind = Kind.World, Player? except = null, Player? only = null)
+    {
+        if (kind == Kind.Create && bytes.Length >= 12
+            && (System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(6)) != uint.MaxValue
+                || System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(10)) != 0))
+        {
+            bytes = bytes.ToArray();
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(6), uint.MaxValue);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(10), 0);
+        }
+        else if (kind == Kind.Remove && bytes.Length >= 10
+            && System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(6)) != uint.MaxValue)
+        {
+            bytes = bytes.ToArray();
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(6), uint.MaxValue);
+        }
         Add(new(entity, bytes, log, kind == Kind.Message || bytes.Length < 12 ? WorldOrder.First
             : new(System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(6)),
                 System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(10))), kind, except, only));
+    }
 
     /// <summary>The frame's records, taken for its end; what waited for a create of this frame starts the next.</summary>
     public IReadOnlyList<Record> Take()

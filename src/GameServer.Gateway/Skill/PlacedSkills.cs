@@ -8,6 +8,7 @@ public sealed class PlacedSkills
         IReadOnlyDictionary<uint, int> Caster, bool Spell)
     {
         public SpiderDamageSource? Spider { get; init; }
+        public IReadOnlyDictionary<uint, int>? WeaponLocal { get; init; }
     }
 
     public sealed record Placed(uint Id, ushort Skill, int Effect, (int X, int Y) At, bool Mine,
@@ -15,6 +16,8 @@ public sealed class PlacedSkills
         int Flat, int Percent, bool ReservesLife, int Efficiency)
     {
         public DamageSnapshot? Offense { get; init; }
+        public GemSourceLifetimes.SourceLifetime? Source { get; init; }
+        public double EffectDurationSeconds { get; init; }
         public double DetonateAt = double.PositiveInfinity;
         public bool SkitterTriggered;
         public int Chain;
@@ -36,6 +39,7 @@ public sealed class PlacedSkills
     public double NextSkitter;
     public double NextChain;
     public int Chain;
+    public int TriggeredInChain;
     public bool Dirty;
     public bool DetonationPublished;
     public static int Reserved(CharacterStats.Pools pools, IEnumerable<Placed> all, bool life) =>

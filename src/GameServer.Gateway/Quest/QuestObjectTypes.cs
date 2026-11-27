@@ -26,6 +26,7 @@ public static class QuestObjectTypes
         /// <summary>Whether the .ot names its own model (Animated animated_object); one that does not takes the placing
         /// line's (the Aspirants' Plaza's LabyrinthAirlockPortal, LabyrinthAirlockPortal.ao in airlock.arm).</summary>
         public bool OwnModel { get; init; } = true;
+        public bool ActorOrChest => Components.Contains("Actor") || Components.Contains("Chest");
         public string? AnimatedModel { get; init; }
         /// <summary>The .ot's Positioned <c>static</c>: unless the object is sent with no static position (flags1 0x20),
         /// the client stamps its model's Hull into the walk grid when it creates it (0x141d8bd20).</summary>
@@ -40,7 +41,18 @@ public static class QuestObjectTypes
         || type.StartsWith("Metadata/Monsters/Doedre/DoedreSewer/", StringComparison.Ordinal)
         || type.StartsWith("Metadata/Terrain/", StringComparison.Ordinal) && type.Contains("/Objects/", StringComparison.Ordinal);
 
-    public static Info? Find(string type) => Catalog.GetValueOrDefault(type);
+    public static Info? Find(string type)
+    {
+        if (ObjectTypes.FindOverlay(type) is { } overlay)
+            return new Info(overlay.Type, overlay.Components, Math.Max(2, overlay.TransitionStates),
+                Math.Max(1, overlay.ObjectSize - 1), overlay.Blocking, overlay.Model)
+            {
+                AnimatedModel = overlay.Model,
+                OwnModel = !overlay.Components.Contains("Animated") || overlay.Model is not null,
+                Static = overlay.Static,
+            };
+        return Catalog?.GetValueOrDefault(type);
+    }
 
     /// <summary>Quest doors that open in place (0x2bc Transitionable plays their .ot's on_transition, 0x1c6 lifts their
     /// TriggerableBlockage) instead of being created again open: the Aspirants' Plaza's door, whose opening the user

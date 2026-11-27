@@ -51,7 +51,7 @@ The issue #75 native matrices were run on the source LocalExile revisions, not r
   conditional damage and support/modifier scope; check equipment UI refresh live.
   Attack base/added coefficients are separate; negative weapon conditions, remaining weapon families,
   skill-specific added inputs and native checks stay in #368.
-- **Warcries:** executors for the other warcries; explosions need global added damage, flat crit chance, on-hit
+- **Warcries:** remaining warcry buffs and exerted attacks; explosions need global added damage, flat crit chance, on-hit
   effects, their native art and the wave delay ([11](../docs/protocol/11-skills.md) §10i).
 - **Character panel (#75)** ([11](../docs/protocol/11-skills.md) §14):
   - Regeneration: other conversions than Zealot's Oath, named conditional/more modifiers and other recovery systems.
@@ -97,10 +97,10 @@ The issue #75 native matrices were run on the source LocalExile revisions, not r
 - **Known:** [11](../docs/protocol/11-skills.md) §13 has reservation, the implemented auras and the own-aura lifecycle.
   Passive enemy auras other than the implemented ones (the Occultist's) need consumers for their stats first (§10e).
 - **Start:** the auras' 3D effects (BuffVisuals EPKs of the `IsSkillBuff` rows do not render, unlike Righteous Fire's);
-  banners, enemy aura executors, the other Vaal auras and unsupported conditional effects.
+  enemy aura executors, the other Vaal auras and unsupported conditional effects.
   Vaal auras: allies do not receive them, and no skill bar soul gain prevention countdown is shown.
-  Verify the herald combat matrix, retail Virulence decay, the skill-specific trap/mine payloads beyond Skitterbots'
-  trigger/rearm, and the skill-bar indicator's buff association (0x1c1 bit3) live.
+  Verify the herald combat matrix, retail Virulence decay, remaining skill-specific trap and mine payloads, and the
+  skill-bar indicator's buff association (0x1c1 bit3) live.
 - **Done when:** the standard auras reserve correctly, their effects match PoB, and the character panel and HUD show
   the same reserved and unreserved values.
 
@@ -127,7 +127,10 @@ The issue #75 native matrices were run on the source LocalExile revisions, not r
     reach the hits that read a monster's resistances or roll crits without a time: Rampage weapons, boss hazards
     (Doedre, Sirus, Kitava, arenas, Vaal Oversoul) and shrine novas.
   - Remaining weapon-scoped fire per Strength, lightning per Dexterity/Intelligence and spell per-Intelligence added damage.
-  - Monster skills beyond the first granted effect (ranged, spells).
+  - Monster skills beyond the first granted effect: ordinary multi-skill kits (up to 16 skills with `MinRange` and
+    `CooldownGroup`), `monster-contacts` v9 clip events, `EmptyAction*` combos (`MonsterCombos`), and `.ot`
+    `StateMachine` visibility/state plumbing (`MonsterStateMachine`, `object_type_state_meta`) are implemented with
+    automated coverage; live real-client verification and remaining unmapped projectile/combo families stay open.
   - Player stun: ES avoidance, substituted thresholds, conditional defences and monster-specific modifiers.
   - Criticals: other conditional more chance, guaranteed-critical effects, off-hand chance/multiplier publication and
     execution, Focus/curse lifecycles. The off-hand range/timing publication has no critical fields: do not infer
@@ -168,7 +171,8 @@ The issue #75 native matrices were run on the source LocalExile revisions, not r
   costs, death/resurrection and slow destination loading ([27](../docs/protocol/27-vaal-souls.md)).
   Validate the [modular Behemoth candidate](../docs/game/behemoth.md) natively; other Vaal executors and official
   distribution/capacity parity remain open.
-  Vaal minion totem, trap and mine execution remains open; these casts are refused before souls or actions are spent.
+  Vaal minion casts linked to a totem, trap or mine support still need a proxy executor.
+  Check Vaal Sweep push reach, Vaal Lightning Warp timing and Warchief's slam coverage with the client.
   Vaal Animate Weapon, full ascended special attacks and minion stance targeting remain open.
 
 ### Death screen variants
@@ -186,14 +190,16 @@ The issue #75 native matrices were run on the source LocalExile revisions, not r
 - **Known:** the [framework](../docs/game/projectile-framework.md) owns production routing and the only simulator;
   [registered skills](../docs/game/projectile-skills.md) add special behaviour.
 - **Open:**
-  - Nonzero intrinsic attack repeats; per-skill duration before the 150-cell cap and a
+  - Remaining intrinsic attack repeats; per-skill duration before the 150-cell cap and a
     native check of the continuation boundary; the action-speed/Tailwind contract (#246).
   - Combat body geometry: actor positions use integer walk estimates and Gateway actor radii are zero, so area
     coverage is centre-based; calibrate against `ObjectSize`.
-  - Monster weapon projectiles: `monster_projectile_weapon`, `monster_snipe` and `monster_puncture` (109 varieties'
-    first effect) take their projectile from the monster's weapon art (MonsterVarieties
-    `Weapon1_ItemVisualIdentityKeys`, e.g. `SkeletonArrow1`), which the server does not read, so they hit instantly
-    with no shot. Monster spell projectiles (`MonsterProjectileSpell`) need their own adapter.
+  - Monster weapon projectiles: weapon attacks with a `monster_projectile_variation` (and sibling `ActionType`s /
+    variation-0 `ScavengerThrow`) fly their `MonsterProjectileAttack` projectile in kit shaping (`BossKits.ArtShot`),
+    while the default attack (`MavenNucleus.Shot` → `MonsterProjectile` without weapon attacks) still has none.
+    `monster_snipe` and `monster_puncture` (109 varieties' first effect) take their projectile from the monster's weapon
+    art (MonsterVarieties `Weapon1_ItemVisualIdentityKeys`, e.g. `SkeletonArrow1`), which the server does not read, so
+    they hit instantly with no shot. Monster spell projectiles (`MonsterProjectileSpell`) need their own adapter.
   - Mortars: the splash radius is a development default and `projectile_spread_radius` (3) is not modelled; monster
     melee still lands at half the attack time although the pools carry `Melee` keyframes. Check live whether the
     client seeds a monster's clip choice from the 0xffff sequence (the Spitter's attack2 would spit 75 ms earlier and

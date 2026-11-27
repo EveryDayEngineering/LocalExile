@@ -18,24 +18,53 @@ public sealed class PortalsModule : IModule
         global::PortalsRules.LoadRulesSettingsData();
     }
 
+    static readonly string[] FlagNone = [];
+    static readonly string[] FlagInMapArea = ["InMapArea"];
+    static readonly string[] FlagMapDeviceActive = ["MapDeviceActive"];
+
+    static IReadOnlyList<string> TransientMapAreaFlags(Player player)
+    {
+        if (MapDevices.IsMapArea(player.Layout.Hash)) return FlagInMapArea;
+        if (HideoutCatalog.ByArea(player.Layout.Hash) is not null)
+        {
+            // Keep MapDeviceActive off while mid-a11q1 (LQF 1036 seen, 1038 not completed) until portals are opened
+            // so the quest tracker waits at state 4 ("Place it in the Map Device and activate it") instead of skipping.
+            const int kiracMapTutorialSeen = 1036, kiracMapTutorialDone = 1038;
+            if (!player.Character.LeagueQuestFlags.Contains(kiracMapTutorialSeen)
+                || player.Character.LeagueQuestFlags.Contains(kiracMapTutorialDone)
+                || MapDevice.AtEntrance(player.Layout.Hash, player.InstanceNumber) is { PortalsLeft: > 0 })
+                return FlagMapDeviceActive;
+        }
+        return FlagNone;
+    }
+
     /// <inheritdoc/>
     public void Load(IModuleContext module)
     {
         LoadData();
+        GameEvents.AreaQuestFlags.Add(module.Manifest.Id, TransientMapAreaFlags);
         // The portals a player can take are their own view (each keeps its own portal state): theirs alone to see.
         GameEvents.PlayerEntered.Add(module.Manifest.Id, async player =>
         {
             Program.ViewOf.Value = player;
             try
             {
-                await SpawnHideoutDoodads(player);
+                await global::Game.SpawnHideoutDevice(player);
+                await global::Game.SpawnEndgameTownDevice(player);
                 await SpawnMapReturnPortal(player);
                 await SpawnTownPortals(player);
                 // A hideout's instance is gone six minutes after its last player leaves, and its device with it: a run whose
                 // portals stood there follows the character into the instance they enter now, so the portals come up below.
                 await PortalsRules.FollowDeviceToThisInstance(player);
-                // Everyone in this exact device instance sees and spends the same run's portals.
-                if (MapDevice.AtEntrance(player.Layout.Hash, player.InstanceNumber) is { PortalsLeft: > 0 } open)
+                // Everyone in a hideout/campaign device instance sees the same run's portals; in Karui Shores, each player sees their own.
+                if (player.Layout.Id == MapDevice.EndgameTownArea)
+                {
+                    if (MapDevice.OpenOf(CharacterName(player)) is { PortalsLeft: > 0 } ownOpen
+                        && (ownOpen.Entrance ?? ownOpen.ReturnTo) is { } ownOrigin
+                        && ownOrigin.Area == player.Layout.Hash && ownOrigin.Instance == player.InstanceNumber)
+                        await SpawnMapPortals(player, ownOpen, firstAfterMs: MapPortalEntryMs, standing: true);
+                }
+                else if (MapDevice.AtEntrance(player.Layout.Hash, player.InstanceNumber) is { PortalsLeft: > 0 } open)
                     await SpawnMapPortals(player, open, firstAfterMs: MapPortalEntryMs, standing: true);
             }
             finally { Program.ViewOf.Value = null; }
@@ -67,6 +96,14 @@ public sealed class PortalsModule : IModule
                 await UseMapReturnPortal(player, use, (back.X, back.Y), requestedAt);
                 return true;
             }
+            (string Owner, int X, int Y, ushort ReturnToTown)? peerPortal = null;
+            lock (player.PeerPortals)
+                if (player.PeerPortals.TryGetValue(use.TargetId, out var pp)) peerPortal = pp;
+            if (peerPortal is { } clickedPeer)
+            {
+                await UseMapReturnPortal(player, use, (clickedPeer.X, clickedPeer.Y), requestedAt, clickedPeer.ReturnToTown);
+                return true;
+            }
             (int X, int Y, int Index)? portal;
             lock (player.MapPortals) portal = player.MapPortals.TryGetValue(use.TargetId, out var at) ? at : null;
             if (portal is { } p)
@@ -74,9 +111,20 @@ public sealed class PortalsModule : IModule
                 await UseMapPortal(player, use, p, requestedAt);
                 return true;
             }
+            if (global::Game.EndgameTownDevice(player) is { } townDevice && use.TargetId == townDevice.Id)
+            {
+                await UseEndgameTownMapDevice(player, use, (townDevice.X, townDevice.Y), requestedAt);
+                return true;
+            }
             HideoutCatalog.Doodad? doodad;
             lock (player.HideoutDoodads) doodad = player.HideoutDoodads.GetValueOrDefault(use.TargetId);
-            if (doodad is null) return false;
+            // A device variant's button opens its device: walk to the button, open the device's window.
+            if (doodad is null && global::Game.MapDeviceOfButton(player, use.TargetId) is var (device, button))
+            {
+                await UseMapDevice(player, use with { TargetId = device }, button, requestedAt);
+                return true;
+            }
+            if (doodad is null || !HideoutCatalog.IsPlaced(doodad)) return false;
             await UseMapDevice(player, use, doodad, requestedAt);
             return true;
         });
@@ -100,9 +148,25 @@ public sealed class PortalsModule : IModule
             await UsePortalScroll(player, use, item, type);
             return true;
         });
+        GameEvents.PortalRequested.Add(module.Manifest.Id, async (player, x, y, why) =>
+        {
+            if (!PortalAllowed(player)) return false;
+            await OpenTownPortal(player, x, y, why);
+            return true;
+        });
         GameEvents.Packet(InstanceMapDevice.ActivateId).Add(module.Manifest.Id, async (player, bytes) =>
         {
             await ActivateMapDevice(player, InstanceMapDevice.ReadActivate(bytes));
+            return true;
+        });
+        GameEvents.Packet(InstanceMapDevice.ActivateMemoryLineId).Add(module.Manifest.Id, async (player, bytes) =>
+        {
+            await ActivateMemoryLine(player, InstanceMapDevice.ReadActivateMemoryLine(bytes));
+            return true;
+        });
+        GameEvents.Packet(InstanceMapDevice.ActivateMavenInvitationId).Add(module.Manifest.Id, async (player, bytes) =>
+        {
+            await ActivateMavenInvitation(player, InstanceMapDevice.ReadActivateMavenInvitation(bytes));
             return true;
         });
         GameEvents.Packet(InstanceMapDevice.SelectMapId).Add(module.Manifest.Id, async (player, bytes) =>

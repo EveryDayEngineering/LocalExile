@@ -21,7 +21,11 @@ public static partial class Game
 
     public sealed record ProjectileReleaseContext(Player Player, ProjectileSession Session, ushort SkillId,
         (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) Gem,
-        int Variation, Func<uint, int> Get, Func<uint, int> PlayerStat, Func<uint, int> Own);
+        int Variation, Func<uint, int> Get, Func<uint, int> PlayerStat, Func<uint, int> Own)
+    {
+        internal bool NotHandCast { get; init; }
+        internal int SteelShardsSpent { get; init; }
+    }
 
     public sealed record ProjectilePresentation
     {
@@ -60,6 +64,7 @@ public static partial class Game
         /// <summary>Keep the stopped object for <see cref="ImpactLifetime"/> without a clip: an arrow left in its target
         /// or a wall (DefaultArrow has stuck/bounce art the client plays only for its own arrows).</summary>
         public bool StayOnImpact { get; init; }
+        public bool StayAtEndOfRange { get; init; }
         /// <summary>The release point's height above the ground in marker steps, from the releasing clip's contact
         /// keyframe (<see cref="ContactPoint.HeightSteps"/>: the Ranger's bow 16, the Sand Spitter's spit 9); null keeps
         /// <c>Game_PROJECTILE_HEIGHT</c> (<see cref="ProjectileHeight.DefaultSteps"/>).</summary>
@@ -109,9 +114,20 @@ public static partial class Game
     // Module reload replaces this dictionary together with the providers that define the recipes.
     static readonly System.Collections.Concurrent.ConcurrentDictionary<int, ProjectileSkillDefinition?> ProjectileRecipes = new();
     public static ProjectileSkillDefinition? ResolveProjectileDefinition(int effect) =>
-        ProjectileRecipes.GetOrAdd(effect, static row => ProjectileDefinition(Skills.EffectId(row) ?? "")
-            ?? (ProjectileDefinitions.RequireExplicitProfiles ? null
-                : CatalogProjectileDefinition(row) ?? WeaponProjectileDefinition(row)));
+        ProjectileRecipes.GetOrAdd(effect, static row =>
+        {
+            string id = Skills.EffectId(row) ?? "";
+            if (IsArtilleryBallista(id) || id == ThunderstormEffect) return GroundArrow;
+            if (id == ThunderburstEffect) return ThunderburstProjectile;
+            if (id is "KineticFusillade" or KineticFusilladeDetonation) return KineticFusilladeProjectile;
+            if (ConcoctionDefinition(id) is { } concoction) return concoction;
+            if (IsKineticRain(id) || id == KineticAnomalyEffect) return GroundWandRain;
+            if (ScourgeProjectileDefinition(id) is { } scourge) return scourge;
+            if (id == SomaticShellEffect) return SomaticShellProjectile;
+            if (IsWildStrike(id)) return WildStrikeProjectile;
+            return ProjectileDefinition(id) ?? (ProjectileDefinitions.RequireExplicitProfiles ? null
+                : CatalogProjectileDefinition(row) ?? WeaponProjectileDefinition(row));
+        });
 
     static ProjectileSkillParameters CatalogProjectileParameters(int effect, string profileId)
     {

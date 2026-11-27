@@ -12,10 +12,16 @@ public static partial class Game
         ? "Metadata/Effects/Spells/heavy_strike_02/heavy_strike_hit.ao" : null;
 
     internal static byte[] MeleeHitFeedback(uint attacker, ushort sequence, uint target, byte code, byte angle,
-        bool critical, string? impactArt, uint orderKey = 0, ushort checkpoint = 0) =>
-        InstanceProtocol.ActionHit(attacker, impactArt is null ? sequence : (ushort)0xffff, target,
-            flags: (ushort)(0x4200 | HitTypeFlag(code) | (critical ? 0x20 : 0)), kind: 3, code: code, angle: angle,
+        bool critical, string? impactArt, uint orderKey = 0, ushort checkpoint = 0,
+        SpawnedMonster.NativeKnockback? knockback = null)
+    {
+        ushort flags = (ushort)(0x4200 | HitTypeFlag(code) | (critical ? 0x20 : 0));
+        byte kind = 3;
+        ApplyNativeKnockback(knockback, ref flags, ref kind, ref angle, out ushort u3c, out ushort u3e);
+        return InstanceProtocol.ActionHit(attacker, impactArt is null ? sequence : (ushort)0xffff, target,
+            flags: flags, kind: kind, code: code, angle: angle, u3c: u3c, u3e: u3e,
             orderKey: orderKey, checkpoint: checkpoint);
+    }
 
     static async Task PresentMeleeImpact(Player player, string art, (int X, int Y) from, (int X, int Y) at, float scale = 1)
     {
@@ -23,7 +29,7 @@ public static partial class Game
         uint id;
         if (!session.Active || player.LeavingArea) return;
         id = player.TakeObjectId();
-        player.ProjectileObjects.Add(id);
+        player.TrackProjectileObject(id);
         var effect = new EffectObject(at.X, at.Y, art)
         {
             AnimatedFlags = 9, Flags0 = EffectObject.FixedRotation, Scale = scale,
@@ -32,14 +38,14 @@ public static partial class Game
         bool created = await SendWorldCreate(player, id,
             () => session.Active ? InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(EffectObject.TypePath), effect.Blob()) : null,
             "native melee impact", wake: true);
-        if (!created) { player.ProjectileObjects.Remove(id); return; }
+        if (!created) { player.UntrackProjectileObject(id); return; }
         if (!session.Active) return;
         // Existing connection scheduler/outbox: no per-hit task, timer or worker.
         long until = Math.Max(session.Runtime.Now, ProjectileRuntime.Time(AreaTime(player)))
             + ProjectileRuntime.Time(2);
         session.Runtime.Schedule(until, () => session.WorldRecords(id, () =>
         {
-            player.ProjectileObjects.Remove(id);
+            player.UntrackProjectileObject(id);
             return [InstanceProtocol.RemoveObject(id)];
         }, remove: true));
     }

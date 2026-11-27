@@ -5,6 +5,30 @@ using GameServer.Core.Diagnostics;
 
 public static partial class Game
 {
+    static int MapFlaskChargeGain(Player player) => MapModsOf(player)?.Get(Stat.MapPlayerChargesGainedPlusPct) ?? 0;
+
+    // Apply the flask's area-entry rule before publishing the inventory. An entry reset takes priority over a refill.
+    static void SettleAreaEntryFlasks(Player player, PlayerInventories inventory)
+    {
+        bool refill = LeagueFor(player).Rules.TownRefillsFlasks && (InTown(player) || HideoutCatalog.ByArea(player.Layout.Hash) is not null);
+        var catalog = ItemsFor(player);
+        int emptied = 0, refilled = 0;
+        foreach (var flask in inventory.Items(PlayerInventories.Flask))
+        {
+            if (catalog.ByHash(flask.Item.TypeHash) is not { } type || catalog.FlaskChargesOf(type) is not { } baseUse) continue;
+            var local = ItemModStats.Local(flask.Item, catalog.Mods);
+            bool empty = local.GetValueOrDefault(Stat.LocalFlaskLoseAllChargesOnEnteringNewArea) != 0;
+            int current = flask.Item.Charges;
+            int requested = empty ? 0 : refill ? Math.Max(current, FlaskCharges.Of(baseUse, local).MaxCharges) : current;
+            if (requested == current || inventory.ChangeUnsaved(PlayerInventories.Flask, flask.Id,
+                item => item with { Charges = requested }) is null) continue;
+            if (empty) emptied++; else refilled++;
+        }
+        if (emptied == 0 && refilled == 0) return;
+        inventory.SaveUnsaved();
+        Console.WriteLine($"[gateway] {player.Connection.Remote} area entry: {emptied} flasks emptied, {refilled} flasks refilled");
+    }
+
     // A change of the flask bar and its S→C 0xbf as one step under the connection's flask-bar gate: the crit, hit, kill and
     // every-3-seconds gains and the flask uses run on their own tasks, and the client must see their revisions in order,
     // each with the flask's latest charges. `change` makes the change and returns what to send (removed ids and the changed
@@ -20,17 +44,34 @@ public static partial class Game
             string message;
             if (!CurrentGameWork || HardcoreProgressBlocked(player)) return;
             var items = ItemsOf(player);
-            var before = items.Items(PlayerInventories.Flask).ToDictionary(i => i.Id, i => i.Item.Charges);
+            var before = items.Items(PlayerInventories.Flask).ToDictionary(i => i.Id);
             int outputAt = Automation(player).Packets.Count;
             if (change(items) is not { } done || done.Changed.Count == 0) return;
             foreach (var changed in done.Changed)
-                if (before.TryGetValue(changed.Id, out int held) && changed.Item.Charges > held
+                if (before.TryGetValue(changed.Id, out var prevItem) && changed.Item.Charges > prevItem.Item.Charges
                     && ItemsFor(player).ByHash(changed.Item.TypeHash) is { } flaskType
                     && ItemsFor(player).FlaskChargesOf(flaskType) is { } baseCharges
                     && changed.Item.Charges >= FlaskCharges.Of(baseCharges, ItemModStats.Local(changed.Item, ItemsFor(player).Mods)).MaxCharges)
                     QueueFlaskTrigger(player, FlaskEnchantments.Trigger.Full, changed.Id, changed.X);
-            packet = InstanceItems.InventoryChange(PlayerInventories.InventoryId(PlayerInventories.Flask),
-                items.NextRevision(PlayerInventories.Flask), done.Removed, done.Changed);
+            bool chargesOnly = done.Removed.Length == done.Changed.Count
+                && done.Changed.All(c => Array.IndexOf(done.Removed, c.Id) >= 0
+                    && before.TryGetValue(c.Id, out var prev)
+                    && c.X == prev.X && c.Y == prev.Y
+                    && c.Item.Components.Contains("Charges")
+                    && c.Item.Charges != prev.Item.Charges
+                    && (c.Item with { Charges = prev.Item.Charges }) == prev.Item);
+            if (chargesOnly)
+            {
+                var chargeBytes = new List<byte>(done.Changed.Count * 10);
+                foreach (var changed in done.Changed)
+                    chargeBytes.AddRange(InstanceItems.FlaskCharges(changed.Id, (uint)Math.Max(0, changed.Item.Charges)));
+                packet = [.. chargeBytes];
+            }
+            else
+            {
+                packet = InstanceItems.InventoryChange(PlayerInventories.InventoryId(PlayerInventories.Flask),
+                    items.NextRevision(PlayerInventories.Flask), done.Removed, done.Changed);
+            }
             message = log(done.Changed);
             if (retainOutput) Automation(player).Packets.Insert(outputAt, new(packet, message));
             else if (player.ProjectileRuntime is { Active: true } session)
@@ -71,9 +112,25 @@ public static partial class Game
                 if (player.EntryProtection.End(now, player.Walk.Position(now), action: true) is ushort)
                     player.Area.Buffs.Clear(player.Id, GracePeriod.BuffRow, player.Id);
                 accepted(done);
+                ApplyEquipmentFlaskCleansesLocked(player, now);
+                if (player.PlayerLife > 0 && player.PlayerLife < player.PlayerMaxLife)
+                {
+                    var stats = CharacterPlayerStats(player);
+                    int Recover(uint key) => stats.GetValueOrDefault(key);
+                    int percent = Recover(Stat.RecoverPctMaximumLifeOnFlaskUse);
+                    if (percent > 0 && !LifeRecovery.NonLeechBlocked(Recover))
+                    {
+                        double carry = 0;
+                        uint before = player.PlayerLife;
+                        player.PlayerLife = PetrifiedBlood.RecoverLife(player, before,
+                            player.PlayerMaxLife * (percent / 100d), ref carry);
+                        if (player.PlayerLife != before)
+                            Automation(player).Packets.Add(new([], $"0x01b1 player life {player.PlayerLife} (on flask use)", FlaskOutputPool.Life));
+                    }
+                }
             }
             return ([done.Id], [done]);
-        }, changed => $"0x00bf flask {slot}: {changed[0].Item.Charges}/{charges.MaxCharges} charges", retainOutput: accepted is not null);
+        }, changed => $"0x00c6 flask {slot}: {changed[0].Item.Charges}/{charges.MaxCharges} charges", retainOutput: accepted is not null);
         if (spent is not null && accepted is null) await EndGracePeriod(player, action: true);
         return spent;
     }
@@ -85,46 +142,53 @@ public static partial class Game
     public static async Task GainFlaskCharges(Player player,
         Func<InventoryItem, IReadOnlyDictionary<uint, int>, double> chargesFor, string why)
     {
-        var gaining = new List<(InventoryItem Flask, IReadOnlyDictionary<uint, int> Local, Flasks.Flask Charges, double Gain)>();
+        var catalog = ItemsFor(player);
+        List<(InventoryItem Flask, IReadOnlyDictionary<uint, int> Local, Flasks.Flask Charges, double Gain)>? gaining = null;
         foreach (var flask in ItemsOf(player).Items(PlayerInventories.Flask))
         {
-            if (ItemsFor(player).ByHash(flask.Item.TypeHash) is not { } type || ItemsFor(player).FlaskChargesOf(type) is not { } baseCharges) continue;
-            var local = ItemModStats.Local(flask.Item, ItemsFor(player).Mods);
+            if (catalog.ByHash(flask.Item.TypeHash) is not { } type || catalog.FlaskChargesOf(type) is not { } baseCharges) continue;
+            var local = FlaskLocalStats(player, flask.Item);
             var charges = FlaskCharges.Of(baseCharges, local);
+            if (flask.Item.Charges >= charges.MaxCharges) continue;
             double gain = chargesFor(flask, local);
-            if (gain > 0 && flask.Item.Charges < charges.MaxCharges) gaining.Add((flask, local, charges, gain));
+            if (gain > 0) (gaining ??= []).Add((flask, local, charges, gain));
         }
-        if (gaining.Count == 0) return;
-        var character = CharacterPlayerStats(player);
+        if (gaining is null) return;
+        int areaIncrease = MapFlaskChargeGain(player);
+        var character = PlayerStatValues(player);
         int Get(uint key) => character.GetValueOrDefault(key);
         await ChangeFlaskBar(player, items =>
         {
             List<InventoryItem> changed = [];
             foreach (var (flask, local, charges, gain) in gaining)
             {
-                if (!CanGainFlaskCharges(player, flask)) continue;
-                int whole = player.FlaskChargeCarry.Take(flask.Id, gain * FlaskCharges.GainMultiplier(local, Get));
+                if (!CanGainFlaskCharges(player, flask, local, character)) continue;
+                int whole = player.FlaskChargeCarry.Take(flask.Id, gain * FlaskCharges.GainMultiplier(local, Get, areaIncrease));
                 if (whole > 0 && items.ChangeUnsaved(PlayerInventories.Flask, flask.Id, i => Flasks.Gain(i, charges, whole)) is { } done)
                 {
                     changed.Add(done);
                 }
             }
             return ([.. changed.Select(c => c.Id)], changed);
-        }, changed => $"0x00bf flasks: {string.Join(", ", changed.Select(c => $"{c.X}: {c.Item.Charges}"))} charges ({why})");
+        }, changed => $"0x00c6 flasks: {string.Join(", ", changed.Select(c => $"{c.X}: {c.Item.Charges}"))} charges ({why})");
     }
 
-    public static bool CanGainFlaskCharges(Player player, InventoryItem flask)
+    public static bool CanGainFlaskCharges(Player player, InventoryItem flask) =>
+        CanGainFlaskCharges(player, flask, null, null);
+
+    internal static bool CanGainFlaskCharges(Player player, InventoryItem flask,
+        IReadOnlyDictionary<uint, int>? local, IReadOnlyDictionary<uint, int>? playerStats)
     {
         var activeEffect = player.UtilityFlaskEffects.Of(flask.Id);
-        if (FlaskEnchantments.BlocksGain(ItemModStats.Local(flask.Item, ItemsFor(player).Mods),
-                activeEffect is not null && activeEffect.Ends > AreaTime(player))) return false;
+        local ??= FlaskLocalStats(player, flask.Item);
+        bool running = activeEffect is not null && activeEffect.Ends > AreaTime(player);
+        if (FlaskEnchantments.BlocksGain(local, running)) return false;
         var rules = LeagueFor(player).Rules;
-        if (rules.UtilityFlaskChargesWhileActive || ItemsFor(player).ByHash(flask.Item.TypeHash) is not { } type
-            || ItemsFor(player).UtilityFlaskOf(type) is null) return true;
-        var active = player.UtilityFlaskEffects.Of(flask.Id);
-        bool running = active is not null && active.Ends > AreaTime(player);
+        var catalog = ItemsFor(player);
+        if (rules.UtilityFlaskChargesWhileActive || catalog.ByHash(flask.Item.TypeHash) is not { } type
+            || catalog.UtilityFlaskOf(type) is null) return true;
         bool exception = rules.UtilityFlaskExceptionStat is { } stat && Stats.Key(stat) is uint key
-            && CharacterPlayerStats(player).GetValueOrDefault(key) > 0;
+            && (playerStats ?? PlayerStatValues(player)).GetValueOrDefault(key) > 0;
         return LeagueGameplay.CanGainUtilityCharges(!rules.UtilityFlaskChargesWhileActive, running, exception);
     }
 
@@ -133,9 +197,20 @@ public static partial class Game
     public static Task GainKillCharges(Player player, MonsterRarity rarity, string why) =>
         GainKillCharges(player, rarity, why, 0);
 
-    static Task GainKillCharges(Player player, MonsterRarity rarity, string why, int grantedPct) =>
-        FlaskCharges.FullShortcut ? GainFlaskCharges(player, int.MaxValue, why)
-            : GainFlaskCharges(player, (_, _) => FlaskCharges.KillCharges(rarity, ItemsFor(player).Mods, grantedPct), why);
+    static Task GainKillCharges(Player player, MonsterRarity rarity, string why, int grantedPct)
+    {
+        if (FlaskCharges.FullShortcut) return GainFlaskCharges(player, int.MaxValue, why);
+        double? killGain = null;
+        return GainFlaskCharges(player, (_, _) =>
+        {
+            if (killGain is double computed) return computed;
+            var stats = PlayerStatValues(player);
+            long finalPct = Math.Max(0, 100L + stats.GetValueOrDefault(Stat.FlaskChargesGainedFromKillsPlusPctFinalFromUnique));
+            double gain = FlaskCharges.KillCharges(rarity, ItemsFor(player).Mods, grantedPct) * finalPct / 100d;
+            killGain = gain;
+            return gain;
+        }, why);
+    }
 
     // A critical strike the player dealt (a hit that landed): each flask with "#% chance to gain a Flask Charge when you deal
     // a Critical Strike" (local_recharge_on_crit_%) rolls for one charge, and the character's chance and sure charges
@@ -148,12 +223,27 @@ public static partial class Game
         var bar = CritFlaskBar(player);
         if (bar.All(f => f.Full)) return;
         var character = CharacterPlayerStats(player);
-        int Get(uint key) => character.GetValueOrDefault(key);
         bool precision;
         precision = AffectingAuras(player).Any(a => a.EffectId == "Precision");
-        var gains = FlaskCharges.OnCrit(bar, FlaskCharges.CritSources(Get, precision), player.FlaskChargeCarry, now, AreaRng(player).Next);
+        var gains = FlaskCharges.OnCrit(bar, PlayerFlaskCritSources(player, character, precision), player.FlaskChargeCarry, now, AreaRng(player).Next);
         if (gains.Count > 0)
             await GainFlaskCharges(player, (f, _) => gains.GetValueOrDefault(f.Id), "critical strike");
+    }
+
+    static (int Chance, int Sure) PlayerFlaskCritSources(Player player, IReadOnlyDictionary<uint, int> stats, bool precision)
+    {
+        var sources = FlaskCharges.CritSources(stats.GetValueOrDefault, precision);
+        int frenzyChance = stats.GetValueOrDefault(Stat.GainFlaskChargeOnCritChancePctWhileAtMaximumFrenzyCharges);
+        if (frenzyChance <= 0) return sources;
+        const ChargeType type = ChargeType.Frenzy;
+        var charges = ChargesOf(player);
+        int maximum = charges.Limits(type).Maximum;
+        bool converted = stats.GetValueOrDefault(Charges.ConversionFlag(type)) != 0;
+        bool countsAsMaximum = stats.GetValueOrDefault(ChargeScaling.CountAsMaximumStat(type)) != 0
+            || stats.GetValueOrDefault(ChargeScaling.AllCountAsMaximum) != 0;
+        if (maximum > 0 && StandardChargesAtMaximum(charges.Effective(type), maximum, converted, countsAsMaximum))
+            sources.Chance = ActorScale.Saturate((long)sources.Chance + frenzyChance);
+        return sources;
     }
 
     // An accepted enemy hit, including a blocked hit: "Gain # Charges when you are Hit by an Enemy" (local_flask_gain_X_charges_when_hit).
@@ -162,18 +252,36 @@ public static partial class Game
 
     // "Flasks gain # charges every 3 seconds" (FlaskCharges.PerThreeSeconds: every flask, utility, life, life on low life,
     // mana), every 3 s of the area's frames (a pause holds them) while the player's updates run.
-    static void StartFlaskChargeRegen(Player player, PlayerUpdatesState updates) =>
-        EveryAsPlayer(player, 3000, () => PlayerUpdatesCurrent(player, updates), player =>
-        {
-            if (player.PlayerLife == 0) return Task.CompletedTask;
-            var character = CharacterPlayerStats(player);
-            int Get(uint key) => character.GetValueOrDefault(key);
-            bool lowLife = FlaskRecovery.LowLife(player.PlayerLife, player.PlayerMaxLife);
-            return GainFlaskCharges(player, (f, _) => ItemsFor(player).ByHash(f.Item.TypeHash) is not { } t ? 0
-                : FlaskCharges.PerThreeSeconds(Get, life: ItemsFor(player).FlaskOf(t)?.LifePerUse > 0, mana: ItemsFor(player).FlaskOf(t)?.ManaPerUse > 0,
-                    utility: ItemsFor(player).UtilityFlaskOf(t) is not null, lowLife),
-                "every 3 seconds");
-        });
+    static void StartFlaskChargeRegen(Player player, PlayerUpdatesState updates)
+    {
+        bool Current() => PlayerUpdatesCurrent(player, updates);
+        EveryAsPlayer(player, 3000, Current, GainPeriodicFlaskCharges);
+        EveryAsPlayer(player, 1000, Current, GainUniqueHitFlaskCharges, () => player.PlayerLife > 0
+            && player.RecentEvents.Happened(StatConditions.HitUniqueEnemy, AreaTime(player)));
+    }
+
+    static Task GainUniqueHitFlaskCharges(Player player)
+    {
+        int charges = CharacterPlayerStats(player).GetValueOrDefault(Stat.GainFlaskChargesEverySecondIfHitUniqueEnemyRecently);
+        return charges > 0 ? GainFlaskCharges(player, charges, "recent unique enemy hit") : Task.CompletedTask;
+    }
+
+    internal static Task GainPeriodicFlaskCharges(Player player)
+    {
+        if (player.PlayerLife == 0) return Task.CompletedTask;
+        var character = CharacterPlayerStats(player);
+        int alchemist = player.Summons.Fighters.Values.Any(f => f.Definition.Kind == "Spectre"
+            && f.Monster.Variety?.Id == "Metadata/Monsters/LeagueAzmeri/SpecialCorpses/FlaskloverHigh"
+            && !f.Monster.Dead && f.Monster.Life > 0 && GolemCurrent(player, f)) ? 1 : 0;
+        int ryslatha = !player.RecentEvents.Happened(StatConditions.UsedLifeFlask, AreaTime(player))
+            ? character.GetValueOrDefault(Stat.LifeFlasksGainXChargesEvery3SecondsIfYouHaveNotUsedALifeFlaskRecently) : 0;
+        int Get(uint key) => character.GetValueOrDefault(key) + (key == Stat.LifeFlaskChargesRecoveredPer3Seconds ? alchemist + ryslatha : 0);
+        bool lowLife = FlaskRecovery.LowLife(player.PlayerLife, player.PlayerMaxLife);
+        return GainFlaskCharges(player, (f, _) => ItemsFor(player).ByHash(f.Item.TypeHash) is not { } t ? 0
+            : FlaskCharges.PerThreeSeconds(Get, life: ItemsFor(player).FlaskOf(t)?.LifePerUse > 0, mana: ItemsFor(player).FlaskOf(t)?.ManaPerUse > 0,
+                utility: ItemsFor(player).UtilityFlaskOf(t) is not null, lowLife),
+            "every 3 seconds");
+    }
 
     // Cinderswallow Urn: the ignited corpses consumed since the last time (NoteCorpseConsumedLocked marks it), as a stat
     // presentation.

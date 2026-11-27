@@ -11,16 +11,21 @@ public static partial class Game
         if (clear && !player.BenchBalanceSent) return;
         IReadOnlyList<InventoryItem> snapshot = clear ? [] : Saves.Atomically(() => BenchBalance.Snapshot(PersonalStashOf(player), Items, Bench));
         byte[] packet;
+        bool added = false;
         if (!player.BenchBalanceSent)
         {
             packet = InstanceInventories.AddInventory(InstanceBench.BalanceInventoryId, InstanceBench.BalanceSlot, 0, snapshot);
             player.BenchBalanceSent = true;
+            added = true;
         }
         else
             packet = InstanceItems.InventoryChange(InstanceBench.BalanceInventoryId, ++player.BenchBalanceRevision,
                 [.. player.BenchBalanceItems.Select(i => i.Id)], snapshot);
         player.BenchBalanceItems = snapshot;
         await Send(player, packet, $"bench stash balance: {snapshot.Count} currency stack(s), {snapshot.Sum(i => (long)i.Item.StackSize)} units");
+        if (added)
+            await Send(player, InstanceInventories.InventoryPermissions(InstanceBench.BalanceInventoryId, notWritable: true, skipScans: false),
+                "0x00c2 bench stash balance read-only");
     }
 
     // A click on the guild stash (C→S 0x24): walk there, then its tab list (S→C 0x136 kind 1) and its panel (0x7b kind 2).
@@ -34,6 +39,12 @@ public static partial class Game
         Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0024 guild stash ({use}) from ({here.X}, {here.Y}): reached at ({stop.X}, {stop.Y}) in {arrive - now:0.00} s");
         if (arrive > now) await AreaDelay(player, arrive - now);
         if (!PlayerActionCurrent(player, action)) return;
+        player.StashOpen = false;
+        player.TradeStashOpen = false;
+        player.BenchOpen = false;
+        player.ModuleWindow = null;
+        player.ModuleWindowAnchor = null;
+        await RefreshBenchBalance(player, clear: true);
         player.GuildStashOpen = true;
         var guild = GuildStashOf(player);
         var tabs = guild.Records(null, player.Connection.GuildStashTabsSent, ItemsFor(player));

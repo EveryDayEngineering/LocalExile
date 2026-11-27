@@ -6,6 +6,38 @@ using static Program;
 
 static class PortalsFeature
 {
+    /// <summary>Sentinel <see cref="MapOpening.Target"/> value indicating a C→S 0x0297 Memory Line Map Device activation.</summary>
+    internal const ushort MemoryLineActivateTarget = 0xFFFF;
+
+    static PortalsFeature() => MapDevice.OpenPortalsFromDevice = OpenDeviceArea;
+
+    /// <summary>Opens a map device portal ring directly around the player's current Map Device (used by modules for
+    /// Eagon boss quests, Memory Vaults, etc.). Returns the opened run, or null when no Map Device is present.</summary>
+    internal static async Task<MapDevice.OpenMap?> OpenDeviceArea(Player player, MapDevice.MapArea area,
+        MapMods? mods = null, IReadOnlyDictionary<string, string>? contentData = null, int portalCount = MapDevice.PortalCount)
+    {
+        var device = MapDeviceHere(player);
+        if (device is null) return null;
+        bool endgameTown = player.Layout.Id == MapDevice.EndgameTownArea;
+        if (!device.Value.Campaign && !endgameTown && !OwnHideout(player)) return null;
+        var entrance = player.Layout.Near((device.Value.X, device.Value.Y));
+        var open = MapDevice.Activate(CharacterName(player), area, mods ?? MapMods.None, itemRow: 0,
+            returnTo: device.Value.Campaign || endgameTown ? new(player.Layout.Hash, player.InstanceNumber, device.Value.X, device.Value.Y) : null,
+            entrance: new(player.Layout.Hash, player.InstanceNumber, entrance.X, entrance.Y),
+            bossOption: 0, pantheonSoul: null, portalCount: portalCount, contentData: contentData);
+        IEnumerable<Player> recipients = endgameTown ? [player] : DeviceVisitors(player);
+        foreach (var visitor in recipients)
+        {
+            try
+            {
+                await RemoveMapPortals(visitor);
+                if (visitor.InstanceNumber == player.InstanceNumber && visitor.Layout.Hash == player.Layout.Hash)
+                    await SpawnMapPortals(visitor, open);
+            }
+            catch (Exception e) when (e is IOException or ObjectDisposedException) { }
+        }
+        return open;
+    }
     // What the chat says when a run can no longer be entered and its portals are closed with it: the client's own
     // BackendErrors texts (InstanceDoesNotExist, FailedToConnectToInstance).
     const string MapInstanceGone = "The instance does not exist.";
@@ -29,19 +61,19 @@ static class PortalsFeature
         var origin = MapReturnOrigin(player);
         var hideout = HomeHideout(player);
         if (origin is null && (!MapDevices.IsMapArea(player.Layout.Hash) || hideout is null)) return;
-        // The player's own portal in this instance stands instead (SpawnTownPortals): one portal per player.
-        if (MapTownPortals.TryGetValue(CharacterName(player), out var own) && own.Area == player.Layout.Hash
-            && own.Instance == player.InstanceNumber) return;
+        // Another player's or own town portal in this map instance stands instead (SpawnTownPortals): don't place an extra one at start.
+        if (ActiveMapPortal(player.Layout.Hash, player.InstanceNumber) is not null) return;
         ushort destination = origin?.Area ?? hideout!.AreaHash16;
         var (x, y) = player.Layout.Near((player.Layout.SpawnX, player.Layout.SpawnY));
         uint id = player.TakeObjectId();
-        await global::Game.ListStandingPortal(player, id, destination, "the return portal");
+        ushort? variation = global::Game.MapRunOf(player) is { PortalVariation: not 0 } run ? run.PortalVariation : null;
+        await global::Game.ListStandingPortal(player, id, destination, "the return portal", variation: variation);
         await global::Game.SendWorldCreate(player, id, () => InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(MapPortalObject.MetadataPath),
             new MapPortalObject(x, y, -1, MapPortalType, Open: 1, Rotation: player.PortalRotationRadians).Blob()),
                 $"0x02bb create the return portal 0x{id:x} at ({x}, {y})", wake: true, awaitBirth: false);
         player.ReturnPortal = (id, x, y);
         player.ReturnPortalTo = 0;
-        global::Game.ListPortal(player, id, destination, "the return portal", MapPortalEntryMs);
+        global::Game.ListPortal(player, id, destination, "the return portal", MapPortalEntryMs, variation: variation);
     }
 
     // A click on a map portal (C→S 0x24): walk there, then the portal is used up and the player goes into the open map, a new
@@ -94,21 +126,78 @@ static class PortalsFeature
         }, $"map portal to {map.Area.Name}");
     }
 
+    static OpenPortal? ActiveMapPortal(ushort area, ulong instance)
+    {
+        if (instance == 0) return null;
+        if (MapDevice.InInstance(area, instance)?.Owner is { } owner
+            && MapTownPortals.TryGetValue(owner, out var ownersPortal)
+            && ownersPortal.Area == area && ownersPortal.Instance == instance)
+            return ownersPortal;
+        return MapTownPortals.Values.FirstOrDefault(p => p.Area == area && p.Instance == instance);
+    }
+
     // Where an entry through the map device's portals arrives in an entered map: at the character's own town portal in
-    // that instance, opened before it left (a Portal Scroll's, or before a death, issue #1002), else at the map's start.
-    internal static (int X, int Y)? MapEntrySpot(string character, MapDevice.OpenMap map) =>
-        map.Instance != 0 && MapTownPortals.TryGetValue(character, out var own)
-        && own.Area == map.Area.Hash16 && own.Instance == map.Instance ? (own.X, own.Y) : null;
+    // that instance, or the map's shared active portal in that instance, else at the map's start.
+    internal static (int X, int Y)? MapEntrySpot(string character, MapDevice.OpenMap map)
+    {
+        if (map.Instance == 0) return null;
+        if (MapTownPortals.TryGetValue(character, out var own)
+            && own.Area == map.Area.Hash16 && own.Instance == map.Instance)
+            return (own.X, own.Y);
+        return ActiveMapPortal(map.Area.Hash16, map.Instance) is { } shared ? (shared.X, shared.Y) : null;
+    }
 
     // C→S 0x00d8, the map device window's Activate (21-hideouts.md §5): one map (its affixes and the scarabs/fragments)
     // or a MapDeviceRecipes set with no map. Then one item from each slot's stack is consumed, the area opens (the first
     // portal taken makes its instance) and its portals appear around the device, replacing any open before. Otherwise the chat says why.
-    internal static async Task ActivateMapDevice(Player player, (ushort Target, byte Index) activate)
+    internal static Task ActivateMapDevice(Player player, (ushort Target, byte Index) activate) =>
+        ActivateDeviceSlots(player, PlayerInventories.MapDevice, ItemsOf(player).Items(PlayerInventories.MapDevice),
+            activate.Target, activate.Index, $"0x00d8 activate the map device (target 0x{activate.Target:x4}, index {activate.Index})",
+            allowCampaign: true);
+
+    // C→S 0x0297, the map receptacle's Memory Line Activate (mode 0x5e, inventory row 94 MemoryLineMaps1).
+    internal static Task ActivateMemoryLine(Player player, byte bossOption) =>
+        ActivateDeviceSlots(player, PlayerInventories.MemoryLineMaps, ItemsOf(player).Items(PlayerInventories.MemoryLineMaps),
+            target: MemoryLineActivateTarget, bossOption, $"0x0297 activate memory line (index {bossOption})", allowCampaign: false);
+
+    sealed class ActivationConsumeAbortedException : Exception;
+
+    // C→S 0x0298, the map receptacle's Maven Invitation Activate (mode 0x56, inventory row 86 MavenInvitations, slot 0..10).
+    internal static async Task ActivateMavenInvitation(Player player, byte invitationIndex)
+    {
+        if (invitationIndex > 10)
+        {
+            Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0298 activate Maven invitation slot {invitationIndex}: out of range");
+            await Send(player, InstanceChat.ChatLine("Invalid Maven invitation slot."),
+                "0x0017 chat line \"Invalid Maven invitation slot.\"");
+            return;
+        }
+        var all = ItemsOf(player).Items(PlayerInventories.MavenInvitations);
+        var chosen = all.Where(i => i.X == invitationIndex).ToList();
+        if (chosen.Count == 0)
+        {
+            Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0298 activate Maven invitation slot {invitationIndex}: empty");
+            await Send(player, InstanceChat.ChatLine("No Maven invitation is placed in that slot."),
+                "0x0017 chat line \"No Maven invitation is placed in that slot.\"");
+            return;
+        }
+        if (chosen.Count != 1 || !MapDevice.IsMavenInvitation(chosen[0].Item.TypeHash))
+        {
+            Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0298 activate Maven invitation slot {invitationIndex}: not a Maven invitation");
+            await Send(player, InstanceChat.ChatLine("Only a Maven invitation can be activated in that slot."),
+                "0x0017 chat line \"Only a Maven invitation can be activated in that slot.\"");
+            return;
+        }
+        await ActivateDeviceSlots(player, PlayerInventories.MavenInvitations, chosen,
+            target: 0, bossOptionInput: 0, $"0x0298 activate Maven invitation slot {invitationIndex}", allowCampaign: false);
+    }
+
+    static async Task ActivateDeviceSlots(Player player,
+        byte inventoryRow, IReadOnlyList<InventoryItem> slots, ushort target, byte bossOptionInput, string logHeader, bool allowCampaign)
     {
         var device = MapDeviceHere(player);
         var items = ItemsOf(player);
-        var slots = items.Items(PlayerInventories.MapDevice);
-        Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x00d8 activate the map device (target 0x{activate.Target:x4}, index {activate.Index}): " +
+        Console.WriteLine($"[gateway] {player.Connection.Remote} <= {logHeader}: " +
             $"{string.Join(", ", slots.Select(i =>
             {
                 string name = Items.ByHash(i.Item.TypeHash)?.Name ?? $"0x{i.Item.TypeHash:x8}";
@@ -116,22 +205,31 @@ static class PortalsFeature
             }).DefaultIfEmpty("empty"))}");
         Task Tell(string text) => Send(player, InstanceChat.ChatLine(text), $"0x0017 chat line \"{text}\"");
         if (device is null) { await Tell("There is no Map Device here."); return; }
-        if (!device.Value.Campaign && !OwnHideout(player)) { await Tell("Only the hideout owner can activate this Map Device."); return; }
+        bool campaign = allowCampaign && device.Value.Campaign;
+        bool endgameTown = player.Layout.Id == MapDevice.EndgameTownArea;
+        if (!device.Value.Campaign && !endgameTown && !OwnHideout(player)) { await Tell("Only the hideout owner can activate this Map Device."); return; }
+        if (!allowCampaign && device.Value.Campaign) { await Tell("This Map Device cannot activate that mode."); return; }
         MapDevice.Slot[] checkedSlots = [.. slots.Select(i => Items.ByHash(i.Item.TypeHash) is { } t
             ? new MapDevice.Slot(i.Item.TypeHash, t.Class, t.Name, t.Row, i.Item.Mods, i.Item.Quality)
             {
                 AlternateQualityType = i.Item.AlternateQualityType, Components = t.Components,
-                Rarity = i.Item.Rarity, Corrupted = i.Item.Corrupted, BaseId = t.Id,
+                Rarity = i.Item.Rarity, Corrupted = i.Item.Corrupted, BaseId = t.Id, NameWords = i.Item.NameWords,
+                SourceItem = i.Item,
             }
-            : new MapDevice.Slot(i.Item.TypeHash, "", $"Item 0x{i.Item.TypeHash:x8}", -1, [], 0))];
-        var opening = MapDevices.Check(checkedSlots, CharacterName(player), Items.Mods, out string why, campaign: device.Value.Campaign);
-        var request = new MapOpening(player, checkedSlots, device.Value.Campaign, opening, why) { Target = activate.Target };
+            : new MapDevice.Slot(i.Item.TypeHash, "", $"Item 0x{i.Item.TypeHash:x8}", -1, [], 0) { SourceItem = i.Item })];
+        byte bossOption = !campaign && bossOptionInput is >= 1 and <= 3 ? bossOptionInput : (byte)0;
+        var opening = MapDevices.Check(checkedSlots, CharacterName(player), Items.Mods, out string why, campaign: campaign, player: player);
+        if (opening is not null && bossOption != 0)
+            opening = opening with { BossOption = global::Game.EligibleBossOption(player, opening, bossOption) };
+        var request = new MapOpening(player, checkedSlots, campaign, opening, why) { Target = target };
         GameEvents.ResolveMapOpening(request);
         opening = request.Opening;
         why = request.Reason;
         int[] consumedIndices = request.ConsumeSlots?.ToArray() ?? Enumerable.Range(0, slots.Count).ToArray();
+        bool explicitZeroConsume = request.ConsumeSlots is { Count: 0 };
         // Only an opening the check and the handlers allowed can have bad inputs; a refusal keeps its own reason.
-        if (opening is not null && (consumedIndices.Length == 0 || consumedIndices.Distinct().Count() != consumedIndices.Length
+        if (opening is not null && ((!explicitZeroConsume && consumedIndices.Length == 0)
+            || consumedIndices.Distinct().Count() != consumedIndices.Length
             || consumedIndices.Any(i => i < 0 || i >= slots.Count)))
         { opening = null; why = "The selected recipe has no valid inputs."; }
         if (opening is null)
@@ -141,35 +239,68 @@ static class PortalsFeature
             return;
         }
         var area = opening.Area;
+        byte resolvedBossOption = !campaign
+            ? global::Game.EligibleBossOption(player, opening, opening.BossOption != 0 ? opening.BossOption : bossOption)
+            : (byte)0;
         // One from each slot's stack, in one transaction: leftover stacks stay in the device (a shop scarab stack is 20).
-        var consumed = Saves.Atomically(() =>
+        if (consumedIndices.Length > 0)
         {
-            var gone = new List<uint>();
-            var left = new List<InventoryItem>();
-            foreach (int index in consumedIndices)
+            (List<uint> gone, List<InventoryItem> left) consumed;
+            try
             {
-                var slot = slots[index];
-                if (items.ConsumeOne(PlayerInventories.MapDevice, slot.Id) is not { } take) continue;
-                gone.Add(slot.Id);
-                if (take.Left is { } remain) left.Add(remain);
+                consumed = Saves.Atomically(() =>
+                {
+                    var current = items.Items(inventoryRow);
+                    foreach (int index in consumedIndices)
+                        if (!current.Any(i => i.Id == slots[index].Id))
+                            throw new ActivationConsumeAbortedException();
+                    var gone = new List<uint>();
+                    var left = new List<InventoryItem>();
+                    foreach (int index in consumedIndices)
+                    {
+                        var slot = slots[index];
+                        if (items.ConsumeOne(inventoryRow, slot.Id) is not { } take)
+                            throw new ActivationConsumeAbortedException();
+                        gone.Add(slot.Id);
+                        if (take.Left is { } remain) left.Add(remain);
+                    }
+                    return (gone, left);
+                });
             }
-            return (gone, left);
-        });
-        await Send(player, InstanceItems.InventoryChange(PlayerInventories.InventoryId(PlayerInventories.MapDevice),
-            items.NextRevision(PlayerInventories.MapDevice), consumed.gone, consumed.left),
-            $"0x00bf inventory {PlayerInventories.InventoryId(PlayerInventories.MapDevice)}: the map device consumed {consumed.gone.Count} slot(s)"
-            + (consumed.left.Count == 0 ? "" : $", {consumed.left.Count} stack(s) left"));
+            catch (ActivationConsumeAbortedException)
+            {
+                Console.WriteLine($"[gateway] {player.Connection.Remote} map device activation aborted: input slot(s) changed before consumption");
+                await Tell("The items in the Map Device changed; activation cancelled.");
+                return;
+            }
+            await Send(player, InstanceItems.InventoryChange(PlayerInventories.InventoryId(inventoryRow),
+                items.NextRevision(inventoryRow), consumed.gone, consumed.left),
+                $"0x00bf inventory {PlayerInventories.InventoryId(inventoryRow)}: the map device consumed {consumed.gone.Count} slot(s)"
+                + (consumed.left.Count == 0 ? "" : $", {consumed.left.Count} stack(s) left"));
+        }
         var entrance = player.Layout.Near((device.Value.X, device.Value.Y));
+        int portalLimit = opening.Mods.Get(Stat.MapPortalLimit);
         var open = MapDevice.Activate(CharacterName(player), area, opening.Mods, opening.ItemRow,
-            device.Value.Campaign || request.ReturnToSource ? new(player.Layout.Hash, player.InstanceNumber, device.Value.X, device.Value.Y) : null,
-            entrance: new(player.Layout.Hash, player.InstanceNumber, entrance.X, entrance.Y));
-        if (device.Value.Campaign)
+            // Back next to the device, never on it: its own cell is inside its collision hull and the player could not move.
+            campaign || endgameTown || request.ReturnToSource ? new(player.Layout.Hash, player.InstanceNumber, entrance.X, entrance.Y) : null,
+            entrance: new(player.Layout.Hash, player.InstanceNumber, entrance.X, entrance.Y), bossOption: resolvedBossOption,
+            pantheonSoul: opening.PantheonSoul, portalCount: portalLimit > 0 ? portalLimit : MapDevice.PortalCount,
+            portalVariation: opening.PortalVariation, contentData: opening.ContentData);
+        if (campaign)
             await SetQuestFlags(player, ["a7q2-DeliveredItem"]);
+        else if (!ClientHasQuestFlag(player, "MapDeviceActive"))
+            await SetQuestFlags(player, ["MapDeviceActive"]);
+        if (area.Id == "MavenHub" && player.Connection.PlayerSent)
+            await global::Game.SendWorldRecord(player, player.Id,
+                InstanceEntities.PlayerQuestFlagsUpdate(player.Id, global::Game.PlayerQuestFlags(player)),
+                "0x02bc Maven Crucible portal quest flags");
         string extra = opening.Mods.ExtraMagicPacks > 0 || opening.Mods.PacksDropCards > 0
             ? $", +{opening.Mods.ExtraMagicPacks} magic packs, {opening.Mods.PacksDropCards} pack(s) drop cards"
             : "";
-        Console.WriteLine($"[gateway] {player.Connection.Remote} map device opened {area.Name} ({area.Id}, 0x{area.Hash16:x4}, tier {area.Tier}, {opening.Mods}{extra}): {open.PortalsLeft} portals");
-        foreach (var visitor in DeviceVisitors(player))
+        string bossLabel = resolvedBossOption switch { 1 => ", boss Maven", 2 => ", boss Eater of Worlds", 3 => ", boss Searing Exarch", _ => "" };
+        Console.WriteLine($"[gateway] {player.Connection.Remote} map device opened {area.Name} ({area.Id}, 0x{area.Hash16:x4}, tier {area.Tier}, {opening.Mods}{extra}{bossLabel}): {open.PortalsLeft} portals");
+        IEnumerable<Player> recipients = endgameTown ? [player] : DeviceVisitors(player);
+        foreach (var visitor in recipients)
         {
             try
             {
@@ -184,13 +315,14 @@ static class PortalsFeature
     // A click on the portal back (C→S 0x24, the map's own or a Portal Scroll's): walk there, then to the hideout next to its
     // waypoint, or to the town the scroll's portal leads to (ReturnPortalTo), at its spawn.
     internal static async Task UseMapReturnPortal(Player player,
-        InstanceTransfer.UseSkillOnObject use, (int X, int Y) at, double requestedAt)
+        InstanceTransfer.UseSkillOnObject use, (int X, int Y) at, double requestedAt, ushort? returnToTown = null)
     {
         if (!TryBeginObjectWalk(player, requestedAt, at.X, at.Y, AreaTransitionObjectSize, out var objectWalk)) return;
         var (action, now, here, stop, arrive) = objectWalk;
         Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0024 portal back 0x{use.TargetId:x} from ({here.X}, {here.Y}): reached at ({stop.X}, {stop.Y}) in {arrive - now:0.00} s");
         if (arrive > now) await AreaDelay(player, arrive - now);
         if (!PlayerActionCurrent(player, action)) return;
+        ushort town = returnToTown ?? player.ReturnPortalTo;
         if (MapReturnOrigin(player) is { } origin)
         {
             bool gone = false;
@@ -200,10 +332,24 @@ static class PortalsFeature
             await ChangeArea(player, ReturnTransfer(origin, gone),
                 gone ? "return to the map device: its instance is gone, a new one" : "return to the map device");
         }
-        else if (player.ReturnPortalTo is ushort town and not 0)
+        else if (town != 0)
             await ChangeArea(player, new PendingTransfer(town, 0, false, AtSpawn: true), "portal to town");
         else
             await WarpToHideout(player, "map portal back");
+    }
+
+    internal static async Task UseEndgameTownMapDevice(Player player,
+        InstanceTransfer.UseSkillOnObject use, (int X, int Y) at, double requestedAt)
+    {
+        if (!TryBeginObjectWalk(player, requestedAt, at.X, at.Y, StashReach, out var objectWalk, centreRange: true)) return;
+        var (action, now, here, stop, arrive) = objectWalk;
+        Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0024 Karui Shores Map Device ({use}) from ({here.X}, {here.Y}): reached at ({stop.X}, {stop.Y}) in {arrive - now:0.00} s");
+        if (arrive > now) await AreaDelay(player, arrive - now);
+        if (!PlayerActionCurrent(player, action)) return;
+        await global::Game.DeliverCapturedSouls(player, CharacterName(player));
+        await GameEvents.RunMapDeviceOpened(player);
+        await Send(player, InstanceWaypoints.OpenUi(InstanceWaypoints.HideoutMapDeviceUi, use.TargetId),
+            "0x007b open the Karui Shores map device window", still: () => PlayerActionCurrent(player, action));
     }
 
     // A click on the map device (C→S 0x24): walk there, then S→C 0x7b kind 5 opens the map device window (21-hideouts.md §4).
@@ -216,6 +362,8 @@ static class PortalsFeature
         Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0024 {device.Name} ({use}) from ({here.X}, {here.Y}): reached at ({stop.X}, {stop.Y}) in {arrive - now:0.00} s");
         if (arrive > now) await AreaDelay(player, arrive - now);
         if (!PlayerActionCurrent(player, action)) return;
+        await global::Game.DeliverCapturedSouls(player, CharacterName(player));
+        await GameEvents.RunMapDeviceOpened(player);
         await Send(player, InstanceWaypoints.OpenUi(InstanceWaypoints.HideoutMapDeviceUi, use.TargetId),
             "0x007b open the map device window", still: () => PlayerActionCurrent(player, action));
     }
@@ -227,7 +375,7 @@ static class PortalsFeature
         InstanceMapDevice.Move request)
     {
         var items = ItemsOf(player);
-        if (ItemMoves.MoveToMapDevice(items, request.ItemId, ShapeOf) is not { } move)
+        if (ItemMoves.MoveToMapDevice(items, request.ItemId, ShapeOf, player) is not { } move)
         {
             Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x00e8 Ctrl + click item {request.ItemId} on the map device: refused (not there, wrong class or no room) ({request})");
             return;
@@ -275,29 +423,34 @@ static class PortalsFeature
     // to that cell (SpotArrivals).
     internal static async Task SpawnTownPortals(Player player)
     {
+        string self = CharacterName(player);
         // A map's own portal stands again in its instance; it has no portal back beside the hideout's device.
-        if (MapTownPortals.TryGetValue(CharacterName(player), out var inMap) && inMap.Area == player.Layout.Hash
+        if (MapTownPortals.TryGetValue(self, out var inMap) && inMap.Area == player.Layout.Hash
             && inMap.Instance == player.InstanceNumber)
         {
             await OpenTownPortal(player, inMap.X, inMap.Y, "town portal again", replace: false);
-            return;
         }
-        if (!OpenPortals.TryGetValue(CharacterName(player), out var open)) return;
-        if (open.Area == player.Layout.Hash && open.Instance == player.InstanceNumber)
+        else if (OpenPortals.TryGetValue(self, out var open))
         {
-            await OpenTownPortal(player, open.X, open.Y, "town portal again", replace: false);
-            return;
+            if (open.Area == player.Layout.Hash && open.Instance == player.InstanceNumber)
+            {
+                await OpenTownPortal(player, open.X, open.Y, "town portal again", replace: false);
+            }
+            else if (open.LeadsTo == player.Layout.Hash && !await ExpireTownPortal(player, open) && !player.Closed && !player.LeavingArea
+                && OpenPortals.TryGetValue(self, out var current) && current == open)
+            {
+                var (x, y) = TownPortalPosition(player);
+                uint id = player.TakeObjectId();
+                await global::Game.ListStandingPortal(player, id, open.Area, "the portal back");
+                if (!await global::Game.SendWorldCreate(player, id, InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(MapPortalObject.MetadataPath),
+                    new MapPortalObject(x, y, -1, MapPortalType, Open: 1).Blob()), $"0x02bb create the portal back 0x{id:x} at ({x}, {y}) to 0x{open.Area:x4}")) return;
+                await global::Game.SendWorldRecord(player, id, InstanceProtocol.EnterWakeZone(id), null);
+                player.BackPortal = (id, x, y);
+                global::Game.ListPortal(player, id, open.Area, "the portal back", MapPortalListMs);
+            }
         }
-        if (open.LeadsTo != player.Layout.Hash || await ExpireTownPortal(player, open) || player.Closed || player.LeavingArea
-            || !OpenPortals.TryGetValue(CharacterName(player), out var current) || current != open) return;
-        var (x, y) = TownPortalPosition(player);
-        uint id = player.TakeObjectId();
-        await global::Game.ListStandingPortal(player, id, open.Area, "the portal back");
-        if (!await global::Game.SendWorldCreate(player, id, InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(MapPortalObject.MetadataPath),
-            new MapPortalObject(x, y, -1, MapPortalType, Open: 1).Blob()), $"0x02bb create the portal back 0x{id:x} at ({x}, {y}) to 0x{open.Area:x4}")) return;
-        await global::Game.SendWorldRecord(player, id, InstanceProtocol.EnterWakeZone(id), null);
-        player.BackPortal = (id, x, y);
-        global::Game.ListPortal(player, id, open.Area, "the portal back", MapPortalListMs);
+        foreach (var peer in PeerOpenPortalsInArea(player.Layout.Hash, player.InstanceNumber, self))
+            await ShowPeerPortal(player, peer.Owner, peer.Portal, peer.ToHideout, replace: false);
     }
 
     // The player's spawn follows its latest entrance or waypoint arrival; the standing portal does not.
@@ -341,70 +494,183 @@ static class PortalsFeature
         var mapOrigin = MapReturnOrigin(player);
         bool toHideout = mapOrigin is not null || MapDevices.IsMapArea(here) && home is not null;
         ushort town = player.Character.LastTown != 0 ? player.Character.LastTown : AreaLayouts.LioneyesWatch;
-        // One portal per player: the old one closes (0x8f with area 0) and goes.
-        if (player.ReturnPortal is { } old)
-        {
-            await Send(player, InstanceMapDevice.Portals(0, [new(old.Id, 0)]), null);
-            await global::Game.SendWorldRemoval(player, old.Id, $"0x{InstanceProtocol.RemoveObjectId:x4} remove the old portal 0x{old.Id:x}");
-            player.ReturnPortal = null;
-            player.ReturnPortalTo = 0;
-        }
         // Beside the player, so the click that opens it is not on the player (a reopened portal stands where it stood).
         var (x, y) = !replace || player.Layout.Walkable is not { } walkable || !walkable(px + 3, py) ? (px, py) : (px + 3, py);
         uint id = player.TakeObjectId();
+        ushort variation = global::Game.PortalVariation(player, id);
         ushort leadsTo = toHideout ? mapOrigin?.Area ?? home!.AreaHash16 : town;
-        // Standing again on entry (not replace): listed before its create, so it shows idle rather than opening.
-        if (!replace) await global::Game.ListStandingPortal(player, id, leadsTo, "the town portal");
-        if (!await global::Game.SendWorldCreate(player, id, InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(MapPortalObject.MetadataPath),
-            new MapPortalObject(x, y, -1, MapPortalType, Open: 1).Blob()), $"0x02bb create the Portal Scroll's portal 0x{id:x} at ({x}, {y})")) return;
-        await global::Game.SendWorldRecord(player, id, InstanceProtocol.EnterWakeZone(id), null);
+        var previousView = Program.ViewOf.Value;
+        Program.ViewOf.Value = player;
+        try
+        {
+            // One portal per player: the old one closes (0x8f with area 0) and goes.
+            if (player.ReturnPortal is { } old)
+            {
+                await Send(player, InstanceMapDevice.Portals(0, [new(old.Id, 0)]), null);
+                await global::Game.SendWorldRemoval(player, old.Id, $"0x{InstanceProtocol.RemoveObjectId:x4} remove the old portal 0x{old.Id:x}");
+                player.ReturnPortal = null;
+                player.ReturnPortalTo = 0;
+            }
+            // Standing again on entry (not replace): listed before its create, so it shows idle rather than opening.
+            if (!replace) await global::Game.ListStandingPortal(player, id, leadsTo, "the town portal", variation: variation);
+            if (!await global::Game.SendWorldCreate(player, id, InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(MapPortalObject.MetadataPath),
+                new MapPortalObject(x, y, -1, MapPortalType, Open: 1).Blob()), $"0x02bb create the Portal Scroll's portal 0x{id:x} at ({x}, {y})")) return;
+            await global::Game.SendWorldRecord(player, id, InstanceProtocol.EnterWakeZone(id), null);
+        }
+        finally { Program.ViewOf.Value = previousView; }
         player.ReturnPortal = (id, x, y);
         player.ReturnPortalTo = toHideout ? (ushort)0 : town;
         string owner = CharacterName(player);
+        // Remove the owner's stale peer portal from viewers still in the previous (area, instance) before replacing it.
+        if (replace)
+        {
+            List<(ushort Area, ulong Instance)> staleAreas = [];
+            void CollectPrevious(OpenPortal? prev)
+            {
+                if (prev is { } p && (p.Area != here || p.Instance != player.InstanceNumber) && !staleAreas.Contains((p.Area, p.Instance)))
+                    staleAreas.Add((p.Area, p.Instance));
+            }
+            if (MapTownPortals.TryGetValue(owner, out var prevMap)) CollectPrevious(prevMap);
+            if (OpenPortals.TryGetValue(owner, out var prevOpen)) CollectPrevious(prevOpen);
+            foreach (var (oldArea, oldInstance) in staleAreas)
+                foreach (var other in InGame.Keys)
+                {
+                    if (ReferenceEquals(other, player) || other.Closed || other.LeavingArea || !other.Connection.PlayerSent
+                        || other.Layout.Hash != oldArea || other.InstanceNumber != oldInstance) continue;
+                    try { await RemovePeerPortal(other, owner); }
+                    catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+                }
+        }
         // Map return portals never create an extra entrance beside the device: re-entry spends its shared six portals, and
         // arrives at this portal (MapEntrySpot).
-        var portal = new OpenPortal(here, player.InstanceNumber, x, y, leadsTo);
+        var portal = new OpenPortal(here, player.InstanceNumber, x, y, leadsTo, variation);
         if (toHideout) { OpenPortals.TryRemove(owner, out _); MapTownPortals[owner] = portal; }
         else { MapTownPortals.TryRemove(owner, out _); OpenPortals[owner] = portal; }
         Console.WriteLine($"[gateway] {player.Connection.Remote} {why}: town portal at ({x}, {y}) of 0x{here:x4} instance {player.InstanceNumber} → 0x{leadsTo:x4}");
         // 0x8f only reaches a portal the client has finished creating (Game.ListPortal).
         global::Game.ListPortal(player, id, leadsTo,
-            $"the Portal Scroll's portal, to {(toHideout ? "the hideout" : "the last town")}", MapPortalListMs);
+            $"the Portal Scroll's portal, to {(toHideout ? "the hideout" : "the last town")}",
+            global::Game.PortalScrollListMs, global::Game.PortalScrollRelistMs, variation: variation);
+        if (replace && player.Instance is { } instance)
+        {
+            foreach (var other in instance.Presence.PlayersExcept(player.Id))
+            {
+                if (other.Closed || other.LeavingArea || !other.Connection.PlayerSent
+                    || !ReferenceEquals(other.Instance, instance)
+                    || other.Layout.Hash != here || other.InstanceNumber != player.InstanceNumber) continue;
+                try { await ShowPeerPortal(other, owner, portal, toHideout, replace: true); }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+            }
+        }
+    }
+
+    static List<(string Owner, OpenPortal Portal, bool ToHideout)> PeerOpenPortalsInArea(ushort area, ulong instance, string exclude)
+    {
+        if (instance == 0) return [];
+        var list = new List<(string Owner, OpenPortal Portal, bool ToHideout)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { exclude };
+        foreach (var kv in MapTownPortals)
+            if (kv.Value.Area == area && kv.Value.Instance == instance && seen.Add(kv.Key))
+                list.Add((kv.Key, kv.Value, true));
+        foreach (var kv in OpenPortals)
+            if (kv.Value.Area == area && kv.Value.Instance == instance && seen.Add(kv.Key))
+                list.Add((kv.Key, kv.Value, false));
+        return list;
+    }
+
+    static async Task RemovePeerPortal(Player viewer, string owner)
+    {
+        if (viewer.Closed || viewer.LeavingArea) return;
+        uint? staleId = null;
+        lock (viewer.PeerPortals)
+        {
+            foreach (var kv in viewer.PeerPortals)
+            {
+                if (!string.Equals(kv.Value.Owner, owner, StringComparison.OrdinalIgnoreCase)) continue;
+                staleId = kv.Key;
+                viewer.PeerPortals.Remove(kv.Key);
+                break;
+            }
+        }
+        if (staleId is not uint stale) return;
+        var previousView = Program.ViewOf.Value;
+        Program.ViewOf.Value = viewer;
+        try
+        {
+            await Send(viewer, InstanceMapDevice.Portals(0, [new(stale, 0)]), null);
+            await global::Game.SendWorldRemoval(viewer, stale, $"0x{InstanceProtocol.RemoveObjectId:x4} remove old peer portal 0x{stale:x}");
+        }
+        finally { Program.ViewOf.Value = previousView; }
+    }
+
+    static async Task ShowPeerPortal(Player viewer, string owner, OpenPortal portal, bool toHideout, bool replace)
+    {
+        if (viewer.Closed || viewer.LeavingArea) return;
+        uint id;
+        uint? oldId = null;
+        var entry = (owner, portal.X, portal.Y, toHideout ? (ushort)0 : portal.LeadsTo);
+        lock (viewer.PeerPortals)
+        {
+            foreach (var kv in viewer.PeerPortals)
+            {
+                if (!string.Equals(kv.Value.Owner, owner, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!replace) return;
+                oldId = kv.Key;
+                viewer.PeerPortals.Remove(kv.Key);
+                break;
+            }
+            id = viewer.TakeObjectId();
+            viewer.PeerPortals[id] = entry;
+        }
+        ushort variation = portal.Variation;
+        bool created = false;
+        var previousView = Program.ViewOf.Value;
+        Program.ViewOf.Value = viewer;
+        try
+        {
+            if (oldId is uint stale)
+            {
+                await Send(viewer, InstanceMapDevice.Portals(0, [new(stale, 0)]), null);
+                await global::Game.SendWorldRemoval(viewer, stale, $"0x{InstanceProtocol.RemoveObjectId:x4} remove old peer portal 0x{stale:x}");
+            }
+            if (!replace)
+                await global::Game.ListStandingPortal(viewer, id, portal.LeadsTo, $"{owner}'s town portal", owner, variation);
+            if (!await global::Game.SendWorldCreate(viewer, id, InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(MapPortalObject.MetadataPath),
+                new MapPortalObject(portal.X, portal.Y, -1, MapPortalType, Open: 1).Blob()),
+                $"0x02bb create {owner}'s portal 0x{id:x} at ({portal.X}, {portal.Y})")) return;
+            created = true;
+            await global::Game.SendWorldRecord(viewer, id, InstanceProtocol.EnterWakeZone(id), null);
+        }
+        finally
+        {
+            Program.ViewOf.Value = previousView;
+            if (!created)
+                lock (viewer.PeerPortals) viewer.PeerPortals.Remove(id);
+        }
+        global::Game.ListPortal(viewer, id, portal.LeadsTo,
+            $"{owner}'s portal, to {(toHideout ? "the hideout" : "the last town")}",
+            replace ? global::Game.PortalScrollListMs : global::Game.MapPortalListMs,
+            replace ? global::Game.PortalScrollRelistMs : null,
+            owner, variation);
     }
     // C→S 0x00e7: an Atlas map node picked in the hideout map device (u16 WorldAreas HASH16, u8). The layout becomes
-    // what the next generic map key opens.
+    // what the next generic map key opens; non-layout nodes (e.g. Atlas Anomalies) are remembered in module data.
     internal static async Task SelectAtlasMap(Player player, (ushort Area, byte Mode) picked)
     {
+        string? character = CharacterName(player);
         var layout = MapDevices.Atlas?.ByHash16(picked.Area);
-        if (layout is not null && CharacterName(player) is { } character)
+        if (layout is not null && character is not null)
         {
             MapDevices.Atlas!.Select(character, layout);
             CharacterSaves.SetAtlasLayout(character, layout.Id);
+            CharacterSaves.ChangeModuleData(character, "atlas.selectedTarget", _ => "");
             Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x00e7 Atlas node 0x{picked.Area:x4} selected: {layout.Name} ({layout.Id}), mode 0x{picked.Mode:x2}");
         }
-        else Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x00e7 Atlas node 0x{picked.Area:x4} (mode 0x{picked.Mode:x2}) is not a known layout");
-    }
-
-    // A hideout's placed doodads (HideoutCatalog.IsPlaced: the map device) from its decoration, with their HideoutDoodad data.
-    internal static async Task SpawnHideoutDoodads(Player player)
-    {
-        if (HideoutFurniture(player) is not { } scene) return;
-        foreach (var d in new[] { scene.Device })
+        else if (picked.Area != 0 && character is not null)
         {
-            if (HideoutCatalog.TypeOf(d.Type!) is not var (components, states) || !HideoutObject.CanSerialize(components))
-            {
-                Console.WriteLine($"[gateway] {player.Connection.Remote} hideout doodad {d.Name} ({d.Type}): unknown type or unsupported components, not created");
-                continue;
-            }
-            uint id = player.TakeObjectId();
-            // "active" 1: the map device stands open and idle (its .ot: per-player quest flag MapDeviceActive).
-            var obj = new HideoutObject(d.X, d.Y, d.Rotation, components, new HideoutDoodad(d.Hash, (byte)d.Variation),
-                [.. states.Select(s => s == "active" ? 1 : 0)]);
-            await global::Game.SendWorldCreate(player, id, InstanceEntities.CreateObject(id, InstanceEntities.ObjectTypeHash(d.Type!), obj.Blob()),
-                $"0x02bb create hideout doodad 0x{id:x} {d.Name} ({d.Type}) at ({d.X}, {d.Y}), components {string.Join(", ", components)}");
-            await global::Game.SendWorldRecord(player, id, InstanceProtocol.EnterWakeZone(id), $"0x01a9 hideout doodad 0x{id:x} enters wake zone");
-            lock (player.HideoutDoodads) player.HideoutDoodads[id] = d;
-            await RegisterStationaryCollision(player, id, d.Type!, d.X, d.Y, d.Rotation, "map-device", d.Model);
+            CharacterSaves.ChangeModuleData(character, "atlas.selectedTarget", _ => picked.Area.ToString());
+            Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x00e7 Atlas special target 0x{picked.Area:x4} selected, mode 0x{picked.Mode:x2}");
         }
+        else Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x00e7 Atlas node 0x{picked.Area:x4} (mode 0x{picked.Mode:x2}) is not a known layout");
     }
 }

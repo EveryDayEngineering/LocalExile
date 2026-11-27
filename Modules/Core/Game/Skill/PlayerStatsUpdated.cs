@@ -9,24 +9,29 @@ public static partial class Game
         int Get(uint key) => stats.GetValueOrDefault(key);
         PresentStats(player);
         RecoveryRatesChanged(player);
+        double now = AreaTime(player);
+        FortificationOf(player).SetExpiryRate(now, RecipientEffectTime.Rate(1, Get));
+        player.UtilityFlaskEffects.SetExpiryRate(now, RecipientEffectTime.Rate(16, Get));
+        player.EnergyShield.SetRechargeProtection(Get(Stat.KeystoneWickedWard) != 0 ? RecentlySeconds : 0);
         // A periodic charge gain's stat may have come (ChargeSession.Observe): the charges ticker runs while it has work.
         WakeCharges(player);
         WakeFootsteps(player);
         // What the pools are built of (Adrenaline, Fortification, the aspects and aura reservations, conditional items):
         // a change rebuilds them, and the steps that read the pools run in the next phase.
         EnsureConditionalItemPools(player);
-        EnsureAntiquarianPools(player);
+        EnsureWardBreakPools(player);
         EnsureOwnAuraPools(player);
         EnsureFortificationPools(player);
         ConfigureFortificationRecovery(player, player.Pools.Life, Get);
         ConfigureLeech(player, Get, CriticalOnLowLife(player, stats));
         ConfigureKillOnslaught(player, Get);
         ConfigureSoulEater(player, stats);
-        ObserveAntiquarian(player, stats);
+        ObserveWardBreak(player, stats);
         ReconcileRampageSource(player, stats);
         if (player.RageRetired || player.PlayerLife == 0) player.Rage.Clear();
         if (player.ResourceEffectsState is ResourceEffectsState state && ResourceEffectsCurrent(player, state))
-            state.Mana.Observe(RageStat(stats, ManaRecoveryRules.RagePer200));
+            state.Mana.Observe(RageStat(stats, ManaRecoveryRules.RagePer200),
+                Get(Stat.GainXFrenzyChargesAfterSpending200Mana), Get(Stat.LocalDisplayGainPowerChargeOnSpendingMana) > 0 ? 1 : 0);
         // A new immunity removes the ailments it rejects; the stats that read them follow.
         var ailments = player.ElementalAilments.Snapshot(AreaTime(player));
         player.ElementalAilments.Reconcile(Get);

@@ -13,6 +13,23 @@ using static Program;
 /// </summary>
 public static partial class MapStrongboxes
 {
+    /// <summary>How long each daemon lives, in frames (1/30 s) after the click: the middle of the lifetimes recorded in the
+    /// official game (the plain summoning daemon 31 to 106 frames over 10 boxes; the others 1 to 3 boxes each). The
+    /// daemons the recordings never show live as the plain one does.</summary>
+    static readonly Dictionary<string, int> DaemonFrames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["ChestDaemonSummonNormal"] = 45, ["ChestDaemonFreeze"] = 4, ["ChestDaemonReviveAllWithOnslaught"] = 21,
+        ["ChestDaemonExplode"] = 59, ["ChestDaemonDetonateDead"] = 78, ["ChestDaemonSummonSkeletons"] = 35,
+        ["ChestDaemonSummonMagic"] = 141, ["ChestDaemonSummonRare"] = 67, ["ChestDaemonSummonExile"] = 68,
+        ["ChestDaemonFirestorm"] = 99, ["ChestDaemonRandomCurse"] = 16, ["ChestDaemonPoison"] = 77, ["WeylamsWarchest"] = 305,
+    };
+
+    /// <summary>The frame after the click at which a box's items drop: one frame after its last daemon is gone (10 of 10
+    /// recorded drops), the daemons being the box's mods' MonsterMetadata.</summary>
+    public static int DropFrames(IEnumerable<string> daemons) =>
+        1 + daemons.Select(d => DaemonFrames.GetValueOrDefault(d[(d.LastIndexOf('/') + 1)..], DaemonFrames["ChestDaemonSummonNormal"]))
+            .DefaultIfEmpty(DaemonFrames["ChestDaemonSummonNormal"]).Max();
+
     /// <summary>A wave of guards that arrives at <paramref name="AtTicks"/> (UTC ticks).</summary>
     public sealed record Wave(long AtTicks, List<AreaPopulation.Spawn> Spawns);
 
@@ -119,7 +136,7 @@ public static partial class MapStrongboxes
                 .Select(r => r.IntOrNull("MonsterVarietiesKey") ?? -1);
         // Rallying's stream: the area's own monsters.
         else if (skill == "ChestSummonMonstersContinuous")
-            rows = (Packs.For(player.Layout.Id)?.Scattered ?? []).SelectMany(p => p.Pack.Entries).Select(e => e.Variety);
+            rows = (InstancePacks(player)?.Scattered ?? []).SelectMany(p => p.Pack.Entries).Select(e => e.Variety);
         else return [];
         return [.. rows.Distinct().Where(r => r >= 0 && Monsters.Find(r.ToString()) is { Supported: true })];
     }

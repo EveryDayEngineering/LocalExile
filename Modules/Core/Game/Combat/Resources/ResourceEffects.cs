@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using GameServer.Core.World;
 using GameServer.Modding;
 
 /// <summary>Rule-owned resources, separate from the animated-actor runtime and its worker.</summary>
@@ -9,6 +10,8 @@ public sealed class ResourceEffectsState(IModuleLifetime? rules, IModuleLifetime
     public long Generation;
     public readonly ManaRecoupState Mana = new();
     public readonly TimedBlind PlayerBlind = new();
+    internal FlameTouchedState? FlameTouched;
+    internal double MinionLifeLossCarry, MinionShieldLossCarry;
     public readonly Dictionary<uint, (SpawnedMonster Target, TimedBlind Blind)> Targets = [];
     readonly HashSet<(uint Actor, ushort Buff)> retired = [];
     public sealed record Snapshot(ManaRecoupState.Carried Mana, (double Seconds, int Less)[] Blind,
@@ -80,10 +83,12 @@ public sealed class ResourceEffectsState(IModuleLifetime? rules, IModuleLifetime
     }
     public void Clear()
     {
+        MinionLifeLossCarry = MinionShieldLossCarry = 0;
         if (player is not null)
         {
             Game.RetireAvatarOfFire(player);
             Game.RetireHerEmbrace(player);
+            Game.RetireFlameTouched(player, this);
             Game.RetireRecentHitLifeLoss(player);
             Game.RetireElusive(player);
             if (Game.ChargeSessions.TryGetValue(player, out var charges)) charges.Degeneration.Clear(Game.ResourceEffectsTime(player));
@@ -136,11 +141,16 @@ public static partial class Game
     {
         if (amount == 0 || player.LeavingArea || player.PlayerLife == 0 || !CurrentGameRules) return;
         player.RecentEvents.RecordAmount(StatConditions.SpentMana, ResourceEffectsTime(player), amount);
+        SigilManaSpent(player, amount, AreaTime(player));
         var state = ResourceEffectsOf(player);
         if (!ResourceEffectsCurrent(player, state)) return;
         int Get(uint key) => playerStats.GetValueOrDefault(key);
         long gain = state.Mana.Spent(amount, Get(ManaRecoveryRules.RagePer200));
-        if (gain > 0) player.Rage.Gain(gain, ResourceEffectsTime(player), RageStats.Inputs(Get), Get(Stat.HasSoulGainPrevention) != 0);
+        if (gain > 0) player.Rage.Gain(gain, ResourceEffectsTime(player), RageStats.Inputs(player, Get), Get(Stat.HasSoulGainPrevention) != 0);
+        var (frenzy, power) = state.Mana.SpentForCharges(amount, Get(Stat.GainXFrenzyChargesAfterSpending200Mana),
+            Get(Stat.LocalDisplayGainPowerChargeOnSpendingMana) > 0 ? 1 : 0);
+        if (frenzy > 0) ChargesOf(player).Enqueue(new ChargeEvent.Grant(ChargeType.Frenzy, frenzy, "mana spent"));
+        if (power > 0) ChargesOf(player).Enqueue(new ChargeEvent.Grant(ChargeType.Power, power, "mana spent"));
     }
     public static void SettleFullManaLocked(Player player, double at)
     {
@@ -148,6 +158,51 @@ public static partial class Game
             && player.PlayerMana >= UnreservedMana(player))
         { state.Mana.Take(at); state.Mana.DiscardRecoveryFraction(); }
     }
+    static void RecordUsedSkillLocked(Player player, double now, int effect = -1, bool activated = true)
+    {
+        if (MapSkillActionSpeedPerUse(player) != 0)
+        {
+            player.RecentEvents.RecordAmount(StatConditions.UsedSkill, now);
+            if (!player.Connection.LockstepClient || !player.Frames.Running)
+            {
+                player.ApplyMovementSpeedAt(now);
+                if (player.Frames is { Running: true, Area: { } area })
+                    AfterSeconds(player, RecentEvents.WindowSeconds, () =>
+                    {
+                        if (!player.LeavingArea && ReferenceEquals(player.Frames.Area, area))
+                            player.ApplyMovementSpeedAt(AreaTime(player));
+                    });
+            }
+        }
+        else player.RecentEvents.Record(StatConditions.UsedSkill, now);
+        var raw = StatSourceValues(player);
+        if (activated && effect >= 0) BlindOnElementalSkillUseLocked(player, effect, now, raw);
+        ApplySiphoningSkillUseLocked(player, now, raw);
+        int loss = activated ? raw.GetValueOrDefault(Stat.LoseXManaWhenYouUseSkill) : 0;
+        if (loss > 0 && player.PlayerMana != 0)
+        {
+            uint before = player.PlayerMana, maximum = player.Pools.Mana;
+            uint after = before - Math.Min(before, (uint)loss);
+            player.PlayerMana = after;
+            if (maximum > 0 && (before >= maximum && after < maximum
+                || (long)before * 2 > maximum && (long)after * 2 <= maximum))
+            {
+                EnsureConditionalItemPools(player);
+                player.AuraStatsDirty = true;
+            }
+            player.Frames.Area?.Life.Resend(player);
+        }
+        int chance = raw.GetValueOrDefault(Stat.Recover10PctOfMaximumManaOnSkillUsePct);
+        if (raw.GetValueOrDefault(Stat.Recover10PctManaOnSkillUsePctChanceWhileAffectedByClarity) is int clarity and not 0
+            && AffectingAuras(player).Any(a => a.AffectsSelf && a.EffectId == "Clarity"))
+            chance = ActorScale.Saturate((long)chance + clarity);
+        if (chance <= 0) return;
+
+        uint cap = (uint)UnreservedMana(player);
+        if (player.PlayerMana < cap && RandomRolls.Chance(chance, 100, AreaRng(player)))
+            player.PlayerMana = (uint)Math.Min(cap, (ulong)player.PlayerMana + (ulong)player.Pools.Mana / 10);
+    }
+
     public static void DiscardResourceLoadingRecovery(Player player, double now)
     {
         if (player.ResourceEffectsState is ResourceEffectsState state && ResourceEffectsCurrent(player, state))
@@ -156,21 +211,62 @@ public static partial class Game
     public static bool CompleteResourceRecoveryLocked(Player player, double from, double now,
         IReadOnlyDictionary<uint, int> stats, double earnedMana, uint manaBefore, uint manaCap, ref double manaCarry)
     {
+        if (player.WitchbaneImmunityUntil is > 0 and var expiry && now >= expiry)
+        {
+            player.WitchbaneImmunityUntil = 0;
+            if (HasMapHexes(MapModsOf(player))) RecomputePoolsAndSpeed(player);
+            MarkPlayerStats(player, PlayerStatStep.SelfVulnerability);
+        }
         AdvancePlayerAilmentsLocked(player, from, now, stats);
         if (player.PlayerLife > 0) AdvanceSiphoningDamageLocked(player, now, stats);
         if (player.PlayerLife > 0) AdvanceHerEmbraceDamageLocked(player, now, stats);
+        if (player.PlayerLife > 0) AdvanceFlameTouchedDamage(player, now, stats);
+        if (player.PlayerLife > 0) AdvanceUtilityFlaskChaosDamageLocked(player, now, stats);
         if (player.PlayerLife > 0) AdvanceChargeDegenerationLocked(player, now, stats);
         if (player.PlayerLife > 0) AdvanceRecentHitLifeLossLocked(player, now);
+        if (player.PlayerLife > 0) AdvanceMinionPoolLossLocked(player, from, now, stats);
         if (player.PlayerLife == 0)
         {
             manaCarry = 0; LeechOf(player).Clear(now); FortificationOf(player).Clear();
-            player.EnergyShield.Empty(); ClearAntiquarianOnDeath(player); return false;
+            player.EnergyShield.Empty(); ClearWardBreakOnDeath(player); return false;
         }
         var state = ResourceEffectsOf(player);
         double recoup = ResourceEffectsCurrent(player, state) ? state.Mana.Take(now) : 0;
-        player.PlayerMana = RecoveryPool.Advance(manaBefore, manaCap, earnedMana + recoup, ref manaCarry);
+        // Advance from live PlayerMana so Chaos DoT Mana-before-Life drain applied above is preserved.
+        player.PlayerMana = RecoveryPool.Advance(player.PlayerMana, manaCap, earnedMana + recoup, ref manaCarry);
         if (player.PlayerMana >= manaCap && ResourceEffectsCurrent(player, state)) state.Mana.DiscardRecoveryFraction();
         return true;
+    }
+
+    static void AdvanceMinionPoolLossLocked(Player player, double from, double now, IReadOnlyDictionary<uint, int> stats)
+    {
+        int shieldRate = Math.Max(0, stats.GetValueOrDefault(Stat.LifeAndEnergyShieldDegenerationPermyriadPerMinutePerMinion));
+        long lifeRate = shieldRate + (long)Math.Max(0, stats.GetValueOrDefault(Stat.LifeDegenerationPermyriadPerMinutePerMinion));
+        if (lifeRate == 0)
+        {
+            if (player.ResourceEffectsState is ResourceEffectsState inactive)
+                inactive.MinionLifeLossCarry = inactive.MinionShieldLossCarry = 0;
+            return;
+        }
+        if (now <= from || InTown(player) || player.Immune || stats.GetValueOrDefault(Stat.BaseCannotBeDamaged) > 0
+            || HardcoreProgressBlocked(player) || InGracePeriod(player)) return;
+        var state = ResourceEffectsOf(player);
+        if (!ResourceEffectsCurrent(player, state)) return;
+        int count = player.Minions.All.Count(minion => minion.Until > now && !minion.Monster.Dead && minion.Monster.Life > 0
+            && ReferenceEquals(player.Area.Monsters.GetValueOrDefault(minion.Id), minion.Monster));
+        if (count == 0)
+        {
+            state.MinionLifeLossCarry = state.MinionShieldLossCarry = 0;
+            return;
+        }
+        double time = (now - from) * count / 600_000;
+        uint life = RecoveryPool.Advance(player.PlayerLife, player.PlayerMaxLife,
+            -time * lifeRate * player.PlayerMaxLife, ref state.MinionLifeLossCarry);
+        player.PlayerLife = VaalImmortalCallLife(player, life, now);
+        player.EnergyShield.Lose(time * shieldRate * player.EnergyShield.Maximum, ref state.MinionShieldLossCarry);
+        if (player.PlayerLife != 0) return;
+        player.InvalidateIncomingHits();
+        RecordHardcoreDeath(player);
     }
 
     sealed record ResourceTransfer(string Character, DateTime At, IModuleLifetime Rules, IModuleLifetime? Source,

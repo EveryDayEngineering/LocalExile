@@ -23,65 +23,69 @@ public static partial class Game
         foreach (uint key in VaalSoulCost.Inputs) stats[key] = VaalSoulInput(player, playerStats, own, key);
     }
 
+    readonly record struct VaalSourceInputs(PlayerInventories Items, long ItemChanges, LeagueRuntime League, int Class,
+        (int Level, int Strength, int Dexterity, int Intelligence) Attributes,
+        bool Alive, bool God, List<ushort> Passives, int PassivesCount,
+        AscendancyProgress Ascendancy, int DescendancyCount, int ClusterCount, int TattooRevision,
+        IReadOnlyDictionary<ushort, ushort> Masteries, long ExecutableRevision, long ExemptionsRevision);
+
     sealed class VaalRefreshCache
     {
-        public long EquipmentMutations = -1;
-        public int PassivesCount = -1;
-        public int AscendancyCount = -1;
-        public int Level = -1;
-        public bool Alive;
-        public bool HasVaalSources;
-        public bool HardMode;
-        public bool God;
+        public VaalSourceInputs? Inputs;
+        public IReadOnlyDictionary<uint, int>? FrameStats;
+        public bool HasCandidates;
     }
 
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Player, VaalRefreshCache> VaalRefreshCaches = new();
 
     // Reconcile before an await as well as at the send gate: a queued removal must lose its balance even if readded
     // before publication. Requirements/inactive equipment are refreshed by the normal character stat seam.
-    public static void RefreshVaalSouls(Player player)
+    public static void RefreshVaalSouls(Player player) => RefreshVaalSouls(player, onlyWhenChanged: false);
+
+    static void RefreshVaalSouls(Player player, bool onlyWhenChanged)
     {
         if (player.VaalSoulsRetired || player.Closed) return;
         var items = ItemsOf(player);
-        long mutations = items.Mutations;
-        int passivesCount = player.Character.Passives.Count;
-        int ascCount = player.Character.MainAscendancy.Allocated.Count;
-        int level = player.Pools.Level;
-        bool alive = player.PlayerLife > 0;
-        bool hardMode = LeagueFor(player).HardMode;
-        bool god = player.God;
+        var character = player.Character;
+        var league = LeagueFor(player);
+        var stats = FrameStatsOf.TryGetValue(player, out var frame) && frame.ByFrame ? frame.Graph?.Values : null;
+        // Gem experience beneath a level boundary is unsaved and does not change its soul source.
+        // The gem level-up path refreshes immediately when an unsaved change crosses that boundary.
+        var pools = player.Pools;
+        var inputs = new VaalSourceInputs(items, items.Changes, league, character.ClassRow,
+            (pools.Level, pools.Strength, pools.Dexterity, pools.Intelligence), player.PlayerLife > 0, player.God,
+            character.Passives, character.Passives.Count, character.MainAscendancy,
+            character.DescendancyNodes.Count, character.ClusterPassives.Count, character.TattooRevision,
+            character.MasteryEffects, GameEvents.GrantedSkillExecutable.Revision, GameEvents.RequirementExemptions.Revision);
         var cache = VaalRefreshCaches.GetOrCreateValue(player);
-        if (!cache.HasVaalSources && cache.EquipmentMutations == mutations && cache.PassivesCount == passivesCount
-            && cache.AscendancyCount == ascCount && cache.Level == level && cache.Alive == alive
-            && cache.HardMode == hardMode && cache.God == god && player.VaalSouls.Read().Length == 0)
-            return;
+        if (cache.Inputs == inputs && (!cache.HasCandidates && !player.VaalSouls.HasSources
+            || onlyWhenChanged && ReferenceEquals(cache.FrameStats, stats))) return;
         var playerStats = CharacterPlayerStats(player);
         var requirements = CurrentGemRequirements(player);
+        var skills = SkillsFor(player);
         var sources = new List<(uint, uint)>();
-        foreach (var gem in GemSkillEffectsAt(player.Character.Name, requirements.Equipment, requirements.Inactive, LeagueFor(player),
+        bool hasCandidates = false;
+        foreach (var gem in PlayerSkillSourcesAt(character.Name, requirements.Equipment, requirements.Inactive, league,
             GrantedSkillsOf(player), WornGrantedSkillsOf(player, requirements.Equipment)))
         {
-            if (SkillsFor(player).VaalBudget(gem.Effect, gem.Level) is null) continue;
+            if (skills.VaalBudget(gem.Effect, gem.Level) is null) continue;
+            hasCandidates = true;
+            if (!gem.Active) continue;
             var supported = SupportedSkillAt(player, gem.Id, requirements);
-            if (!supported.RequirementsMet || SkillsFor(player).VaalBudget(gem.Effect, supported.Level) is not { } definition) continue;
+            if (!supported.RequirementsMet || skills.VaalBudget(gem.Effect, supported.Level) is not { } definition) continue;
             var own = supported.Stats;
             int required = VaalSoulCost.Required(definition.BaseCost,
                 name => VaalSoulInput(player, playerStats, own, name));
-            if (SkillsFor(player).IsAttack(gem.Effect)
+            if (skills.IsAttack(gem.Effect)
                 && VaalSoulInput(player, playerStats, own, Stat.VaalAttackRageCostInsteadOfSoulsPerUse) != 0)
                 required = 0;
             sources.Add((definition.ActiveSkillsRow, VaalSoulCost.Capacity(required, definition.StoredUses)));
         }
         player.VaalSouls.Reconcile(sources);
         if (player.PlayerLife == 0) player.VaalSouls.ClearBalance();
-        cache.EquipmentMutations = mutations;
-        cache.PassivesCount = passivesCount;
-        cache.AscendancyCount = ascCount;
-        cache.Level = level;
-        cache.Alive = alive;
-        cache.HardMode = hardMode;
-        cache.God = god;
-        cache.HasVaalSources = sources.Count > 0;
+        cache.Inputs = inputs;
+        cache.FrameStats = stats;
+        cache.HasCandidates = hasCandidates;
     }
 
     // Called with Life=0/Dead=true in the SAME Monsters section as the lethal mutation, before notification awaits.
@@ -89,13 +93,17 @@ public static partial class Game
     public static void CollectVaalSoulAtDeathLocked(Player player, SpawnedMonster monster)
     {
         if (monster.Life != 0 || !monster.Dead || monster.SoulKillProcessed) return;
-        RefreshVaalSouls(player);
-        if (player.VaalSouls.Read().Length == 0)
+        RefreshVaalSouls(player, onlyWhenChanged: true);
+        if (!player.VaalSouls.CanGain)
         {
             monster.SoulKillProcessed = true;
             return;
         }
-        CollectVaalSoulOnKill(player, player.Area.Monsters.FirstOrDefault(kv => ReferenceEquals(kv.Value, monster)).Key, monster);
+        var monsters = player.Area.Monsters;
+        uint id = monster.ObjectId;
+        if (!monsters.TryGetValue(id, out var found) || !ReferenceEquals(found, monster))
+            id = monsters.FirstOrDefault(kv => ReferenceEquals(kv.Value, monster)).Key;
+        CollectVaalSoulOnKill(player, id, monster);
     }
 
     // Consume ineligible deaths too. Notifications may only publish current state; they never call this method.
@@ -115,20 +123,46 @@ public static partial class Game
         // (WithVaalPrevention publishes has_soul_gain_prevention from it). Vaal Immortal Call holds soul gain for
         // its duration (the buff's cannot_gain_souls); its state is a cheap table read, not a stat build.
         bool held = VaalImmortalCallActive(player, now);
-        bool prevented = player.VaalPreventionUntil > VaalResourceTime(player)
-            || CharacterPlayerStats(player).GetValueOrDefault(Stat.HasSoulGainPrevention) != 0;
-        if (prevented || held)
+        var stats = held || player.VaalPreventionUntil > VaalResourceTime(player) ? null : CharacterPlayerStats(player);
+        if (stats is null || stats.GetValueOrDefault(Stat.HasSoulGainPrevention) != 0)
         {
             Console.WriteLine($"[gateway] Vaal soul not gained from monster 0x{id:x}: " +
                 $"{(held ? "Vaal Immortal Call" : "soul gain prevention")} (t={VaalResourceTime(player):0.000})");
             return false;
         }
         if (!player.VaalSouls.Gain()) return false;
-        // "Kills grant an additional Vaal Soul if you have Rampaged Recently": only a streak needs the stat read.
+        // These are two separate sources of additional souls on an eligible kill.
+        if (stats.GetValueOrDefault(Stat.ChanceToGainVaalSoulOnKillPct) is int chance and > 0
+            && GameServer.Core.World.RandomRolls.Chance(chance, 100, AreaRng(player)))
+            player.VaalSouls.Gain();
         if (player.Rampage.Current.Active
-            && CharacterPlayerStats(player).GetValueOrDefault(Stat.GainAnAdditionalVaalSoulOnKillIfHaveRampagedRecently) != 0)
+            && stats.GetValueOrDefault(Stat.GainAnAdditionalVaalSoulOnKillIfHaveRampagedRecently) != 0)
             player.VaalSouls.Gain();
         return true;
+    }
+
+    sealed class HitSoulCooldown { public double NextAt = double.NegativeInfinity; }
+    static readonly RuleTable<Player, HitSoulCooldown> HitSoulCooldowns = new();
+
+    static void HarvestVaalSoulOnHitLocked(Player player, int intervalMs, double now,
+        IReadOnlyDictionary<uint, int> playerStats)
+    {
+        if (player.Closed || player.LeavingArea || player.VaalSoulsRetired || player.Paused || player.PlayerLife == 0
+            || InTown(player) || player.VaalPreventionUntil > VaalResourceTime(player)
+            || VaalImmortalCallActive(player, now) || playerStats.GetValueOrDefault(Stat.HasSoulGainPrevention) != 0
+            || playerStats.GetValueOrDefault(Stat.PreventVaalSoulsOnHit) != 0) return;
+
+        var cooldown = HitSoulCooldowns.GetOrCreateValue(player);
+        if (now < cooldown.NextAt || !player.VaalSouls.Gain()) return;
+        cooldown.NextAt = now + intervalMs / 1000.0;
+        QueueVaalSoulPresentationLocked(player, "Vaal souls from a supported attack");
+    }
+
+    static void QueueVaalSoulPresentationLocked(Player player, string label)
+    {
+        var queue = player.Minions.OutputQueue;
+        if (!queue.Any(o => o.Kind == PlayerMinions.OutputKind.Vaal))
+            queue.Add(new([], label, Kind: PlayerMinions.OutputKind.Vaal));
     }
 
     // Native UPDATE clamps against OLD capacity. Unknown rows and increases must seed first, then restore current.
@@ -155,10 +189,14 @@ public static partial class Game
     }
 
     public static byte[] PlayerSkillsWithVaalSouls(Player player, IReadOnlyList<GrantedSkill> skills,
+        IReadOnlyList<ushort> gone) =>
+        [.. PlayerSkillsBatchesWithVaalSouls(player, skills, gone).SelectMany(p => p)];
+
+    public static byte[][] PlayerSkillsBatchesWithVaalSouls(Player player, IReadOnlyList<GrantedSkill> skills,
         IReadOnlyList<ushort> gone)
     {
         var changes = VaalSoulChanges(player);
-        return InstanceEntities.PlayerSkillsChange(player.Id, skills, gone, changes.Seeds, changes.Updates, CanDetonateMines(player));
+        return InstanceEntities.PlayerSkillsChangeBatches(player.Id, skills, gone, changes.Seeds, changes.Updates, CanDetonateMines(player));
     }
 
     public static byte[]? VaalSoulPresentation(Player player)

@@ -56,6 +56,25 @@ public static class ItemMoves
     });
 
     /// <summary>
+    /// One oil from a blight tab stack into the first free input cell beside the anoint cell (Ctrl + click, C→S 0xf5, while
+    /// the anoint cell holds an item: <see cref="AccountStash.AnointInputFor"/>), with a new id.
+    /// Null (nothing changes) when the inputs don't apply; <paramref name="full"/> when they apply but are all taken.
+    /// </summary>
+    public static Transfer? StashToAnointInput(AccountStash stash, int tab, uint itemId,
+        Func<Item, PlayerInventories.Shape?> shapeOf, out bool full)
+    {
+        bool isFull = false;
+        var result = Saves.Atomically(() =>
+        {
+            if (stash.MoveToAnointInput(tab, itemId, shapeOf, out isFull) is not var (placed, left)) return null;
+            stash.SetLastTab(tab);
+            return new Transfer(Main, 0, null, tab, [], [placed], [], [], itemId, left);
+        });
+        full = isFull;
+        return result;
+    }
+
+    /// <summary>
     /// An item out of whichever inventory holds it into a stash tab (Ctrl + click: C→S 0xe0 into the shown tab, 0xe1 into
     /// the tab of its affinity): a stack onto the tab's stacks of its type first, then into free cells (a slotted tab: its
     /// own slot), and what doesn't fit stays in the inventory; any other item into the first free cell (or its slot) with a
@@ -70,6 +89,8 @@ public static class ItemMoves
             if (tab < 0 || tab >= stash.Count) { reason = "no such tab"; return null; }
             if (items.RowOf(itemId) is not byte from || items.Items(from).FirstOrDefault(i => i.Id == itemId) is not { } item)
             { reason = "the item is not in the inventories"; return null; }
+            if (from == PlayerInventories.MercenaryTemporary) { reason = "temporary mercenary gear is locked"; return null; }
+            if (item.Item.MercenaryLocked) { reason = "locked mercenary gear cannot be removed"; return null; }
             if (shapeOf(item.Item) is not { } shape) { reason = "unknown item type"; return null; }
             tab = stash.UniqueDestination(tab, item.Item);
             if (tab < 0) { reason = "the item has no collection slot"; return null; }
@@ -96,36 +117,181 @@ public static class ItemMoves
         return result;
     }
 
+    /// <summary>
+    /// Lists an item from <paramref name="sourceRow"/> into a shown merchant <paramref name="tab"/> with
+    /// <paramref name="note"/> in one transaction (C→S 0x01a2): the source inventory item is never mutated on refusal,
+    /// and any unmoved stack remainder keeps its original note.
+    /// </summary>
+    public static Transfer? ListInMerchantTab(AccountStash stash, PlayerInventories items, int tab, byte sourceRow,
+        uint itemId, string? note, Func<Item, PlayerInventories.Shape?> shapeOf, out string why)
+    {
+        string? normalized = string.IsNullOrWhiteSpace(note) ? null : note.Trim();
+        if (normalized is { Length: > 250 }) normalized = normalized[..250];
+        string reason = "";
+        var result = Saves.Atomically(() =>
+        {
+            if (!stash.IsShownTab(tab) || stash.TabType(tab) != StashRules.Trade)
+            { reason = "no merchant tab"; return null; }
+            if (items.RowOf(itemId) != sourceRow || items.Items(sourceRow).FirstOrDefault(i => i.Id == itemId) is not { } item)
+            { reason = "not in the inventory"; return null; }
+            if (sourceRow == PlayerInventories.MercenaryTemporary) { reason = "temporary mercenary gear is locked"; return null; }
+            if (item.Item.MercenaryLocked) { reason = "locked mercenary gear cannot be removed"; return null; }
+            if (shapeOf(item.Item) is not { } shape) { reason = "unknown item type"; return null; }
+            if (!stash.Holds(tab, item.Item)) { reason = $"the {stash.TypeOf(tab)} tab doesn't hold that item"; return null; }
+            var listed = item.Item with { Note = normalized };
+            if (shape.MaxStack > 1 || listed.Components.Contains("Stack"))
+            {
+                if (stash.AddStacked(tab, listed, shapeOf, out reason) is not { } stacked) return null;
+                if (stacked.Left == listed.StackSize) { reason = "the tab is full"; return null; }
+                var left = stacked.Left == 0 ? null : items.SetStackSize(sourceRow, itemId, stacked.Left);
+                if (stacked.Left == 0) items.Remove(sourceRow, itemId);
+                stash.SetLastTab(tab);
+                return new Transfer(sourceRow, itemId, left, tab, stacked.Changed, stacked.Added, [], []);
+            }
+            if (stash.CellFor(tab, listed, shapeOf) is not { } cell) { reason = "the tab is full"; return null; }
+            var removed = items.Remove(sourceRow, itemId)!;
+            if (stash.Place(tab, cell.X, cell.Y, removed with { Item = listed }, shapeOf, out reason) is not var (placed, _))
+                throw new InvalidOperationException($"stash tab {tab} refused item {itemId} at its free cell: {reason}");
+            stash.SetLastTab(tab);
+            return new Transfer(sourceRow, itemId, null, tab, [], [placed], [], []);
+        });
+        why = result is null && reason == "" ? "refused" : reason;
+        return result;
+    }
+
+    /// <summary>
+    /// Quick-places the cursor item into a specialty/Unique/Map stash tab (C→S 0x00e2): routes Unique and Map tabs to
+    /// their destination child page, merges stackable items onto existing stacks first, or places non-stackables in the
+    /// first matching free cell. Null with reason when refused (nothing changes).
+    /// </summary>
+    public static Transfer? HeldQuickToStash(AccountStash stash, PlayerInventories items, int tab, uint itemId,
+        Func<Item, PlayerInventories.Shape?> shapeOf, out string why)
+    {
+        string reason = "";
+        var result = Saves.Atomically(() =>
+        {
+            if (tab < 0 || tab >= stash.Count) { reason = "no such tab"; return null; }
+            if (items.Items(Cursor) is not [var held, ..]) { reason = "nothing held"; return null; }
+            if (itemId != 0 && held.Id != itemId) { reason = "cursor item mismatch"; return null; }
+            if (shapeOf(held.Item) is not { } shape) { reason = "unknown item type"; return null; }
+            int destination = stash.UniqueDestination(tab, held.Item);
+            if (destination < 0) { reason = "the item has no collection slot"; return null; }
+            destination = stash.MapDestination(destination, held.Item, shapeOf);
+            if (!stash.Holds(destination, held.Item)) { reason = $"the {stash.TypeOf(destination)} tab doesn't hold that item"; return null; }
+            if (shape.MaxStack > 1 || held.Item.Components.Contains("Stack"))
+            {
+                if (stash.AddStacked(destination, held.Item, shapeOf, out reason) is not { } stacked) return null;
+                if (stacked.Left == held.Item.StackSize) { reason = "the tab is full"; return null; }
+                var left = stacked.Left == 0 ? null : items.SetStackSize(Cursor, held.Id, stacked.Left);
+                if (stacked.Left == 0) items.Remove(Cursor, held.Id);
+                stash.SetLastTab(destination);
+                return new Transfer(Cursor, held.Id, left, destination, stacked.Changed, stacked.Added, [], []);
+            }
+            if (stash.CellFor(destination, held.Item, shapeOf) is not { } cell) { reason = "the tab is full"; return null; }
+            var removed = items.Remove(Cursor, held.Id)!;
+            if (stash.Place(destination, cell.X, cell.Y, removed, shapeOf, out reason) is not var (placed, _))
+                throw new InvalidOperationException($"stash tab {destination} refused cursor item {held.Id} at its free cell: {reason}");
+            stash.SetLastTab(destination);
+            return new Transfer(Cursor, held.Id, null, destination, [], [placed], [], []);
+        });
+        why = result is null && reason == "" ? "refused" : reason;
+        return result;
+    }
+
+    /// <summary>Quick-moves a Heist equipment item between carried inventory (main/expanded) and one of the nine Heist NPC
+    /// equipment rows (rows 45..53, kind 0x22; C→S 0x00fd and controller C→S 0x002d).</summary>
+    public static BenchMove? MoveHeistNpcEquipment(PlayerInventories items, byte slot, uint itemId, bool intoTarget,
+        bool fromExpanded, Func<Item, PlayerInventories.Shape?> shapeOf) => Saves.Atomically<BenchMove?>(() =>
+    {
+        if (slot >= PlayerInventories.HeistNpcEquipmentCount) return null;
+        byte targetRow = (byte)(PlayerInventories.HeistNpcEquipmentFirst + slot);
+        byte from;
+        if (intoTarget)
+        {
+            byte preferred = fromExpanded ? PlayerInventories.ExpandedInventory : Main;
+            if (items.Items(preferred).Any(i => i.Id == itemId)) from = preferred;
+            else if (items.RowOf(itemId) is byte src && src is Main or PlayerInventories.ExpandedInventory) from = src;
+            else return null;
+        }
+        else from = targetRow;
+        byte to = intoTarget ? targetRow : Main;
+        if (items.Items(from).FirstOrDefault(i => i.Id == itemId) is not { } item || shapeOf(item.Item) is not { } shape) return null;
+        if (intoTarget)
+        {
+            byte? slotX = shape.Class switch
+            {
+                "HeistEquipmentTool" => 0,
+                "HeistEquipmentWeapon" => 2,
+                "HeistEquipmentUtility" => 4,
+                "HeistEquipmentReward" => 6,
+                _ => null,
+            };
+            if (slotX is not byte x) return null;
+            bool occupied = items.Items(to).Any(i => shapeOf(i.Item) is { } s && i.X < x + shape.Width && x < i.X + s.Width && i.Y < shape.Height);
+            if (occupied || items.Remove(from, itemId) is not { } taken) return null;
+            return new(from, to, items.Put(to, taken with { X = x, Y = 0 }));
+        }
+        if (items.FreeCell(to, shape.Width, shape.Height, shapeOf) is not { } cell
+            || items.Remove(from, itemId) is not { } outItem) return null;
+        return new(from, to, items.Put(to, outItem with { X = cell.X, Y = cell.Y }));
+    });
+
+    /// <summary>Result of a mercenary Ctrl+click quick-move (C→S 0x010c): <see cref="Placed"/> moved from
+    /// <see cref="From"/> to <see cref="To"/>, and if an unlocked slot item was swapped out it moved to <see cref="SwappedToRow"/>
+    /// as <see cref="SwappedOut"/>. If a locked rolled item was replaced in-place, it was discarded and its id is <see cref="DestroyedId"/>.</summary>
+    public sealed record MercenaryMove(byte From, byte To, InventoryItem Placed, InventoryItem? SwappedOut = null,
+        byte SwappedToRow = 0, uint? DestroyedId = null);
+
+    /// <summary>Quick-moves an equipment item between carried inventory (main/expanded) and a permanent mercenary row
+    /// (rows 95..97, C→S 0x010c). <paramref name="target"/> accepts either roster key 0..3 or <c>Inventories._row</c>
+    /// 95..97/107.</summary>
+    public static MercenaryMove? MoveMercenaryEquipment(PlayerInventories items, byte target, uint itemId,
+        bool toMercenary, bool fromExpanded, bool expandedAllowed, Func<Item, PlayerInventories.Shape?> shapeOf,
+        Func<byte, Item, bool>? canEquip = null) => Saves.Atomically<MercenaryMove?>(() =>
+    {
+        if (PlayerInventories.MercenaryRowForTarget(target) is not byte mercRow
+            || !PlayerInventories.IsPermanentMercenaryRow(mercRow)) return null;
+        if (toMercenary)
+        {
+            return items.QuickMoveToMercenary(mercRow, itemId, fromExpanded, expandedAllowed, shapeOf, canEquip)
+                is var (fromRow, placed, swapped, swappedToRow, destroyedId)
+                ? new MercenaryMove(fromRow, mercRow, placed, swapped, swappedToRow, destroyedId)
+                : null;
+        }
+        return items.QuickMoveFromMercenary(mercRow, itemId, expandedAllowed, shapeOf) is var (toRow, moved)
+            ? new MercenaryMove(mercRow, toRow, moved)
+            : null;
+    });
+
     /// <summary>A price paid: what it took from the main inventory's stacks and from the stash's (either may be null).</summary>
     public sealed record Price(PlayerInventories.Payment? Inventory, AccountStash.Payment? Stash);
 
     public sealed record VendorPurchase(IReadOnlyList<Price> Payments, IReadOnlyList<InventoryItem> Bought,
-        PlayerInventories.Placement? Equipped = null);
+        PlayerInventories.Placement? Equipped = null, PlayerInventories.Placement? Placed = null);
+
+    public sealed record VendorSocketPurchase(IReadOnlyList<Price> Payments, InventoryItem Host, InventoryItem? Displaced);
 
     public static VendorPurchase? PurchaseVendor(PlayerInventories items, AccountStash? stash, AccountStash gold,
         Item offer, ItemCatalog catalog, Func<Item, PlayerInventories.Shape?> shapeOf, Func<bool> consume,
-        byte? destination = null, byte x = 0, byte y = 0) => Saves.Atomically<VendorPurchase?>(() =>
+        byte? destination = null, byte x = 0, byte y = 0, bool expandedAllowed = false) => Saves.Atomically<VendorPurchase?>(() =>
     {
         if (offer.Price.Count == 0 || offer.Price.Any(p => p.Amount == 0)) return null;
         byte row = destination ?? Main;
         bool equipment = row is >= 1 and <= 11 or 14 or 15 or 102;
-        if (row != Main && row != Cursor && !equipment) return null;
+        bool expanded = row == PlayerInventories.ExpandedInventory;
+        if (row != Main && row != Cursor && !equipment && !(expanded && expandedAllowed)) return null;
         var bought = offer with { Price = [] };
-        if (equipment)
-        {
-            if (items.PreviewPurchase(row, x, y, bought, shapeOf) is null) return null;
-        }
-        else if (destination is null)
+        if (destination is null)
         {
             if (!items.Fits(Main, bought, shapeOf)) return null;
         }
+        else if (row == Cursor)
+        {
+            if (items.Items(Cursor).Count != 0) return null;
+        }
         else
         {
-            if (shapeOf(bought) is not { } shape) return null;
-            var grid = InstanceInventories.PlayerDefaults[row];
-            if (x + shape.Width > grid.Width || y + shape.Height > grid.Height
-                || items.Items(row).Any(i => shapeOf(i.Item) is { } s && i.X < x + shape.Width
-                    && x < i.X + s.Width && i.Y < y + shape.Height && y < i.Y + s.Height)) return null;
+            if (items.PreviewPurchase(row, x, y, bought, shapeOf, expandedAllowed, allowDisplace: equipment) is null) return null;
         }
         var costs = offer.Price.GroupBy(p => p.TypeHash).Select(g => (Currency:g.Key, Amount:g.Sum(p => (long)p.Amount))).ToArray();
         foreach (var (currency, amount) in costs)
@@ -143,18 +309,53 @@ public static class ItemMoves
             }
             else payments.Add(Pay(items,stash,currency,(int)amount)
                 ?? throw new InvalidOperationException("Vendor payment changed during purchase"));
-        if (equipment)
+        if (destination is null)
         {
-            items.Add(Cursor, 0, 0, bought);
-            var equipped = items.Place(row, x, y, shapeOf, out var why)
-                ?? throw new InvalidOperationException($"Vendor equipment placement changed during purchase: {why}");
-            return new(payments, [equipped.Placed], equipped);
+            var into = items.AddStacked(Main,bought,shapeOf);
+            if (into.Left != 0) throw new InvalidOperationException("Vendor item no longer fits after payment");
+            return new(payments,[.. into.Changed, .. into.Added]);
         }
-        if (destination is not null) return new(payments,[items.Add(row,x,y,bought)]);
-        var into = items.AddStacked(Main,bought,shapeOf);
-        if (into.Left != 0) throw new InvalidOperationException("Vendor item no longer fits after payment");
-        return new(payments,[.. into.Changed, .. into.Added]);
+        if (row == Cursor) return new(payments, [items.Add(Cursor, 0, 0, bought)]);
+        var placed = items.PlaceIncoming(row, x, y, bought, shapeOf, out var why, expandedAllowed, allowDisplace: equipment)
+            ?? throw new InvalidOperationException($"Vendor placement changed during purchase: {why}");
+        return new(payments, [placed.Placed], equipment ? placed : null, placed);
     });
+
+    /// <summary>Buys a vendor item and sockets it directly into <paramref name="targetItemId"/>'s <paramref name="socket"/>
+    /// (<c>C→S 0x0089</c>) in one transaction, moving any displaced gem onto the empty cursor.</summary>
+    public static VendorSocketPurchase? PurchaseAndSocketVendor(PlayerInventories items, AccountStash? stash, AccountStash gold,
+        Item offer, ItemCatalog catalog, byte targetRow, uint targetItemId, int socket,
+        Func<Item, PlayerInventories.Shape?> shapeOf, Func<bool> consume, out string why)
+    {
+        string reason = "";
+        var result = Saves.Atomically<VendorSocketPurchase?>(() =>
+        {
+            if (offer.Price.Count == 0 || offer.Price.Any(p => p.Amount == 0)) { reason = "invalid price"; return null; }
+            var bought = offer with { Price = [] };
+            if (items.PreviewSocketItem(targetRow, targetItemId, socket, bought, shapeOf, out reason) is null) return null;
+            var costs = offer.Price.GroupBy(p => p.TypeHash).Select(g => (Currency: g.Key, Amount: g.Sum(p => (long)p.Amount))).ToArray();
+            foreach (var (currency, amount) in costs)
+            {
+                if (amount <= 0 || amount > int.MaxValue || catalog.ByHash(currency) is not { } type) { reason = "invalid price"; return null; }
+                if (type.Class == ItemDrops.GoldClass ? gold.Gold < amount
+                    : (long)items.Count(Main, currency) + (stash?.CountOf(currency) ?? 0) < amount) { reason = "insufficient currency"; return null; }
+            }
+            if (!consume()) { reason = "out of stock"; return null; }
+            var payments = new List<Price>();
+            foreach (var (currency, amount) in costs)
+                if (catalog.ByHash(currency)!.Class == ItemDrops.GoldClass)
+                {
+                    if (gold.TrySpendGold(amount) is null) throw new InvalidOperationException("Vendor gold changed during purchase");
+                }
+                else payments.Add(Pay(items, stash, currency, (int)amount)
+                    ?? throw new InvalidOperationException("Vendor payment changed during purchase"));
+            if (items.SocketItem(targetRow, targetItemId, socket, bought, shapeOf, items.NewItemId, out reason) is not var (host, displaced))
+                throw new InvalidOperationException($"Vendor socket placement changed during purchase: {reason}");
+            return new(payments, host, displaced);
+        });
+        why = reason;
+        return result;
+    }
 
     public sealed record BenchResult(InventoryItem Changed, IReadOnlyList<Price> Payments);
 
@@ -178,13 +379,50 @@ public static class ItemMoves
         return new(from, to, items.Put(to, taken with { X = cell.Value.X, Y = cell.Value.Y }));
     });
 
+    /// <summary>Ctrl + click between main/expanded inventory and a single-item crafting slot (e.g. HarvestCraftingItem).</summary>
+    public static BenchMove? MoveToSlot(PlayerInventories items, byte slotRow, uint itemId, bool intoSlot,
+        Func<Item, PlayerInventories.Shape?> shapeOf) => Saves.Atomically<BenchMove?>(() =>
+    {
+        byte from;
+        if (intoSlot)
+        {
+            if (items.RowOf(itemId) is not byte src
+                || src is not (PlayerInventories.MainInventory or PlayerInventories.ExpandedInventory)) return null;
+            from = src;
+        }
+        else from = slotRow;
+        byte to = intoSlot ? slotRow : Main;
+        if (items.Items(from).FirstOrDefault(i => i.Id == itemId) is not { } item || shapeOf(item.Item) is not { } shape) return null;
+        if (intoSlot && (item.Item.Components.Contains("Quest") || shape.Class == "QuestItem")) return null;
+        var cell = intoSlot ? (items.Items(to).Count == 0 ? ((byte)0, (byte)0) : null)
+            : items.FreeCell(to, shape.Width, shape.Height, shapeOf);
+        if (cell is null || items.Remove(from, itemId) is not { } taken) return null;
+        return new(from, to, items.Put(to, taken with { X = cell.Value.X, Y = cell.Value.Y }));
+    });
+
+    /// <summary>Moves one item from a stash tab into an empty single-item crafting slot (e.g. HarvestCraftingItem).
+    /// Rejects oversized stacks (e.g. 5,000/50,000 currency tab stacks) and quest items.</summary>
+    public static InventoryItem? StashToSlot(AccountStash stash, PlayerInventories items, int tab, byte slotRow, uint itemId,
+        Func<Item, PlayerInventories.Shape?> shapeOf) =>
+        Saves.Atomically<InventoryItem?>(() =>
+    {
+        if (tab < 0 || tab >= stash.Count || items.Items(slotRow).Count > 0) return null;
+        if (stash.Inventory(tab).Items.FirstOrDefault(i => i.Id == itemId) is not { } inTab
+            || shapeOf(inTab.Item) is not { } shape) return null;
+        if (inTab.Item.StackSize > Math.Max((ushort)1, shape.MaxStack)
+            || inTab.Item.Components.Contains("Quest") || shape.Class == "QuestItem") return null;
+        if (stash.Take(tab, itemId) is not { } taken) return null;
+        stash.SetLastTab(tab);
+        return items.Put(slotRow, taken with { X = 0, Y = 0 });
+    });
+
     /// <summary>
     /// Ctrl + click with the map device open (C→S 0xe8): a map/fragment from the main inventory into Map1's first free
     /// cell, or a device item back into the inventory. Null when the item is missing, the class is refused, or there is
     /// no room. The item's current inventory wins if the packet's direction flag disagrees.
     /// </summary>
     public static BenchMove? MoveToMapDevice(PlayerInventories items, uint itemId,
-        Func<Item, PlayerInventories.Shape?> shapeOf) => Saves.Atomically<BenchMove?>(() =>
+        Func<Item, PlayerInventories.Shape?> shapeOf, Player? player = null) => Saves.Atomically<BenchMove?>(() =>
     {
         byte main = Main, device = PlayerInventories.MapDevice;
         byte from;
@@ -194,7 +432,7 @@ public static class ItemMoves
         else return null;
         byte to = from == main ? device : main;
         if (shapeOf(item.Item) is not { } shape) return null;
-        if (to == device && !MapDevice.AcceptsItem(item.Item.TypeHash, shape.Class)) return null;
+        if (to == device && !MapDevice.AcceptsItem(item.Item.TypeHash, shape.Class, player)) return null;
         if (items.FreeCell(to, shape.Width, shape.Height, shapeOf) is not { } cell
             || items.Remove(from, itemId) is not { } taken) return null;
         return new(from, to, items.Put(to, taken with { X = cell.X, Y = cell.Y }));
@@ -249,11 +487,20 @@ public static class ItemMoves
     {
         var targets = items.Items(row);
         if (targets.Count != 1 || craftIt(targets[0].Item) is not { } craft) return null;
+        var totals = new Dictionary<uint, long>();
         foreach (var (currency, amount) in craft.Costs)
-            if (amount < 0 || (long)items.Count(Main, currency) + stash.CountOf(currency) < amount) return null;
+        {
+            if (amount < 0) return null;
+            if (amount == 0) continue;
+            long sum = totals.GetValueOrDefault(currency) + amount;
+            if (sum > int.MaxValue) return null;
+            totals[currency] = sum;
+        }
+        foreach (var (currency, amount) in totals)
+            if ((long)items.Count(Main, currency) + stash.CountOf(currency) < amount) return null;
         var payments = new List<Price>();
-        foreach (var (currency, amount) in craft.Costs)
-            if (amount > 0) payments.Add(Pay(items, stash, currency, amount)
+        foreach (var (currency, amount) in totals)
+            payments.Add(Pay(items, stash, currency, (int)amount)
                 ?? throw new InvalidOperationException("Craft payment changed after validation"));
         var changed = items.Change(row, targets[0].Id, _ => craft.Item)
             ?? throw new InvalidOperationException("Crafted item disappeared after payment");
@@ -399,33 +646,50 @@ public static class ItemMoves
             return (left, part);
         });
 
-    /// <summary>Where an item is for <see cref="UseAcross"/>: a stash tab (<paramref name="Tab"/>) or a character
+    /// <summary>Where an item is for <see cref="Use"/>: a stash tab (<paramref name="Tab"/>) or a character
     /// inventory row (<paramref name="Row"/>), and its id.</summary>
     public readonly record struct Spot(int? Tab, byte Row, uint Id);
 
-    /// <summary>A currency item used on an item, each in a character inventory or a stash tab (C→S 0x71 naming a stash tab
-    /// for either: the currency tab's crafting slot, live 2026-10-23): one leaves the currency's stack (the last one removes
-    /// it) and the target becomes <paramref name="change"/>(target), together. Returns the currency's stack as it is now
-    /// (null when it is gone) and the changed target, or null when either is gone (nothing changes).</summary>
-    public static (InventoryItem? Left, InventoryItem Changed)? UseAcross(PlayerInventories items, AccountStash stash, Spot used, Spot target,
-        Func<Item, Item> change) =>
-        Saves.Atomically<(InventoryItem?, InventoryItem)?>(() =>
+    /// <summary>A currency item used on an item (C→S 0x71 / Shift 0x72), each in a character inventory or a stash tab (the
+    /// currency tab's crafting slot included, live 2026-10-23): one leaves the currency's stack (the last one removes it)
+    /// and, together, the target becomes <paramref name="change"/> and/or <paramref name="held"/> goes onto the empty cursor
+    /// as a new character item (a Mirror of Kalandra's copy, the target unchanged). Returns the currency's stack as it is now
+    /// (null when it is gone), the changed target and the held item, or null (nothing changes) when either item is gone or
+    /// something is held while <paramref name="held"/> is set.</summary>
+    public static (InventoryItem? Left, InventoryItem? Changed, InventoryItem? Held)? Use(PlayerInventories items, AccountStash stash,
+        Spot used, Spot target, Item? change, Item? held) =>
+        Saves.Atomically<(InventoryItem?, InventoryItem?, InventoryItem?)?>(() =>
         {
+            if (used == target) return null;
             bool there(Spot s) => s.Tab is int t ? t >= 0 && t < stash.Count && stash.Inventory(t).Items.Any(i => i.Id == s.Id)
                 : items.Items(s.Row).Any(i => i.Id == s.Id);
-            if (!there(used) || !there(target)) return null;
-            InventoryItem? left = null;
-            if (used.Tab is int tab)
+            if (change is null && held is null || !there(used) || !there(target)) return null;
+            if (held is not null && items.Items(Cursor).Count > 0) return null;
+            if (!TakeOne(items, stash, used, out var left)) return null;
+            InventoryItem? changed = null;
+            if (change is not null)
             {
-                var stack = stash.Inventory(tab).Items.First(i => i.Id == used.Id);
-                if (stack.Item.StackSize <= 1) { if (stash.Take(tab, used.Id) is null) return null; }
-                else if ((left = stash.Shrink(tab, used.Id, 1)) is null) return null;
+                changed = target.Tab is int targetTab ? stash.Change(targetTab, target.Id, _ => change) : items.Change(target.Row, target.Id, _ => change);
+                if (changed is null) return null;
             }
-            else if (items.ConsumeOne(used.Row, used.Id) is { } consumed) left = consumed.Left;
-            else return null;
-            var changed = target.Tab is int targetTab ? stash.Change(targetTab, target.Id, change) : items.Change(target.Row, target.Id, change);
-            return changed is null ? null : (left, changed);
+            return (left, changed, held is null ? null : items.Add(Cursor, 0, 0, held));
         });
+
+    // One currency item leaves its stack, in a stash tab or a character inventory row (the last one removes the stack).
+    // False when the stack is gone or offered in a trade; nothing changes then.
+    static bool TakeOne(PlayerInventories items, AccountStash stash, Spot used, out InventoryItem? left)
+    {
+        left = null;
+        if (used.Tab is int tab)
+        {
+            if (tab < 0 || tab >= stash.Count || stash.Inventory(tab).Items.FirstOrDefault(i => i.Id == used.Id) is not { } stack) return false;
+            if (stack.Item.StackSize <= 1) return stash.Take(tab, used.Id) is not null;
+            return (left = stash.Shrink(tab, used.Id, 1)) is not null;
+        }
+        if (items.ConsumeOne(used.Row, used.Id) is not { } consumed) return false;
+        left = consumed.Left;
+        return true;
+    }
 
     /// <summary>
     /// A purchase (C→S 0x88): the price (<paramref name="price"/>: currency type and amount, or null when free) paid from the
@@ -459,15 +723,5 @@ public static class ItemMoves
             if (items.ConsumeOne(row, itemId) is not { } taken) return null;
             CharacterSaves.SetExtraPassivePoints(character, extraPoints);
             return taken;
-        });
-
-    /// <summary>A currency item used on an item (C→S 0x71): one leaves its stack and the target becomes
-    /// <paramref name="change"/>(target), together. Null when either is gone (nothing changes).</summary>
-    public static (PlayerInventories.Consumption Used, InventoryItem Changed)? UseOn(PlayerInventories items, byte usedRow, uint usedId,
-        byte targetRow, uint targetId, Func<Item, Item> change) =>
-        Saves.Atomically<(PlayerInventories.Consumption, InventoryItem)?>(() =>
-        {
-            if (!items.Items(targetRow).Any(i => i.Id == targetId) || items.ConsumeOne(usedRow, usedId) is not { } used) return null;
-            return (used, items.Change(targetRow, targetId, change)!);
         });
 }

@@ -10,6 +10,12 @@ public static partial class Game
     // which only normal and magic enemies are culled at. CannotKill: Pacifism, whose hits leave the enemy at 1 Life.
     public readonly record struct Cull(int Threshold, int RecoverLifePct, int NormalMagicThreshold = 0, bool CannotKill = false)
     {
+        public bool AgainstBleedingWithWeapon { get; init; }
+        internal bool ShatterFrozen { get; init; }
+
+        public Cull WithWeapon(IReadOnlyDictionary<uint, int>? local) => local is null ? this
+            : this with { AgainstBleedingWithWeapon = local.GetValueOrDefault(Stat.LocalCullingStrikeVsBleedingEnemies) != 0 };
+
         // The character's stats and the skill's own (support gems included); pass them apart, not merged.
         public static Cull Of(IReadOnlyDictionary<uint, int>? player, IReadOnlyDictionary<uint, int>? skill, bool critical,
             bool spell)
@@ -28,11 +34,18 @@ public static partial class Game
         }
     }
 
+    static Cull MinionIgniteKillRule(IReadOnlyDictionary<uint, int> owner, SpawnedMonster target, double now) =>
+        new(0, 0, CannotKill: owner.GetValueOrDefault(Stat.MinionsHitsCanOnlyKillIgnitedEnemies) != 0
+            && !target.Ignites.IgnitedAt(now));
+
     // The hit's own damage, then the cull. A boss stage this hit starts, or one still running, keeps the boss alive.
     public static (uint Life, bool StageStarts) TakeOwnerHitLocked(Player player, SpawnedMonster m, int damage, Cull cull,
         bool? rampageSource = null, IReadOnlyDictionary<uint, int>? playerStats = null,
         IReadOnlyDictionary<uint, int>? cullPlayer = null)
     {
+        if (!m.Contagion.Idle && m is { Hostile: true, Dead: false, Life: > 0, Invulnerable: false }
+            && m.Effects[Stat.BaseCannotBeDamaged] == 0)
+            ContagionSpreadOnHitLocked(player, m, ProjectileWorldTime(player));
         m.LastHitBy = player;
         // The culling context is the attack's cached offensive snapshot and is passed for every victim of an area
         // skill. `player` is Rampage's freshness-scoped source: only the first target gets a rebuilt snapshot, so it
@@ -40,9 +53,10 @@ public static partial class Game
         var cullStats = cullPlayer ?? playerStats;
         int threshold = m.Rarity is MonsterRarity.Normal or MonsterRarity.Magic
             ? Math.Max(cull.Threshold, cull.NormalMagicThreshold) : cull.Threshold;
-        // Conditional culling sources that depend on the target's state (poedb Culling Strike / passives): each grants
-        // the standard 10% cull when its condition holds. The weapon-local (local/main_hand/off_hand), flask, stun and
-        // "crit recently" sources need extra context and stay outside this. Pacifism (CannotKill) is never overridden.
+        if (cull.AgainstBleedingWithWeapon && m.Bleeds.IgnitedAt(ProjectileWorldTime(player)))
+            threshold = Math.Max(10, threshold);
+        // Conditional culling sources that depend on the target's state grant the standard 10% cull.
+        // Pacifism (CannotKill) still governs the hit.
         if (threshold == 0 && !cull.CannotKill && cullStats is not null)
         {
             int Get(uint k) => cullStats.GetValueOrDefault(k);
@@ -64,7 +78,17 @@ public static partial class Game
             threshold = 0;
         }
         uint beforeHit = m.Life;
+        bool shatter = cull.ShatterFrozen && !cull.CannotKill && m.Rarity != MonsterRarity.Unique
+            && beforeHit * 3L < m.MaxLife
+            && m.Ailments.Magnitude(MonsterElementalAilments.Kind.Freeze, ProjectileWorldTime(player)) > 0;
         var hit = TakeOwnerDamageLocked(player, m, damage, rampageSource, playerStats);
+        // Glacial Hammer's shatter has its own condition and leaves no overkill damage or cull recovery.
+        if (shatter && hit.Life > 0 && !hit.StageStarts && !m.StageRunning)
+        {
+            m.Overkill = 0;
+            m.Life = hit.Life;
+            return TakeOwnerDamageLocked(player, m, (int)Math.Min(int.MaxValue, hit.Life), rampageSource, playerStats);
+        }
         // The direct hit's excess feeds overkill effects; a subsequent cull contributes no overkill.
         m.Overkill = beforeHit > 0 && hit.Life == 0
             ? (int)Math.Clamp((long)damage - beforeHit, 0, int.MaxValue) : 0;
@@ -113,19 +137,20 @@ public static partial class Game
     // Burning covers the supported non-ignite sources too. Righteous Fire only puts its aura on the monsters in range
     // and ticks their burn; the DoT itself never reaches this hit path, so it cannot cull on its own. `m.Burn` is only
     // the DoT's fractional carry and is never cleared, so it is not a burning signal.
-    static bool BurningTarget(Player player, SpawnedMonster m)
+    static bool BurningTarget(Player player, SpawnedMonster m, double? at = null)
     {
-        if (m.Ignites.Burning || m.HeraldBurns.Burning
+        double now = at ?? ProjectileWorldTime(player);
+        if (m.Ignites.IgnitedAt(now) || m.HeraldBurns.IgnitedAt(now) || TrarthusBurning(m, now) || ConflagrationBurning(m, now)
+            || ProjectileSession.OnBurningDamageGround(player.Area, m, now)
             || InfernalLegionFields.TryGetValue(player, out var field) && field.Burning.Contains(m)) return true;
         foreach (var other in player.Instance?.Presence.PlayersExcept(player.Id) ?? [])
             if (other.PlayerLife > 0 && other.Instance == player.Instance
                 && InfernalLegionFields.TryGetValue(other, out var otherField) && otherField.Burning.Contains(m)) return true;
         if (player.Placed.Grounds.Count > 0)
         {
-            double now = AreaTime(player);
-            var at = m.Walk.Position(now);
+            var position = m.Walk.Position(now);
             foreach (var ground in player.Placed.Grounds)
-                if (now < ground.Until && Dist(at, ground.At) <= ground.Radius) return true;
+                if (now < ground.Until && Dist(position, ground.At) <= ground.Radius) return true;
         }
         return player.RighteousFire is { } rf && player.Area.Monsters.Any(pair =>
             pair.Value == m && rf.Auras.ContainsKey(pair.Key));

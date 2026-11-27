@@ -8,8 +8,37 @@ public static partial class Game
     /// maps here so the client's HUD is not up yet and does not announce them.</summary>
     public static Func<Player, IEnumerable<(string Log, byte[] Message)>>? ExtraPlayerMessages;
 
-    /// <summary>Module data keys: the active Atlas preset (0..2) and the Atlas passive respec points.</summary>
-    public const string AtlasActiveKey = "atlas.active", AtlasRespecKey = "atlas.respec";
+    /// <summary>Module data keys: the active Atlas preset (0..2), respec points, one-off free reset flag, and preset names.</summary>
+    public const string AtlasActiveKey = "atlas.active", AtlasRespecKey = "atlas.respec",
+        AtlasFreeResetKey = "atlas.free_reset";
+
+    public static string AtlasTreeNameKey(int preset) => $"atlas.name.{preset}";
+
+    public static string[] AtlasTreeNames(Player player)
+    {
+        string character = CharacterName(player);
+        return
+        [
+            CharacterSaves.ModuleData(character, AtlasTreeNameKey(0)) ?? "",
+            CharacterSaves.ModuleData(character, AtlasTreeNameKey(1)) ?? "",
+            CharacterSaves.ModuleData(character, AtlasTreeNameKey(2)) ?? "",
+        ];
+    }
+
+    public static void SetAtlasTreeName(Player player, int preset, string name) =>
+        CharacterSaves.ChangeModuleData(CharacterName(player), AtlasTreeNameKey(preset), _ => name);
+
+    public static byte[] AtlasTreeNamesMessage(Player player)
+    {
+        var names = AtlasTreeNames(player);
+        return InstanceEntities.AtlasTreeNames(names[0], names[1], names[2]);
+    }
+
+    public static bool HasAtlasFreeReset(Player player) =>
+        CharacterSaves.ModuleData(CharacterName(player), AtlasFreeResetKey) == "1";
+
+    public static void SetAtlasFreeReset(Player player, bool available) =>
+        CharacterSaves.ChangeModuleData(CharacterName(player), AtlasFreeResetKey, _ => available ? "1" : "");
 
     /// <summary>The preset the client's tree shows and allocates into (C→S 0x2a8 picks it).</summary>
     public static int AtlasActivePreset(Player player) => AtlasActivePreset(CharacterName(player), player.Character.AtlasPassives);
@@ -37,9 +66,10 @@ public static partial class Game
         CharacterSaves.ChangeModuleData(CharacterName(player), AtlasRespecKey, _ => points.ToString());
 
     // One Atlas preset, sorted (the client diffs and binary-searches the list): u28 the respec points, u2a the points
-    // before what allocated nodes grant.
+    // before what allocated nodes grant. Bit 0 is set only when the character has an unused free full reset.
     public static byte[] AtlasSlots(Player player, int preset) =>
-        InstanceEntities.PassiveSlots(AtlasRespecPoints(player), player.Character.AtlasPassivePoints, (byte)(1 << (2 + preset)),
+        InstanceEntities.PassiveSlots(AtlasRespecPoints(player), player.Character.AtlasPassivePoints,
+            (byte)((1 << (2 + preset)) | (HasAtlasFreeReset(player) ? InstanceEntities.PassiveFreeResetFlag : 0)),
             [.. player.Character.AtlasPassives[preset].Order()]);
 
     /// <summary>The three presets, the active one last: a single-preset 0x3d also makes that preset the client's active
@@ -60,20 +90,19 @@ public static partial class Game
             await Send(player, message, log);
     }
 
-    /// <summary>The allocated Atlas passives' stats of the active preset, by stat name: what the tree adds to a map's.</summary>
+    /// <summary>The allocated Atlas passives' composed stats of the active preset (applying Small node effect scaling,
+    /// Wandering Path / Grand Design notable/small suppression, and per-notable pack size).</summary>
     public static Dictionary<uint, int> AtlasStats(Player player)
     {
-        Dictionary<uint, int> stats = [];
-        int preset = player.Character.AtlasPreset is >= 0 and < 3 ? player.Character.AtlasPreset
-            : Enumerable.Range(0, player.Character.AtlasPassives.Length).MaxBy(p => player.Character.AtlasPassives[p].Count);
-        foreach (ushort graphId in player.Character.AtlasPassives[preset])
+        int preset = AtlasActivePreset(player);
+        if (preset < 0 || preset >= player.Character.AtlasPassives.Length) return [];
+        var allocated = player.Character.AtlasPassives[preset];
+        if (allocated.Count == 0) return [];
+        List<AtlasPassives.Node> nodes = new(allocated.Count);
+        foreach (ushort graphId in allocated)
             if (AtlasPassiveNodes.Find(graphId) is { } node)
-                foreach (var (key, value) in node.Stats)
-                {
-                    uint name = key;
-                    stats[name] = stats.GetValueOrDefault(name) + value;
-                }
-        return stats;
+                nodes.Add(node);
+        return global::AtlasStats.Compose(nodes);
     }
 
     /// <summary>The stats of the area the player is in that league mechanics read: a map's own (its affixes, scarabs and

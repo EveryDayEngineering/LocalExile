@@ -1,6 +1,23 @@
 
 public static partial class Game
 {
+    static void LoseLifeOnCriticalStrikeLocked(Player player, int percent, double now)
+    {
+        if (percent <= 0 || player.PlayerLife == 0) return;
+        uint before = player.PlayerLife;
+        uint lost = (uint)Math.Min(before, (long)player.PlayerMaxLife * percent / 100);
+        if (lost == 0) return;
+        player.PlayerLife = VaalImmortalCallLife(player, before - lost, now);
+        LeechOf(player).InstantLifeChanged |= player.PlayerLife != before;
+        if (player.PlayerLife != 0) return;
+        player.InvalidateIncomingHits();
+        ClearWardBreakOnDeath(player);
+        RecordHardcoreDeath(player);
+        int epoch = player.IncomingHitEpoch;
+        ProjectilesFor(player).Enqueue(() => RunOnAreaFrame(player,
+            () => PlayerDiedAtEpoch(player, "life lost on critical strike", epoch)));
+    }
+
     // "Your Critical Strikes do not deal extra Damage": the stat, and the two keystones whose text says the same
     // (Elemental Overload, Perfect Agony). Resolute and Precise Technique say "Never deal Critical Strikes", which is
     // CriticalProhibitedBy instead.
@@ -18,6 +35,15 @@ public static partial class Game
     public static int CriticalHitMultiplier(long ordinary, IReadOnlyDictionary<uint, int> player,
         IReadOnlyDictionary<uint, int>? own = null) => CriticalHitMultiplier(ordinary,
             CriticalHitsDealNoExtraDamage(player, own));
+
+    static long ClawDaggerCriticalBonus(SkillCatalog.Unarmed weapon, IReadOnlyDictionary<uint, int> player,
+        IReadOnlyDictionary<uint, int>? own)
+    {
+        const uint stat = Stat.CriticalStrikeMultiplierPlusPctWithClawsDaggers;
+        long bonus = (long)player.GetValueOrDefault(stat) + (own?.GetValueOrDefault(stat) ?? 0);
+        return bonus != 0 && (weapon.ItemClass is "Claw" or "Dagger" or "Rune Dagger"
+            || WeaponIdentity.AllOneHandMelee(weapon.LocalSources)) ? bonus : 0;
+    }
 
     public static bool IsCriticalProhibition(uint name) => name is Stat.GlobalCannotCrit
         or Stat.VirtualGlobalCannotCrit or Stat.CannotCriticalStrikeWithAttacks

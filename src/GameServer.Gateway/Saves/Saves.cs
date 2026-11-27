@@ -49,6 +49,7 @@ public static class Saves
         yield return baseKey;
         if (leagueKey != baseKey) yield return leagueKey;
         yield return "guild:" + leagueKey;
+        yield return "trade:" + leagueKey;
     }
 
     /// <summary>Keeps <paramref name="character"/> and its account stash in memory while in an area so gameplay makes no
@@ -246,6 +247,62 @@ public static class Saves
             return true;
         });
         if (!cached) SaveRows.WriteCharacter(db, character, save);
+    }
+
+    public static bool PutCharacterInventories(string character, Dictionary<byte, List<CharacterSaves.SavedPlacement>> inventories,
+        CharacterSaves.SavedItem? startWeapon, uint? unsavedExperience)
+    {
+        if (FailWrite?.Invoke(character) == true) throw new IOException($"save of {character} failed (test)");
+        var db = Db;
+        bool? cached = db.Read<bool?>(() =>
+        {
+            if (FailWrite is not null || !_pinnedCharacters.ContainsKey(character)) return null;
+            bool had = _characters.TryGetValue(character, out var prev);
+            var current = had ? prev.Save : LoadPinnedCharacterLocked(db, character);
+            if (current is null)
+            {
+                if (!had) _characters[character] = (null, false);
+                return false;
+            }
+            if (db.InAtomic)
+                db.OnRollback(() => { if (had) _characters[character] = prev; else _characters.Remove(character); });
+            _characters[character] = (current with
+            {
+                Inventories = inventories,
+                StartWeapon = startWeapon,
+                Experience = unsavedExperience ?? current.Experience,
+            }, true);
+            return true;
+        });
+        return cached ?? SaveRows.WriteCharacterInventories(db, character, inventories, startWeapon, unsavedExperience);
+    }
+
+    public static bool PutCharacterExperience(string character, uint experience) => Db.Atomically(() =>
+    {
+        var db = Db;
+        if (FailWrite is null && _pinnedCharacters.ContainsKey(character))
+        {
+            bool had = _characters.TryGetValue(character, out var prev);
+            var current = had ? prev.Save : LoadPinnedCharacterLocked(db, character);
+            if (current is null)
+            {
+                if (!had) _characters[character] = (null, false);
+                return false;
+            }
+            if (db.InAtomic)
+                db.OnRollback(() => { if (had) _characters[character] = prev; else _characters.Remove(character); });
+            _characters[character] = (current with { Experience = experience }, true);
+            return true;
+        }
+        if (!SaveRows.CharacterExperience(db, character).Saved) return false;
+        if (FailWrite?.Invoke(character) == true) throw new IOException($"save of {character} failed (test)");
+        return SaveRows.WriteCharacterExperience(db, character, experience);
+    });
+
+    static CharacterSaves.Save? LoadPinnedCharacterLocked(SaveDatabase db, string character)
+    {
+        _characterReads++;
+        return SaveRows.LoadCharacter(db, character);
     }
 
     /// <summary>A stash's header (its tabs without their items), or null when it has none.</summary>

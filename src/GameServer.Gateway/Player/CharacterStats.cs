@@ -62,14 +62,33 @@ public static class CharacterStats
         public long FortificationRevision { get; init; }
         // Calculated zero attributes are valid; legacy partial pool records may still need class defaults.
         public bool AttributesResolved { get; init; }
+        public bool IgnoreAttributeRequirements { get; init; }
+        public bool EvasionBasedOnWard { get; init; }
+        public bool ImpalesNearbyEnemies { get; init; }
+        public bool HalveColdAndLightningResistance { get; init; }
+        public int? AttackSpeedIncreasedPct { get; init; }
+        public int AttackSpeedMorePct { get; init; }
+
+        public int AttackSpeedWithIncrease(long increased) => AttackSpeedIncreasedPct is { } basis
+            ? ResolveAttackSpeed(basis + increased, AttackSpeedMorePct)
+            : (int)Math.Clamp(AttackSpeedPct + increased, -99L, int.MaxValue);
         // Player stats that monster swings, player ticks, regeneration steps and sweeps read for every character: resolved
         // once per pool build (BuildPoolsFor), never a full stat build on those paths. 0/false: the character has none.
+        public int MapTemporalChainsActionSpeedPct { get; init; }
         public int AttackerSlowPct { get; init; }
         public int EnemyRegenerationOnHitPct { get; init; }
         public int VsBlindedCriticalPct { get; init; }
         public bool WhileMovingStats { get; init; }
+        public bool ConvertSuppressionToSpellDodge { get; init; }
+        public int BaseSpellDodgeChance { get; init; }
         // Real pool builds retain the signed base before the one final floor; legacy partial pools use their rating.
         public long AccuracyBase { get; init; } = Accuracy;
+        public int AccuracyAreaMorePct { get; init; }
+        public int AccuracyWeaponMorePct { get; init; }
+        // Deadeye's Avidity: "5% more Accuracy Rating per Frenzy Charge" (Stats row 20753, PassiveSkills
+        // AscendancyDeadeye10) -- the per-charge value times the charges held, multiplied once per pool build by
+        // PlayerAccuracyModifiers, so it reaches every attack. Kept out of AccuracyPct, which is the increased bucket.
+        public int AccuracyChargeMorePct { get; init; }
     }
 
     /// <summary>What allocated passives and equipped base items add to the pools: attributes, flat and increased life,
@@ -98,7 +117,7 @@ public static class CharacterStats
         int AccuracyFromStrengthPct = 0, int AttackSpeedPer150Accuracy = 0,
         int AccuracyMoreVsUniquePct = 0, int AccuracyMoreInCloseRangePct = 0,
         int ManaReservationEfficiencyPct = 0, int LifeReservationEfficiencyPct = 0,
-        int AuraEffectPct = 0, int AuraAreaPct = 0, decimal ArmourMorePct = 0, decimal EvasionMorePct = 0, int EnergyShield = 0,
+        int AuraEffectPct = 0, int AuraAreaPct = 0, decimal ArmourMorePct = 0, decimal EvasionMorePct = 0, decimal ExtraDefenceMorePct = 0, int EnergyShield = 0,
         // The overcapped-resistance flags' derived increases (ResistanceOvercap), computed once in PoolsFor from the
         // final raw resistances and maxima: +1% per 1% of cold overcap on evasion, lightning overcap on crit chance.
         int ColdOvercapEvasionPct = 0, int LightningOvercapCritPct = 0,
@@ -111,6 +130,12 @@ public static class CharacterStats
         // Body values are likewise local subsets of the flat totals, before slot-specific global operators.
         decimal BodyArmour = 0, decimal BodyEvasion = 0, int BodyEnergyShield = 0, int BodyEnergyShieldPct = 0,
         bool DoubleBodyArmour = false, bool NoBodyArmour = false,
+        int BodyArmourPct = 0, int BodyEvasionPct = 0,
+        // The helmet's local ES and the gloves' and boots' local armour and evasion, for the masteries' slot increases.
+        int HelmetEnergyShield = 0, int HelmetEnergyShieldPct = 0,
+        decimal GlovesBootsArmour = 0, decimal GlovesBootsEvasion = 0, int GlovesBootsArmourPct = 0,
+        // Final "more" multiplier on maximum Life (combined multiplicatively across sources, after increases).
+        decimal LifeMorePct = 0,
         int SpellSuppressionWhileFullEnergyShield = 0,
         bool ArmourAppliesToChaosDamage = false, AttributeModifiers Attributes = default,
         int StrengthPct = 0, int DexterityPct = 0, int IntelligencePct = 0, int AllAttributesPct = 0,
@@ -120,11 +145,21 @@ public static class CharacterStats
         int EnergyShieldPctPerTenStrength = 0, int EvasionPctPerTenIntelligence = 0,
         bool NoLifeFromStrength = false, bool NoManaFromIntelligence = false,
         bool NoStrengthBonuses = false, bool NoDexterityBonuses = false, bool NoIntelligenceBonuses = false,
-        bool MentalConditioning = false, decimal Ward = 0, int WardPct = 0, long AdditionalMana = 0, int EvasionWhileMovingPct = 0,
+        bool MentalConditioning = false, decimal Ward = 0, int WardPct = 0, int EvasionWhileMovingPct = 0,
         // Dexterity's inherent evasion grant can be removed on its own, leaving its accuracy bonus alone, and a source
         // can add spell suppression chance per complete group of 15 Dexterity.
-        bool NoDexterityEvasion = false, int SpellSuppressionPerFifteenDexterity = 0)
+        bool NoDexterityEvasion = false, int SpellSuppressionPerFifteenDexterity = 0,
+        // A source that removes the whole Mana pool (maximum 0).
+        bool NoMana = false)
     {
+        public bool ConvertSuppressionToSpellDodge { get; init; }
+        public int BaseSpellDodgeChance { get; init; }
+        public bool NoEnergyShield { get; init; }
+        public bool NoEnergyShieldFromIntelligence { get; init; }
+        public int LifeToEnergyShieldPct { get; init; }
+        public int EvasionPerTenMaximumLife { get; init; }
+        public int ManaStrengthDivisor { get; init; }
+        public int EnergyShieldStrengthDivisor { get; init; }
         public static readonly Bonus None = new();
     }
 
@@ -162,12 +197,23 @@ public static class CharacterStats
     /// hit an enemy recently, on full energy shield), bounded to 0..100% after every active source is added.</summary>
     public static int SuppressionChance(Pools p, bool fullLife, bool moving, bool hitRecently,
         bool fullEnergyShield = false) =>
-        (int)Math.Clamp((long)(p.SpellSuppressionChanceUncapped ?? p.SpellSuppressionChance)
+        p.ConvertSuppressionToSpellDodge ? 0 : (int)Math.Clamp(
+            UncappedSuppressionChance(p, fullLife, moving, hitRecently, fullEnergyShield), 0L, DamageModel.SpellSuppressionChanceCap);
+
+    public static int SpellDodgeChance(Pools p, bool fullLife, bool moving, bool hitRecently, bool fullEnergyShield = false)
+    {
+        long chance = p.BaseSpellDodgeChance;
+        if (p.ConvertSuppressionToSpellDodge)
+            chance += (long)Math.Floor(UncappedSuppressionChance(p, fullLife, moving, hitRecently, fullEnergyShield) / 2d);
+        return (int)Math.Clamp(chance, 0L, DamageModel.SpellDodgeChanceCap);
+    }
+
+    static long UncappedSuppressionChance(Pools p, bool fullLife, bool moving, bool hitRecently, bool fullEnergyShield) =>
+        (long)(p.SpellSuppressionChanceUncapped ?? p.SpellSuppressionChance)
             + (fullLife ? p.SpellSuppressionWhileFullLife : 0)
             + (moving ? p.SpellSuppressionWhileMoving : 0)
             + (hitRecently ? p.SpellSuppressionIfHitRecently : 0)
-            + (fullEnergyShield ? p.SpellSuppressionWhileFullEnergyShield : 0),
-            0L, DamageModel.SpellSuppressionChanceCap);
+            + (fullEnergyShield ? p.SpellSuppressionWhileFullEnergyShield : 0);
 
     public static Pools For(SkillCatalog.ClassInfo c, int level, Bonus? bonus = null) =>
         For(c, level, bonus, null);
@@ -194,13 +240,15 @@ public static class CharacterStats
         decimal flatLife = c.BaseMaxLife + 12m * level + strengthLife + b.Life
             + LifeManaPoolSources.AdditionalLife(level, dex, intel, b);
         long flatMana = c.BaseMaxMana + 6L * level + intelligenceMana + b.Mana
-            + LifeManaPoolSources.AdditionalMana(level, b) + b.AdditionalMana;
+            + LifeManaPoolSources.AdditionalMana(level, b);
+        int lifeConversion = Math.Clamp(b.LifeToEnergyShieldPct, 0, 100);
+        decimal lifeMore = Math.Max(0m, 100m + b.LifeMorePct) / 100m;
         uint life = b.ChaosInoculation ? 1 : (uint)Math.Clamp(decimal.Floor(flatLife
-            * (100m + b.LifePct) / 100m), 1m, int.MaxValue);
+            * (100m + b.LifePct) / 100m * lifeMore * (100 - lifeConversion) / 100m), 1m, int.MaxValue);
+        int manaPct = ActorScale.Saturate((long)b.ManaPct + (b.ManaStrengthDivisor > 0 ? str / b.ManaStrengthDivisor : 0));
         uint mana = b.ManaPerFourStrength == 0
-            ? (uint)Math.Clamp(decimal.Floor(flatMana
-                * (100m + b.ManaPct) / 100m), 0m, int.MaxValue)
-            : StrengthMana.Maximum(flatMana, str, b.ManaPerFourStrength, b.ManaPct);
+            ? (uint)Math.Clamp(decimal.Floor(flatMana * (100m + manaPct) / 100m), 0m, int.MaxValue)
+            : StrengthMana.Maximum(flatMana, str, b.ManaPerFourStrength, manaPct);
         // PoB CalcOffence: accuracy = floor(base * (1 + increased / 100)) with no more multiplier modelled. The
         // Accuracy Mastery can replace the 2 per level and 2 per dexterity, and add Accuracy equal to Intelligence.
         long accuracyPerLevel = 2L + b.AccuracyPerLevel;
@@ -215,15 +263,17 @@ public static class CharacterStats
         int armourPct = b.ArmourPct;
         // Native slot calculations add slot-specific increases to the applicable global bucket. Sum fractional
         // contributions before rounding the final rating (AR 0x142739a97, EV 0x14273114b, ES 0x142533297).
+        // A further slot (the helmet, or the gloves and boots) has its own increase in the same way.
         decimal Increased(decimal total, decimal shield, decimal body, long increase, long shieldIncrease,
-            long bodyIncrease = 0, bool bodyAsArmour = false)
+            long bodyIncrease = 0, bool bodyAsArmour = false, decimal slot = 0, long slotIncrease = 0)
         {
             // Keep each known local source even if the aggregate was saturated while merging equipment.
-            decimal fromShield = Math.Max(0m, shield), fromBody = Math.Max(0m, body);
+            decimal fromShield = Math.Max(0m, shield), fromBody = Math.Max(0m, body), fromSlot = Math.Max(0m, slot);
             decimal bodyFactor = bodyAsArmour ? b.NoBodyArmour ? 0m : b.DoubleBodyArmour ? 2m : 1m : 1m;
-            return Math.Max(0m, total - fromShield - fromBody) * Math.Max(0m, 100m + increase) / 100m
+            return Math.Max(0m, total - fromShield - fromBody - fromSlot) * Math.Max(0m, 100m + increase) / 100m
                 + (b.NoShieldDefences ? 0m : fromShield * Math.Max(0m, 100m + increase + shieldIncrease) / 100m)
-                + fromBody * Math.Max(0m, 100m + increase + bodyIncrease) / 100m * bodyFactor;
+                + fromBody * Math.Max(0m, 100m + increase + bodyIncrease) / 100m * bodyFactor
+                + fromSlot * Math.Max(0m, 100m + increase + slotIncrease) / 100m;
         }
         decimal More(decimal value, decimal increase)
         {
@@ -231,50 +281,60 @@ public static class CharacterStats
             return factor > 1m && value > decimal.MaxValue / factor ? decimal.MaxValue : value * factor;
         }
         int Rating(decimal value) => (int)Math.Clamp(Math.Round(value, MidpointRounding.AwayFromZero), 0m, int.MaxValue);
-        decimal armourValue = More(Increased(b.Armour, b.ShieldArmour, b.BodyArmour, armourPct,
-            (long)b.ShieldArmourPct + b.SharedShieldDefencesPct, bodyAsArmour: true), b.ArmourMorePct);
+        decimal armourValue = More(More(Increased(b.Armour, b.ShieldArmour, b.BodyArmour, armourPct,
+            (long)b.ShieldArmourPct + b.SharedShieldDefencesPct, b.BodyArmourPct, bodyAsArmour: true,
+            b.GlovesBootsArmour, b.GlovesBootsArmourPct), b.ArmourMorePct), b.ExtraDefenceMorePct);
         // These item coefficients use complete groups of final production attributes. They join ordinary INC,
         // before slot increases/MORE; Iron Reflexes retains this item term while excluding inherent Dexterity.
         long ordinaryEvasionPct = (long)b.EvasionPct + b.ColdOvercapEvasionPct
             + (long)b.EvasionPctPerTenIntelligence * (intel / 10);
         long totalEvasionPct = (b.NoDexterityBonuses || b.NoDexterityEvasion ? 0L : dex / 5L) + ordinaryEvasionPct;
         int evasionPct = (int)Math.Clamp(totalEvasionPct, int.MinValue, int.MaxValue);
-        decimal evasionBase = BaseEvasion + b.Evasion;
-        decimal evasionValue = More(Increased(evasionBase, b.ShieldEvasion, b.BodyEvasion, totalEvasionPct,
-            (long)b.ShieldEvasionPct + b.SharedShieldDefencesPct), b.EvasionMorePct);
+        decimal evasionBase = BaseEvasion + b.Evasion + (long)b.EvasionPerTenMaximumLife * (life / 10);
+        decimal evasionValue = More(More(Increased(evasionBase, b.ShieldEvasion, b.BodyEvasion, totalEvasionPct,
+            (long)b.ShieldEvasionPct + b.SharedShieldDefencesPct, b.BodyEvasionPct), b.EvasionMorePct), b.ExtraDefenceMorePct);
         // "Increased evasion while moving" joins the same increased bucket while the condition holds (PoB Condition Moving).
         // shortcut: Iron Reflexes' converted armour does not get it; upgrade when armour reads a moving condition.
         int? evasionWhileMoving = b.EvasionWhileMovingPct == 0 || b.IronReflexes ? null
-            : Rating(More(Increased(evasionBase, b.ShieldEvasion, b.BodyEvasion, totalEvasionPct + b.EvasionWhileMovingPct,
-                (long)b.ShieldEvasionPct + b.SharedShieldDefencesPct), b.EvasionMorePct));
+            : Rating(More(More(Increased(evasionBase, b.ShieldEvasion, b.BodyEvasion, totalEvasionPct + b.EvasionWhileMovingPct,
+                (long)b.ShieldEvasionPct + b.SharedShieldDefencesPct, b.BodyEvasionPct), b.EvasionMorePct), b.ExtraDefenceMorePct));
         if (b.IronReflexes)
         {
             // Iron Reflexes converts all evasion rating to armour and removes dexterity's evasion bonus. The converted
             // evasion keeps the armour, evasion and shared defence increases (each once), but not dexterity.
             long convertedPct = armourPct + ordinaryEvasionPct - b.SharedDefencesPct;
             // Native 0x14273862b also doubles converted body EV, or suppresses it with the no-body-AR flag.
-            decimal converted = More(More(Increased(evasionBase, b.ShieldEvasion, b.BodyEvasion, convertedPct,
-                (long)b.ShieldArmourPct + b.ShieldEvasionPct + b.SharedShieldDefencesPct, bodyAsArmour: true),
-                b.EvasionMorePct), b.ArmourMorePct);
+            // Converted evasion keeps its slot's armour and evasion increases (PoB CalcDefence per slot).
+            decimal converted = More(More(More(Increased(evasionBase, b.ShieldEvasion, b.BodyEvasion, convertedPct,
+                (long)b.ShieldArmourPct + b.ShieldEvasionPct + b.SharedShieldDefencesPct,
+                (long)b.BodyArmourPct + b.BodyEvasionPct, bodyAsArmour: true,
+                b.GlovesBootsEvasion, b.GlovesBootsArmourPct), b.EvasionMorePct), b.ArmourMorePct), b.ExtraDefenceMorePct);
             armourValue = armourValue > decimal.MaxValue - converted ? decimal.MaxValue : armourValue + converted;
             evasionPct = (int)Math.Clamp(ordinaryEvasionPct, int.MinValue, int.MaxValue);
             evasionValue = 0;
         }
         int armour = Rating(armourValue), evasion = Rating(evasionValue);
-        if (b.MentalConditioning)
+        if (b.MentalConditioning && !b.NoMana)
         {
             long rawFlatManaTwice = (long)Math.Clamp(2m * (c.BaseMaxMana + 6L * level + b.Mana
-                + LifeManaPoolSources.AdditionalMana(level, b) + b.AdditionalMana + StrengthMana.Flat(str, b.ManaPerFourStrength))
+                + LifeManaPoolSources.AdditionalMana(level, b) + StrengthMana.Flat(str, b.ManaPerFourStrength))
                 + (b.NoManaFromIntelligence || b.NoIntelligenceBonuses ? 0 : intel), long.MinValue, long.MaxValue);
-            (mana, armour) = PowerOfPurpose.Pools(rawFlatManaTwice, b, intel);
+            (mana, armour) = PowerOfPurpose.Pools(rawFlatManaTwice, b with { ManaPct = manaPct }, intel);
         }
+        if (b.NoMana) mana = 0;
         // Native ClientStrings IntelligenceDescription: 10 Intelligence grants 1% increased ES.
         // Pinned PoB CalcPerform applies complete groups after resolving final attributes.
-        long totalEnergyShieldPct = (b.NoIntelligenceBonuses ? 0L : intel / 10L) + b.EnergyShieldPct
-            + (long)b.EnergyShieldPctPerTenStrength * (str / 10);
+        long totalEnergyShieldPct = (b.NoIntelligenceBonuses || b.NoEnergyShieldFromIntelligence ? 0L : intel / 10L) + b.EnergyShieldPct
+            + (long)b.EnergyShieldPctPerTenStrength * (str / 10)
+            + (b.EnergyShieldStrengthDivisor > 0 ? str / b.EnergyShieldStrengthDivisor : 0);
         int energyShieldPct = (int)Math.Clamp(totalEnergyShieldPct, int.MinValue, int.MaxValue);
-        uint energyShield = (uint)Rating(Increased(b.EnergyShield, b.ShieldEnergyShield, b.BodyEnergyShield,
-            totalEnergyShieldPct, (long)b.ShieldEnergyShieldPct + b.SharedShieldDefencesPct, b.BodyEnergyShieldPct));
+        // Life-to-Shield conversion retains the source's Life increases and gains the destination's Shield increases.
+        decimal convertedShield = lifeConversion == 0 ? 0m : b.ChaosInoculation ? 1m
+            : Math.Max(0m, flatLife) * lifeConversion / 100m
+                * Math.Max(0m, 100m + b.LifePct + totalEnergyShieldPct) / 100m * lifeMore;
+        uint energyShield = b.NoEnergyShield ? 0u : (uint)Rating(Increased(b.EnergyShield, b.ShieldEnergyShield, b.BodyEnergyShield,
+            totalEnergyShieldPct, (long)b.ShieldEnergyShieldPct + b.SharedShieldDefencesPct, b.BodyEnergyShieldPct,
+            slot: b.HelmetEnergyShield, slotIncrease: b.HelmetEnergyShieldPct) + convertedShield);
         int Max(int bonus) => Math.Min(DamageModel.MaxResistCap, DamageModel.DefaultMaxResistance + bonus);
         int maxBlock = Math.Min(DamageModel.BlockChanceCap, DamageModel.DefaultMaxBlockChance + b.BlockChanceMax);
         int maxSpellBlock = Math.Min(DamageModel.BlockChanceCap, DamageModel.DefaultMaxSpellBlockChance + b.SpellBlockChanceMax);
@@ -290,10 +350,8 @@ public static class CharacterStats
         // attack_speed_+%_per_200_accuracy_rating is per 150 in its own text and in the client: floor(accuracy / 150) x value
         // joins increased (0x1427088d0). shortcut: the off hand uses this accuracy and a gem's own accuracy does not count,
         // until a weapon's local accuracy feeds the pools per hand.
-        int attackSpeedPct = (int)Math.Round(
-            ((1 + (b.AttackSpeedPct + accuracy / 150 * b.AttackSpeedPer150Accuracy) / 100.0) * (1 + b.AttackSpeedMorePct / 100.0) - 1) * 100,
-            MidpointRounding.AwayFromZero);
-        attackSpeedPct = Math.Max(-99, attackSpeedPct);
+        int attackSpeedIncreased = b.AttackSpeedPct + accuracy / 150 * b.AttackSpeedPer150Accuracy;
+        int attackSpeedPct = ResolveAttackSpeed(attackSpeedIncreased, b.AttackSpeedMorePct);
         return new(level, life, mana, accuracy, ExperienceFor(level),
             Armour: armour, ArmourPct: armourPct, Evasion: evasion, EvasionPct: evasionPct,
             EnergyShieldPct: energyShieldPct, EnergyShield: energyShield,
@@ -304,7 +362,7 @@ public static class CharacterStats
             LightningResistance: BaseResistance + b.LightningResistance, ChaosResistance: BaseResistance + b.ChaosResistance,
             FireMaxResistance: Max(b.FireMaxResistance), ColdMaxResistance: Max(b.ColdMaxResistance),
             LightningMaxResistance: Max(b.LightningMaxResistance), ChaosMaxResistance: Max(b.ChaosMaxResistance),
-            SpellSuppressionChance: Math.Clamp(b.SpellSuppressionChance + dex / 15 * b.SpellSuppressionPerFifteenDexterity,
+            SpellSuppressionChance: b.ConvertSuppressionToSpellDodge ? 0 : Math.Clamp(b.SpellSuppressionChance + dex / 15 * b.SpellSuppressionPerFifteenDexterity,
                 0, DamageModel.SpellSuppressionChanceCap),
             SpellSuppressionChanceUncapped: b.SpellSuppressionChance + dex / 15 * b.SpellSuppressionPerFifteenDexterity,
             SpellSuppressionEffect: Math.Max(0, DamageModel.SpellSuppressionEffect + b.SpellSuppressionEffect),
@@ -337,8 +395,16 @@ public static class CharacterStats
             ColdOvercapEvasionPct: b.ColdOvercapEvasionPct, LightningOvercapCritPct: b.LightningOvercapCritPct,
             ArmourAppliesToChaosDamage: b.ArmourAppliesToChaosDamage, Ward: WardState.Max(b.Ward, b.WardPct),
             EvasionWhileMoving: evasionWhileMoving)
-            { AttributesResolved = true, AccuracyBase = accuracyBase };
+            {
+                AttributesResolved = true, AccuracyBase = accuracyBase,
+                AttackSpeedIncreasedPct = attackSpeedIncreased, AttackSpeedMorePct = b.AttackSpeedMorePct,
+                ConvertSuppressionToSpellDodge = b.ConvertSuppressionToSpellDodge, BaseSpellDodgeChance = b.BaseSpellDodgeChance,
+            };
     }
+
+    static int ResolveAttackSpeed(long increased, int more) => (int)Math.Clamp(
+        Math.Round(((1 + increased / 100d) * (1 + more / 100d) - 1) * 100d, MidpointRounding.AwayFromZero),
+        -99, int.MaxValue);
 
     private static uint[] Experience = default!;
 

@@ -48,9 +48,7 @@ penalties."), up to the threshold of the first level whose requirement the chara
 does not meet and the last level's threshold (a support gem too; a gem in an
 inactive item, at its last level, or at experience -1, a corrupted gem over its cap, nothing). All the gems change in
 one step under the inventory's lock (`PlayerInventories.ChangeSocketedGems`), written into the gem inside the socket
-list, and are sent as the socket's equipment row 0x00bf item change, each item once with all its gems — the same item
-id removed and added again, the replace idiom: an addition of a known id alone is dropped as a duplicate and the client
-keeps the stale gem (live 2026-10-23). One item change per row per kill; the client's XP bar and tooltip follow. A
+list, and are sent incrementally via **S→C 0x00c3** (6 bytes, class `0x1431767e8`, read `0x140911270`, dispatcher `0x142154507` → `0x14217a930`: `u32 BE experience` carrying the already-10% share directly without resending full item blobs). Because `0x14217a930` scales by player stats `214`/`3005`, blue-socket item stat `6648`, and local gem stat `234`, and does not skip inactive items or character-level stalls, the server falls back to the equipment row `0x00bf` replace idiom whenever any of those conditions or a level-up applies. A
 level's costs, damage and reservation ride the skills, so a level-up also re-sends the skills (the 0x20 Actor update,
 `SendSkills`), the same thing an equipment change does.
 
@@ -239,13 +237,15 @@ sets the offer's `QuestFlag` (the "taken" flag) in one save. The Gateway now off
 (level-8 magic armours, magic belts) are skipped, as are offers with no buildable choice. Checked live 2026-10-26 on
 offer 3 after `/quest_flag a1q4-PlacedGlyphs`: the six Witch gems, claim, flag and repeat refusal.
 
-**Local Nessa shop.** This checkout restores Nessa's full testing assortment independently of character class and
-quest completion (`NpcShops.Tabs`, `fullGemStock`). Every writable gem with a positive drop level has a tab.
+**Nessa's development tabs.** In a league that lists the mod `nessadevelopmenttabs` (LocalExile-Mods) with its `mode`
+set to `replace`, Nessa sells the full testing assortment independently of character class and quest completion
+(`NpcShops.Tabs`, `fullGemStock`); its default `add` keeps her progression tabs and adds only Awakened Gems, Exceptional
+Gems and the map tabs, and Standard leaves both off ([17](17-npcs.md), Tabs). Every writable gem with a positive drop level has a tab.
 Awakened Gems and Exceptional Gems are separate tabs; the ordinary red/green/blue skill and support tabs contain the
 creatable ordinary variants (transfigured, Trarthan and creatable Vaal) and leave awakened and exceptional gems out;
 legacy alternate rows the catalog cannot create stay out of the colour tabs too.
 White Skills contains both white active and support gems. Full 12-by-12 pages continue as numbered tabs instead of
-dropping overflow. These tabs are permanent development tools: they must always contain the complete assortment
+dropping overflow. These tabs are development tools: they contain the complete assortment
 without quest or class gates, so command and mechanic development does not depend on completing the campaign.
 The separate Skills tab is the future gameplay shop: only ordinary gems unlocked by the character's quest flags
 and class through GemVendorStock.Stock, at the existing vendor prices. It is shown only when it has stock;

@@ -33,8 +33,8 @@ public static class ShrineManager
     {
         public readonly SemaphoreSlim Gate = new(1, 1);
         public readonly Dictionary<uint, ShrineInstance> Instances = [];
-        // The shrines the area's clients were shown (each one the area's object, created once).
-        public readonly HashSet<uint> Shown = [], Spent = [];
+        // The shrines the area's clients were shown (each one the area's object, created once), spent, and guard-spawned.
+        public readonly HashSet<uint> Shown = [], Spent = [], GuardsSpawned = [];
         public bool Spawned;
     }
 
@@ -43,11 +43,27 @@ public static class ShrineManager
         public SharedArea Area = area;
         public Dictionary<uint, ShrineInstance> Instances => Area.Instances;
         public readonly Dictionary<ushort, ActiveBuff> Buffs = [];
+        public readonly List<int> PendingKillShrineDurations = [];
+        public double NextAscendancyShrineAt;
+        public double NextPeriodicShrineAt;
+        public double NextBloodShrineAt;
         public int Token;
     }
 
+    /// <summary>Base duration in seconds for periodic random shrine grants (ClientStrings ReminderTextRandomShrineDuration).</summary>
+    public const int RandomShrineBaseDurationSeconds = 20;
+
+    static readonly string[] BloodShrineIds =
+        ["BloodShrineRat", "BloodShrineSwarm", "BloodShrineToad", "BloodShrineCrow", "BloodShrineBat"];
+
+    public static IReadOnlyList<ShrineCatalog.ShrineDefinition> BloodShrines =>
+        [.. ShrineCatalog.All.Where(s => BloodShrineIds.Contains(s.Id))];
+
     static readonly ConditionalWeakTable<InstanceState, SharedArea> Areas = new();
     static readonly ConditionalWeakTable<Player, AreaState> States = new();
+    public static bool HasBuff(Player player, ushort buffRow) =>
+        !player.Closed && !player.LeavingArea && player.PlayerLife > 0 && States.TryGetValue(player, out var state)
+        && state.Buffs.TryGetValue(buffRow, out var buff) && buff.EndsAt > AreaTime(player);
     static AreaState Of(Player player) => States.GetValue(player,
         c => new(c.Instance is { } instance ? Areas.GetOrCreateValue(instance) : new()));
     static string ClaimKey(ShrineInstance shrine) => shrine.Definition.Lesser ? $"Shrines/used-lesser/{shrine.ObjectId}"
@@ -66,17 +82,23 @@ public static class ShrineManager
             {
                 state.Area.Spawned = true;
                 if (player.Layout.Walkable is { } walk && ServerLevels.For(player.Layout.Id, player.Seed) is { } level)
-                    foreach (var placed in ShrinePlacement.Plan(level.RoomObjects, walk, player.Seed))
-                        await Create(player, NewInstance(placed.Shrine, placed.X, placed.Y, placed.Rotation, placed.Model));
+                    foreach (var placed in MapShrines.Plan(level.RoomObjects, walk, player.Seed, MapModsOf(player)))
+                        await Create(player, NewInstance(placed.Shrine, placed.X, placed.Y, placed.Rotation, placed.Model), spawnGuards: false);
                 if (player.Instance is { } instance)
-                    foreach (var (key, value) in instance.ContentState.Where(p => p.Key.StartsWith("Shrines/lesser/", StringComparison.Ordinal)))
+                    foreach (var (key, value) in instance.ContentState.Where(p => p.Key.StartsWith("Shrines/lesser/", StringComparison.Ordinal)).ToArray())
                     {
                         var kept = JsonSerializer.Deserialize<KeptLesser>(value)!;
-                        if (kept.Until <= AreaTime(player)) { instance.ContentState.TryRemove(key, out _); continue; }
+                        uint id = uint.Parse(key["Shrines/lesser/".Length..]);
+                        if (kept.Until <= AreaTime(player))
+                        {
+                            instance.ContentState.TryRemove(key, out _);
+                            if (state.Area.Shown.Remove(id)) await SendWorldRemoval(player, id, null);
+                            continue;
+                        }
                         if (ShrineCatalog.Find(kept.Type) is not { Lesser: true } type) continue;
                         var lesser = NewInstance(type, kept.X, kept.Y, 0, null);
                         lesser.ExpiresAt = kept.Until;
-                        await Create(player, lesser, uint.Parse(key["Shrines/lesser/".Length..]));
+                        await Create(player, lesser, id);
                     }
             }
             foreach (var shrine in state.Instances.Values) await Present(player, shrine);
@@ -103,7 +125,7 @@ public static class ShrineManager
     /// <summary>Creates one shrine object at its cell and registers it for clicks. The Shrines row goes in the object's
     /// Shrine component (the client draws that row's buff icon over it), so the icon and the buff the click grants are
     /// one value.</summary>
-    static async Task Create(Player player, ShrineInstance shrine, uint restoredId = 0)
+    static async Task Create(Player player, ShrineInstance shrine, uint restoredId = 0, bool spawnGuards = true)
     {
         uint id = restoredId != 0 ? restoredId : !shrine.Definition.Lesser && player.Instance is { } instance
             ? uint.Parse(instance.ContentState.GetOrAdd($"Shrines/id/{shrine.At.X}/{shrine.At.Y}", _ => player.TakeObjectId().ToString()))
@@ -116,7 +138,12 @@ public static class ShrineManager
         Of(player).Instances[id] = shrine;
         await Present(player, shrine);
         if (shrine.State == ShrineState.Inactive)
-            foreach (var effect in shrine.Before) await effect.OnSpawn(new(player, AreaTime(player)), shrine);
+        {
+            bool shouldSpawnGuards = spawnGuards && Of(player).Area.GuardsSpawned.Add(id);
+            foreach (var effect in shrine.Before)
+                if (shouldSpawnGuards || effect is not GuardedPacksEffect)
+                    await effect.OnSpawn(new(player, AreaTime(player)), shrine);
+        }
     }
 
     static async Task Present(Player player, ShrineInstance shrine)
@@ -143,6 +170,21 @@ public static class ShrineManager
             var shrine = NewInstance(definition, cell.X, cell.Y, 0, null);
             shrine.ExpiresAt = AreaTime(player) + seconds;
             await Create(player, shrine);
+        }
+        finally { state.Area.Gate.Release(); }
+    }
+
+    /// <summary>Places one unguarded shrine near its recipient using the ordinary area object and claim path.</summary>
+    public static async Task SpawnReward(Player player, string type)
+    {
+        if (ShrineCatalog.Find(type) is not { } definition || player.Layout.Walkable is not { } walk) return;
+        var state = Of(player);
+        await state.Area.Gate.WaitAsync();
+        try
+        {
+            var (x, y) = player.Walk.Position(AreaTime(player));
+            var cell = Clear(walk, x + ShrinePlacement.ObjectSize + 5, y, ShrinePlacement.ObjectSize + 6);
+            await Create(player, NewInstance(definition, cell.X, cell.Y, 0, ShrinePlacement.DefaultModel), spawnGuards: false);
         }
         finally { state.Area.Gate.Release(); }
     }
@@ -233,10 +275,10 @@ public static class ShrineManager
                 shrine.State = ShrineState.Used;
                 var ctx = new ShrineContext(player, AreaTime(player));
                 foreach (var effect in shrine.Before) await effect.OnActivation(ctx, shrine);
+                await Spent(player, shrine, player.Id);
                 uint party = PartyRoster.PartyOf(player);
                 foreach (var member in Members(player))
                 {
-                    await Spent(member, shrine);
                     if (member.PlayerLife == 0) continue;
                     if (!ReferenceEquals(member, player) && (shrine.Definition.Monster is null || party == 0
                         || PartyRoster.PartyOf(member) != party || Dist(member.Walk.Position(ctx.Now), shrine.At) > NearbyRadius)) continue;
@@ -246,7 +288,22 @@ public static class ShrineManager
                     personal.State = ShrineState.Used;
                     personal.ActivatedAt = ctx.Now;
                     await Grant(member, personal, new(member, AreaTime(member)));
+                    if (!shrine.Definition.Lesser && !shrine.Definition.PvPOnly
+                        && (MapModsOf(member)?.Get(Stat.MapShrinesGrantARandomAdditionalEffect) ?? 0) > 0)
+                    {
+                        var pool = ShrineCatalog.Standard.Where(s => !string.Equals(s.Id, shrine.Definition.Id, StringComparison.Ordinal)).ToArray();
+                        if (pool.Length > 0)
+                        {
+                            var bonusDef = pool[AreaRng(member).Next(pool.Length)];
+                            var bonusShrine = NewInstance(bonusDef, shrine.At.X, shrine.At.Y, shrine.Rotation, shrine.Model);
+                            bonusShrine.ObjectId = shrine.ObjectId;
+                            bonusShrine.State = ShrineState.Used;
+                            bonusShrine.ActivatedAt = ctx.Now;
+                            await Grant(member, bonusShrine, new(member, AreaTime(member)));
+                        }
+                    }
                 }
+                if (shrine.Definition.Lesser) CleanupLesser(player, state.Area, shrine);
             }
         }
         finally { state.Area.Gate.Release(); }
@@ -255,27 +312,26 @@ public static class ShrineManager
         return true;
     }
 
-    /// <summary>The claimed shrine's object again, in the same place with the same model, but with the Shrine component's
-    /// "no shrine" key (<see cref="NoShrineRow"/>): the icon it drew and its interaction are gone with the row. The object
-    /// id is kept, so the client replaces the one it has (the opened-chest pattern).</summary>
-    // A used shrine changes for every client at once (its members' loops call this for each of them).
-    static async Task Spent(Player player, ShrineInstance shrine)
+    static void CleanupLesser(Player player, SharedArea area, ShrineInstance shrine)
+    {
+        area.Shown.Remove(shrine.ObjectId);
+        area.Instances.Remove(shrine.ObjectId);
+        player.Instance?.ContentState.TryRemove($"Shrines/lesser/{shrine.ObjectId}", out _);
+        player.Instance?.ContentState.TryRemove(ClaimKey(shrine), out _);
+    }
+
+    /// <summary>Updates the shrine's Shrine component in place via S→C 0x2bc (reader 0x1415e49f0) with the claimed flag
+    /// and the taker's object id so the client plays the claim clip, ShrineSounds, and Shrines.Description for the
+    /// local taker without deleting and recreating the shrine.</summary>
+    // A used shrine changes for every client in the area.
+    static async Task Spent(Player player, ShrineInstance shrine, uint takerObjectId)
     {
         if (!Of(player).Area.Spent.Add(shrine.ObjectId)) return;
-        await SendWorldRemoval(player, shrine.ObjectId, null);
+        await SendWorldRecord(player, shrine.ObjectId,
+            InstanceEntities.ShrineUpdate(shrine.ObjectId, (byte)shrine.Definition.Row, takerObjectId, claimed: true),
+            $"0x02bc shrine 0x{shrine.ObjectId:x} {shrine.Definition.Id} claimed by 0x{takerObjectId:x}");
         if (shrine.Definition.Lesser)
-        {
-            Of(player).Area.Shown.Remove(shrine.ObjectId);
-            Of(player).Instances.Remove(shrine.ObjectId);
-            player.Instance?.ContentState.TryRemove($"Shrines/lesser/{shrine.ObjectId}", out _);
-            player.Instance?.ContentState.TryRemove(ClaimKey(shrine), out _);
-            return;
-        }
-        await SendWorldCreate(player, shrine.ObjectId,
-            InstanceEntities.CreateObject(shrine.ObjectId, InstanceEntities.ObjectTypeHash(ShrinePlacement.Type),
-                new ShrineObject(shrine.At.X, shrine.At.Y, shrine.Rotation, Model: shrine.Model, Row: NoShrineRow).Blob()),
-            $"0x02bb shrine 0x{shrine.ObjectId:x} {shrine.Definition.Id} used (no row, no icon, not interactable)");
-        await SendWorldRecord(player, shrine.ObjectId, InstanceProtocol.EnterWakeZone(shrine.ObjectId), null);
+            await SendWorldRemoval(player, shrine.ObjectId, null);
     }
 
     /// <summary>Whether this shrine's buff grants a stat the client only reads from the skill panel, so the panel has to
@@ -290,19 +346,21 @@ public static class ShrineManager
 
     /// <summary>Grants the shrine's buff for its row's duration and starts its effect. A second shrine of the same row
     /// replaces the first: its buff is removed before the new one, and the older timer cannot remove the newer buff.</summary>
-    static async Task Grant(Player player, ShrineInstance shrine, ShrineContext ctx)
+    static async Task Grant(Player player, ShrineInstance shrine, ShrineContext ctx, bool mapGranted = true)
     {
         var state = Of(player);
         var definition = shrine.Definition;
         var playerStats = CharacterPlayerStats(player);
         int Stat(uint key) => playerStats.GetValueOrDefault(key);
         int duration = Stat(global::Stat.ShrineEffectDurationPlusPct) + (MapModsOf(player)?.Get(global::Stat.MapPlayerShrineEffectDurationPlusPct) ?? 0);
-        if (!definition.Lesser) duration += MapModsOf(player)?.Get(global::Stat.MapShrineGrantedPlayerBuffDurationPlusPct) ?? 0;
+        if (mapGranted && !definition.Lesser) duration += MapModsOf(player)?.Get(global::Stat.MapShrineGrantedPlayerBuffDurationPlusPct) ?? 0;
         shrine.Duration = Math.Clamp(shrine.Duration * Math.Max(0L, 100L + duration) / 100, 0, int.MaxValue);
-        int effectPercent = Stat(global::Stat.ShrineBuffEffectOnSelfPlusPct) + (MapModsOf(player)?.Get(global::Stat.MapPlayerShrineBuffEffectOnSelfPlusPct) ?? 0);
-        if (!definition.Lesser) effectPercent += MapModsOf(player)?.Get(global::Stat.MapShrineGrantedPlayerBuffEffectPlusPct) ?? 0;
-        if (effectPercent != 0 && (definition.Monster is not null || definition.Lesser))
-            shrine.Stats = shrine.Stats.Select(s => (s.Key, s.Key is global::Stat.HasShrineEffect or global::Stat.AlwaysCrit or global::Stat.BaseCannotBeDamaged or global::Stat.GlobalKnockback or global::Stat.ExtraGore
+        int effectPercent = ShrineGearEffects.EffectiveShrineEffectPct(player, Stat, mapGranted && !definition.Lesser);
+        if (effectPercent != 0)
+            shrine.Stats = shrine.Stats.Select(s => (s.Key, s.Key is global::Stat.HasShrineEffect or global::Stat.AlwaysCrit
+                or global::Stat.BaseCannotBeDamaged or global::Stat.BaseCannotBeStunned
+                or global::Stat.SelfTakeNoExtraDamageFromCriticalStrikes or global::Stat.GlobalKnockback
+                or global::Stat.ExtraGore or global::Stat.SkillRepeatCount
                 ? s.Value : (int)Math.Clamp((long)s.Value * Math.Max(0L, 100L + effectPercent) / 100, int.MinValue, int.MaxValue))).ToArray();
         ActiveBuff? previous;
         previous = state.Buffs.GetValueOrDefault(definition.BuffRow);
@@ -342,6 +400,27 @@ public static class ShrineManager
         foreach (var effect in shrine.After) await effect.OnBuffApplied(ctx, shrine);
     }
 
+    /// <summary>Right-click cancellation (C→S 0x004b): ends the active shrine buff published under wire instance
+    /// <paramref name="buffInstance"/> when its BuffDefinitions row is marked Removable.</summary>
+    public static async Task<bool> CancelBuff(Player player, ushort buffInstance)
+    {
+        if (buffInstance == 0 || player.Closed || player.LeavingArea || player.PlayerLife == 0) return false;
+        if (player.Area.Buffs.Find(player.Id, buffInstance) is not { } active
+            || active.Source != player.Id || !global::Game.IsRemovableBuff(active.Row))
+            return false;
+        if (!States.TryGetValue(player, out var state)) return false;
+        await state.Area.Gate.WaitAsync();
+        try
+        {
+            if (player.Closed || player.LeavingArea || player.PlayerLife == 0
+                || !state.Buffs.TryGetValue(active.Row, out var buff))
+                return false;
+            await EndBuff(player, active.Row, buff);
+            return true;
+        }
+        finally { state.Area.Gate.Release(); }
+    }
+
     /// <summary>The buff's duration ending: the icon, its stats and its effect go together, and only if this granted
     /// buff is still the connection's buff of that row (a later shrine of the same row replaced it otherwise). Called
     /// from the tick at <see cref="ActiveBuff.EndsAt"/>, so it stops with the area instead of outliving it.</summary>
@@ -367,6 +446,35 @@ public static class ShrineManager
         foreach (var effect in buff.Shrine.After) await effect.OnExpired(ctx, buff.Shrine);
     }
 
+    public static async Task GrantRandomShrine(Player player, IReadOnlyList<ShrineCatalog.ShrineDefinition> pool,
+        int baseDurationSeconds, ShrineContext ctx)
+    {
+        if (pool.Count == 0 || player.Closed || player.LeavingArea || player.PlayerLife == 0) return;
+        var state = Of(player);
+        var available = pool.Where(s => !state.Buffs.ContainsKey(s.BuffRow)).ToArray();
+        var choices = available.Length > 0 ? available : pool;
+        var chosen = choices[AreaRng(player).Next(choices.Count)];
+        var here = player.Walk.Position(ctx.Now);
+        var personal = NewInstance(chosen, here.X, here.Y, 0, null);
+        personal.State = ShrineState.Used;
+        personal.ActivatedAt = ctx.Now;
+        personal.Duration = Math.Max(1, baseDurationSeconds);
+        await Grant(player, personal, ctx, mapGranted: false);
+    }
+
+    public static void OnKill(KillContext kill)
+    {
+        if (!kill.PlayerKill || kill.Player.PlayerLife == 0 || kill.Monster.Rarity is not (MonsterRarity.Rare or MonsterRarity.Unique))
+            return;
+        var player = kill.Player;
+        var playerStats = CharacterPlayerStats(player);
+        int centiseconds = playerStats.GetValueOrDefault(Stat.GainShrineBuffOnRareOrUniqueKillCentiseconds);
+        if (centiseconds <= 0) return;
+        var state = Of(player);
+        lock (state.PendingKillShrineDurations)
+            state.PendingKillShrineDurations.Add(Math.Max(1, centiseconds / 100));
+    }
+
     // ---- Per-tick, stats and cleanup ------------------------------------------------------------------------------
 
     /// <summary>One player tick: the unclaimed shrines' neighbourhood steps (monsters coming near and leaving) and the
@@ -385,7 +493,8 @@ public static class ShrineManager
             foreach (var expired in state.Instances.Values.Where(s => s.ExpiresAt <= now).ToArray())
             {
                 expired.State = ShrineState.Used;
-                foreach (var member in Members(player)) await Spent(member, expired);
+                await Spent(player, expired, 0);
+                if (expired.Definition.Lesser) CleanupLesser(player, state.Area, expired);
             }
             // One driver for the physical area's hazards and auras, even when a party shares it.
             if (ReferenceEquals(Members(player).Where(c => c.Connection.PlayerSent).MinBy(c => c.Id), player))
@@ -407,12 +516,50 @@ public static class ShrineManager
             foreach (var (row, buff) in state.Buffs.ToArray())
                 if (player.PlayerLife == 0 || buff.EndsAt <= now) await EndBuff(player, row, buff);
                 else foreach (var effect in buff.Shrine.After) await effect.Tick(ctx, buff.Shrine);
+
+            if (player.PlayerLife > 0 && !InTown(player))
+            {
+                int[] killDurations;
+                lock (state.PendingKillShrineDurations)
+                {
+                    killDurations = [.. state.PendingKillShrineDurations];
+                    state.PendingKillShrineDurations.Clear();
+                }
+                foreach (int seconds in killDurations)
+                    await GrantRandomShrine(player, ShrineCatalog.Standard, seconds, ctx);
+
+                var playerStats = CharacterPlayerStats(player);
+                int ascendancyMs = playerStats.GetValueOrDefault(Stat.GainShrineBuffEveryXMsFromAscendancy);
+                if (ascendancyMs <= 0) state.NextAscendancyShrineAt = 0;
+                else if (now >= state.NextAscendancyShrineAt)
+                {
+                    state.NextAscendancyShrineAt = now + ascendancyMs / 1000.0;
+                    await GrantRandomShrine(player, ShrineCatalog.Standard, RandomShrineBaseDurationSeconds, ctx);
+                }
+
+                int periodicMs = playerStats.GetValueOrDefault(Stat.GainShrineBuffEveryXMs);
+                if (periodicMs <= 0) state.NextPeriodicShrineAt = 0;
+                else if (now >= state.NextPeriodicShrineAt)
+                {
+                    state.NextPeriodicShrineAt = now + periodicMs / 1000.0;
+                    await GrantRandomShrine(player, ShrineCatalog.Standard, RandomShrineBaseDurationSeconds, ctx);
+                }
+
+                int bloodMs = playerStats.GetValueOrDefault(Stat.GainBloodShrineBuffEveryXMsFromUnique);
+                if (bloodMs <= 0) state.NextBloodShrineAt = 0;
+                else if (now >= state.NextBloodShrineAt)
+                {
+                    state.NextBloodShrineAt = now + bloodMs / 1000.0;
+                    await GrantRandomShrine(player, BloodShrines, RandomShrineBaseDurationSeconds, ctx);
+                }
+            }
         }
         finally { state.Area.Gate.Release(); }
     }
 
     public static async Task LeaveArea(Player player)
     {
+        EvolutionShrine.LeaveArea(player);
         if (!States.TryGetValue(player, out var state)) return;
         await state.Area.Gate.WaitAsync();
         try
@@ -460,7 +607,7 @@ public static class ShrineManager
             if (hit.Damage > 0)
             {
                 var stats = CharacterPlayerStats(player);
-                ApplyPlayerAilmentsLocked(player, DamagePacket.Of(type, amount, amount), DamagePacket.Of(type, hit.Damage, hit.Damage),
+                ApplyPlayerAilmentsLocked(player, DamagePacket.Of(type, amount, amount), hit.Taken,
                     false, hit.Blocked, AreaTime(player), stats);
             }
             Note("shrine spell hit");

@@ -17,11 +17,40 @@ public static partial class Game
     {
         if (!CurrentGameWork) return;
         if (player.RageRetired || player.PlayerLife == 0) return;
-        var inputs = RageStats.Inputs(name => RageStat(stats, name));
+        var inputs = RageStats.Inputs(player, name => RageStat(stats, name));
         // Stat projections must not advance Rage past an unprocessed projectile contact.
         var value = player.Rage.Read(ProjectileWorldTime(player), inputs);
         if (player.Rage.NextChangeAt() is double next) StatsChangeAt(next, () => ProjectileWorldTime(player));
         RageStats.ExpandItems(stats, value.Effective);
+        if (value.Effective > 0)
+        {
+            int stun = RageStat(stats, Stat.StunThresholdPlusPctPerRage);
+            if (stun != 0)
+                stats[Stat.StunThresholdPlusPct] = ActorScale.Saturate(
+                    (long)RageStat(stats, Stat.StunThresholdPlusPct) + (long)stun * value.Effective);
+        }
+        int speedPerRage = RageStat(stats, Stat.AttackSpeedPlusPctPerRage);
+        long rageAttackSpeed = (long)speedPerRage * value.Effective;
+        if (speedPerRage != 0)
+            stats[Stat.AttackSpeedPlusPctFromRage] = ActorScale.Saturate(rageAttackSpeed);
+        int movePer5Rage = RageStat(stats, Stat.MovementSpeedPlusPctPer5Rage);
+        if (movePer5Rage != 0)
+            stats[Stat.MovementSpeedPlusPctFromRage] = ActorScale.Saturate((long)(value.Effective / 5) * movePer5Rage);
+        bool grantsCastSpeed = rageAttackSpeed != 0 && RageStat(stats, Stat.RageGrantsCastSpeedInstead) != 0;
+        if (grantsCastSpeed)
+            stats[Stat.CastSpeedPlusPct] = ActorScale.Saturate(
+                (long)RageStat(stats, Stat.CastSpeedPlusPct) + rageAttackSpeed);
+        long increased = (grantsCastSpeed ? 0L : rageAttackSpeed)
+            + CorpsePactSpeed(player, stats, AreaTime(player));
+        if (RageStat(stats, Stat.AttackSpeedPlusPctPerMinionUpTo80Pct) is int perMinion and > 0)
+            increased += Math.Min(80L, (long)perMinion * stats.GetValueOrDefault(Stat.NumberOfActiveMinions));
+        if (increased != 0)
+        {
+            var pools = player.Pools;
+            stats[Stat.MainHandAttackSpeedPlusPct] = ActorScale.Saturate(
+                (long)RageStat(stats, Stat.MainHandAttackSpeedPlusPct)
+                + pools.AttackSpeedWithIncrease(increased) - pools.AttackSpeedPct);
+        }
         foreach (var (name, amount) in RageStats.Display(value, inputs))
             if (name is var key) stats[key] = amount;
     }
@@ -29,6 +58,11 @@ public static partial class Game
     // Only accepted contacts call these, in the same Monsters critical section as life mutation, before any await.
     public static bool RageOnHitLocked(Player player, bool attack, bool melee, bool critical,
         IReadOnlyDictionary<uint, int>? own = null, Random? random = null, IReadOnlyDictionary<uint, int>? playerStats = null)
+        => RageOnHitWithWeaponLocked(player, attack, melee, critical, null, own, random, playerStats);
+
+    static bool RageOnHitWithWeaponLocked(Player player, bool attack, bool melee, bool critical, string? weaponClass,
+        IReadOnlyDictionary<uint, int>? own = null, Random? random = null, IReadOnlyDictionary<uint, int>? playerStats = null,
+        string? secondWeaponClass = null, SpawnedMonster? target = null)
     {
         if (player.Character.Name is null || player.Closed || player.LeavingArea || player.RageRetired
             || player.Paused || player.PlayerLife == 0) return false;
@@ -36,8 +70,30 @@ public static partial class Game
         int Get(uint name) => (int)Math.Clamp((long)RageStat(playerStats, name)
             + (own is null ? 0 : RageStat(own, name)), int.MinValue, int.MaxValue);
         var inputs = RageStats.Inputs(Get);
+        if (attack)
+        {
+            string? primary = WeaponTypeDamage.FamilyOf(weaponClass);
+            string? secondary = WeaponTypeDamage.FamilyOf(secondWeaponClass);
+            bool axe = primary == "axe" || secondary == "axe";
+            if (axe || primary == "sword" || secondary == "sword")
+            {
+                long weaponRage = Get(Stat.GainXRageOnHitWithAxesSwords);
+                if (axe) weaponRage += Get(Stat.GainXRageOnHitWithAxes);
+                inputs = inputs with { GainOnAttackHit = ActorScale.Saturate(inputs.GainOnAttackHit + weaponRage) };
+            }
+        }
+        if (attack && target is not null && TrarthusAttachmentRage(player, target) is > 0 and var trarthusRage)
+            inputs = inputs with { GainOnAttackHit = ActorScale.Saturate((long)inputs.GainOnAttackHit + trarthusRage) };
         return player.Rage.Hit(ProjectileWorldTime(player), inputs, attack, melee, critical, (random ?? AreaRng(player)).Next(100),
-            soulGainPrevention: Get(Stat.HasSoulGainPrevention) != 0);
+            soulGainPrevention: Get(Stat.HasSoulGainPrevention) != 0, nonDelayingRegenerationPerMinute: RageStats.ManaRegenerationPerMinute(player, Get));
+    }
+
+    internal static void RageOnMarkedStunLocked(Player player, int rage, double now)
+    {
+        if (player.RageRetired || player.Closed || player.LeavingArea || player.Paused || player.PlayerLife == 0) return;
+        var stats = CharacterPlayerStats(player);
+        int Get(uint name) => RageStat(stats, name);
+        player.Rage.Gain(rage, ProjectileWorldTime(player), RageStats.Inputs(player, Get), Get(Stat.HasSoulGainPrevention) != 0);
     }
 
     public static void RageWhenHitLocked(Player player)
@@ -45,11 +101,27 @@ public static partial class Game
         if (player.RageRetired || player.Closed || player.LeavingArea || player.Paused) return;
         // The lethal hit retires combat here, before PlayerDiedAtEpoch: the orb's stage icon must be queued for removal
         // first, or RetireOwnedCombat drops the runtime and the icon keeps the charges the player died with.
-        if (player.PlayerLife == 0) { player.Rage.Clear(); player.Rampage.Clear(); WinterOrbRetire(player); SnipeRetire(player); MirageWarriorsRetire(player); player.RetireOwnedCombat(); return; }
+        if (player.PlayerLife == 0)
+        {
+            player.Rage.Clear();
+            player.Rampage.Clear();
+            ClearCycloneStages(player);
+            ClearReaveStages(player);
+            RetireBladeFlurry(player, player.ChannelGeneration);
+            WinterOrbRetire(player);
+            SnipeRetire(player);
+            MirageWarriorsRetire(player);
+            player.RetireOwnedCombat();
+            return;
+        }
         if (player.Character.Name is null) return;
         var stats = CharacterPlayerStats(player);
-        player.Rage.EnemyHit(ProjectileWorldTime(player), RageStats.Inputs(name => RageStat(stats, name)),
-            AreaRng(player).Next(100), soulGainPrevention: RageStat(stats, Stat.HasSoulGainPrevention) != 0);
+        var inputs = RageStats.Inputs(player, name => RageStat(stats, name));
+        double now = ProjectileWorldTime(player);
+        int before = player.Rage.Read(now, inputs).Effective;
+        player.Rage.EnemyHit(now, inputs, AreaRng(player).Next(100), soulGainPrevention: RageStat(stats, Stat.HasSoulGainPrevention) != 0);
+        if (RageStat(stats, Stat.ArmourPlusPctPerRage) != 0 && player.Rage.Read(now, inputs).Effective != before)
+            player.Pools = PoolsFor(player, player.Pools.Level);
     }
 
     public static void ClearRageOnDeath(Player player)
@@ -64,7 +136,7 @@ public static partial class Game
         if (player.RageRetired || player.Closed) return;
         var stats = CharacterPlayerStats(player);
         if (player.PlayerLife == 0) player.Rage.Clear();
-        var state = player.Rage.Carry(AreaTime(player), RageStats.Inputs(name => RageStat(stats, name)));
+        var state = player.Rage.Carry(AreaTime(player), RageStats.Inputs(player, name => RageStat(stats, name)));
         player.Retire();
         foreach (var (old, entry) in CarriedRage)
             if (DateTime.UtcNow - entry.At > TimeSpan.FromMinutes(5)) CarriedRage.TryRemove(old, out _);
@@ -95,7 +167,7 @@ public static partial class Game
     {
         if (!CurrentGameWork) return [];
         var stats = CharacterPlayerStats(player);
-        var inputs = RageStats.Inputs(name => RageStat(stats, name));
+        var inputs = RageStats.Inputs(player, name => RageStat(stats, name));
         var value = player.Rage.Read(ProjectileWorldTime(player), inputs);
         bool prevention = RageStat(stats, Stat.HasSoulGainPrevention) != 0;
         // "when you reach Maximum Rage while a Unique Enemy is in your Presence" (Loyalty Tattoo of Akoya).
@@ -103,6 +175,17 @@ public static partial class Game
             && (player.SentRage is not { } sent || sent.Maximum == 0 || sent.Current < sent.Maximum))
             LoyaltyMaxRageLocked(player, stats);
         if (player.SentRage == value && player.SentVaalPrevention == prevention) return [];
+        bool speedChanged = RageStat(stats, Stat.MovementSpeedPlusPctPer5Rage) != 0
+            && (player.SentRage?.Effective ?? 0) / 5 != value.Effective / 5;
+        bool armourChanged = RageStat(stats, Stat.ArmourPlusPctPerRage) != 0
+            && (player.SentRage?.Effective ?? 0) != value.Effective;
+        if (speedChanged || armourChanged)
+        {
+            // Update pools so both incoming-hit armour and panel stats follow the new Rage; update predictive walk speed too.
+            player.Pools = PoolsFor(player, player.Pools.Level);
+            if (speedChanged) player.ApplyMovementSpeedAt(AreaTime(player));
+            stats = CharacterPlayerStats(player);
+        }
         var bytes = new List<byte>();
         player.RageBuff = (ushort)(value.Current > 0 ? 1 : 0);
         if (value.Current > 0) player.Area.Buffs.Set(player.Id, new(1060, player.Id, Stacks: (ushort)Math.Min(ushort.MaxValue, value.Current)));
@@ -129,13 +212,16 @@ public static partial class Game
         InventoryItem[] Equipment, Dictionary<string, CharacterSaves.SavedCosmetic> Cosmetics,
         CharacterStats.Pools Pools, uint Life, bool LockstepClient)
     {
+        public string Stance { get; init; } = StanceCatalog.BloodSelection;
+
         public static SkillSnapshotInputs Capture(Player player, IReadOnlyDictionary<uint, int> stats) =>
             new(new Dictionary<uint, int>(stats), [.. ItemsOf(player).EquipmentSnapshot().Select(e => e.Item)],
-                new(CharacterSaves.SkillCosmetics(CharacterName(player))), player.Pools, player.PlayerLife, player.Connection.LockstepClient);
+                new(CharacterSaves.SkillCosmetics(CharacterName(player))), player.Pools, player.PlayerLife, player.Connection.LockstepClient)
+            { Stance = player.Stance };
 
         public bool Matches(Player player, IReadOnlyDictionary<uint, int> stats)
         {
-            if (LockstepClient != player.Connection.LockstepClient || Pools != player.Pools || Life != player.PlayerLife || Stats.Count != stats.Count
+            if (LockstepClient != player.Connection.LockstepClient || Stance != player.Stance || Pools != player.Pools || Life != player.PlayerLife || Stats.Count != stats.Count
                 || Stats.Any(kv => !stats.TryGetValue(kv.Key, out int value) || value != kv.Value)) return false;
             var equipment = ItemsOf(player).EquipmentSnapshot().Select(e => e.Item).ToArray();
             if (equipment.Length != Equipment.Length) return false;
@@ -176,7 +262,7 @@ public static partial class Game
         RageState.Value? changed = null;
         if (CurrentGameWork && !player.Closed && !player.LeavingArea && !player.RageRetired)
         {
-            var value = player.Rage.Read(AreaTime(player), RageStats.Inputs(name => RageStat(stats, name)));
+            var value = player.Rage.Read(AreaTime(player), RageStats.Inputs(player, name => RageStat(stats, name)));
             if (player.SentRage != value) changed = value;
         }
         // An unchanged value goes nowhere near the send gate: RagePresentation rebuilds the player's stats under it, and the

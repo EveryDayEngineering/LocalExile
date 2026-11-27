@@ -49,7 +49,10 @@ public static class InstanceControl
 /// the Gateway's capture tour); "leave" (Ticket) → the player left its instance (expiry starts);
 /// "set_level" (Ticket, Level) → the ticket's character gets that level (1 to 100) in the account store;
 /// "set_portrait" (Ticket, Portrait) → the ticket's character's worn portrait, which the character list shows;
-/// "set_portrait_frame" (Ticket, PortraitFrame) → the same for its frame, which the game takes at the next login.
+/// "set_portrait_frame" (Ticket, PortraitFrame) → the same for its frame, which the game takes at the next login;
+/// "gateway_attach" → keeps a persistent reverse NDJSON stream open from Gateway to Auth so Auth can dispatch
+/// "character_created" (Account, CharacterId, Character, Class, League, Hardcore, Ssf, LeagueForm, CreationOptions)
+/// before sending S→C 0x15 / 0x13 and receive StartingAreaId / StartingLevel / SuppressStartKit overrides.
 /// </summary>
 public sealed record ControlRequest
 {
@@ -62,6 +65,16 @@ public sealed record ControlRequest
     public int Level { get; init; }
     public ushort Portrait { get; init; }
     public ushort PortraitFrame { get; init; }
+    public string? Owner { get; init; }
+    public string? Account { get; init; }
+    public Guid? CharacterId { get; init; }
+    public string? Character { get; init; }
+    public int Class { get; init; }
+    public string? League { get; init; }
+    public bool Hardcore { get; init; }
+    public bool Ssf { get; init; }
+    public string? LeagueForm { get; init; }
+    public Dictionary<string, string>? CreationOptions { get; init; }
 }
 
 public sealed record ControlResponse
@@ -71,8 +84,8 @@ public sealed record ControlResponse
     public ushort Area { get; init; }
     public uint Seed { get; init; }
     public ulong Instance { get; init; }
-    /// <summary>"resolve": when Auth created the instance (Unix ms). With <see cref="Instance"/> it names the instance
-    /// across Auth restarts, which start the ids at 1 again.</summary>
+    /// <summary>"resolve" and "transfer": when Auth created the instance (Unix ms). With <see cref="Instance"/> it
+    /// names the instance across Auth restarts, which start the ids at 1 again.</summary>
     public long Created { get; init; }
     public string? InstanceOwner { get; init; }
     public uint Ticket { get; init; }
@@ -98,6 +111,12 @@ public sealed record ControlResponse
     /// town (the death screen then has no Resurrect in Town). An Auth that does not send it leaves Lioneye's Watch.</summary>
     public ushort LastTown { get; init; } = 0x235c;
     public List<ControlInstance>? Instances { get; init; }
+    /// <summary>"character_created": optional town WorldAreas Id to set as LastTown before first AssignStart.</summary>
+    public string? StartingAreaId { get; init; }
+    /// <summary>"character_created": optional starting level (1..100) to commit before S→C 0x15 / 0x13.</summary>
+    public int? StartingLevel { get; init; }
+    /// <summary>"character_created": whether Gateway pre-seeded an empty save to suppress StartKit/Tutorial.</summary>
+    public bool SuppressStartKit { get; init; }
 }
 
 public sealed record ControlInstance(ulong Id, long CreatedUnix, int SecondsLeft, List<string> Players);

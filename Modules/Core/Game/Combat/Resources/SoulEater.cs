@@ -43,11 +43,13 @@ public static partial class Game
         return (int)Math.Clamp(SoulEaterState.MaximumStacks + (long)bonus, 0, ushort.MaxValue);
     }
 
-    static bool MapSoulEater(Player player) =>
-        MapModsOf(player)?.Get(Stat.MapPlayerConsumeNearbySouls) > 0;
+    static bool NearbySoulsActive(Player player, IReadOnlyDictionary<uint, int> stats) =>
+        stats.GetValueOrDefault(Stat.MapPlayerConsumeNearbySouls) > 0
+        || MapModsOf(player)?.Get(Stat.MapPlayerConsumeNearbySouls) > 0
+        || SoulEaterStatPresent(stats) && AnyFlaskEffect(player);
 
     public static bool SoulEaterActive(Player player, IReadOnlyDictionary<uint, int> stats) =>
-        MapSoulEater(player) || SoulEaterHitCooldownMs(stats) > 0 || SoulEaterStatPresent(stats) && AnyFlaskEffect(player);
+        NearbySoulsActive(player, stats) || SoulEaterHitCooldownMs(stats) > 0;
 
     /// <summary>The buff's attack speed part, added to the final main-hand value without rebuilding the pools.</summary>
     public static int SoulEaterAttackSpeed(Player player, IReadOnlyDictionary<uint, int> stats)
@@ -69,7 +71,7 @@ public static partial class Game
     // The sources as the stats give them (PlayerStatsUpdated): which ones feed souls, and the maximum.
     static void ConfigureSoulEater(Player player, IReadOnlyDictionary<uint, int> stats)
     {
-        bool flask = MapSoulEater(player) || SoulEaterStatPresent(stats) && AnyFlaskEffect(player);
+        bool flask = NearbySoulsActive(player, stats);
         int hitCooldown = SoulEaterHitCooldownMs(stats);
         bool active = flask || hitCooldown > 0;
         player.SoulEater.Enabled = active;
@@ -138,7 +140,7 @@ public static partial class Game
     {
         if (player.Closed || player.LeavingArea || player.RageRetired) return null;
         // Refresh the source before deciding what to publish. Recovery flasks can start/end without a soul gain.
-        var currentStats = CharacterPlayerStats(player);
+        var currentStats = PlayerStatValues(player);
         double now = AreaTime(player);
         bool active = player.SoulEater.Enabled && player.PlayerLife > 0;
         bool usingFlask = Stat.UsingFlask is var flaskKey && currentStats.GetValueOrDefault(flaskKey) != 0;
@@ -179,7 +181,8 @@ public static partial class Game
             // Attack and cast speed are in the character's stats; the skill list carries the attack time the client
             // swings with, so both go out when a soul is gained or lost.
             bytes.World(player.Id, PlayerStatsOffFrames(player));
-            bytes.World(player.Id, PlayerSkillsIfChanged(player, PlayerSkills(player)));
+            foreach (var packet in PlayerSkillsBatchesIfChanged(player, PlayerSkills(player)))
+                bytes.World(player.Id, packet);
             player.SoulEater.SentStacks = SoulEaterCount(player, now);
             player.SoulEater.SentUsingFlask = usingFlask;
             Console.WriteLine($"[gateway] {CharacterName(player)} Soul Eater {player.SoulEater.SentStacks}/{player.SoulEater.Limit}");

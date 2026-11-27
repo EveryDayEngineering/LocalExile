@@ -66,7 +66,11 @@ public static partial class Game
     {
         var stats = GolemData.Skill(catalog, effect, level).Stats;
         int Get(uint key) => stats.GetValueOrDefault(key);
-        if (Get(Stat.IsTotem) == 0 && !catalog.HasType(effect, "SummonsTotem")) return null;
+        // Non-totem monsters can share an ActiveSkill row with a player totem (e.g. Voidbearer FlamebearerFlameBlue
+        // uses totem_fire_spray which has ActiveSkillType SummonsTotem even though is_totem == 0 and base_totem_duration == 0).
+        bool isTotemSkill = Get(Stat.IsTotem) != 0 || Get(Stat.BaseSkillIsTotemified) != 0
+            || (catalog.HasType(effect, "SummonsTotem") && Get(Stat.BaseTotemDuration) > 0);
+        if (!isTotemSkill) return null;
         int? skillKey = ClientTables.TableOrNull("GrantedEffects")?.Row(effect)?.IntOrNull("ActiveSkill") is int active
             ? ClientTables.TableOrNull("ActiveSkills")?.Row(active)?.IntOrNull("SkillTotemId") : null;
         int skin = Get(Stat.TotemArtVariation);
@@ -89,7 +93,20 @@ public static partial class Game
     /// object id) first, to make room for <paramref name="incoming"/> more.</summary>
     /// <summary>How many of a summon's monsters its summoner has standing. In the area's frame.</summary>
     public static int LivingSummonsLocked(Player player, uint summoner, SkillCatalog.MonsterSummonInfo summon) =>
-        player.Area.Monsters.Values.Count(m => m.SummonerId == summoner && !m.Dead && m.Life > 0 && m.Variety?.Row == summon.Variety);
+        LivingSummonsLocked(player, summoner, summon, cachedAreaLists: false);
+
+    internal static int LivingSummonsLocked(Player player, uint summoner, SkillCatalog.MonsterSummonInfo summon, bool cachedAreaLists)
+    {
+        if (!cachedAreaLists) player.Area.SyncLivingMonsters();
+        var summons = player.Area.LivingSummons;
+        int count = 0;
+        for (int i = 0; i < summons.Count; i++)
+        {
+            var m = summons[i].Monster;
+            if (m.SummonerId == summoner && !m.Dead && m.Life > 0 && m.Variety?.Row == summon.Variety) count++;
+        }
+        return count;
+    }
 
     static List<uint> SurplusMinionsLocked(Player player, uint summoner, SkillCatalog.MonsterSummonInfo summon, int incoming)
     {

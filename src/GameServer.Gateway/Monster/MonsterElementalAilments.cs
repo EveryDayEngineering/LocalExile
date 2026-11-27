@@ -13,6 +13,7 @@ public sealed class MonsterElementalAilments
         // Glacial Wave: a chill from a hit of a player with enemies_chilled_by_hits_take_damage_increased_by_chill_effect
         // / ..._deal_damage_lessened_by_chill_effect, as the player had them when it landed.
         public bool MoreTaken { get; init; }
+        public bool ColdTaken { get; init; }
         public bool LessDealt { get; init; }
         // Its proliferation radius in cells when it landed; 0 for one that does not spread, as a spread copy.
         public int Spread { get; init; }
@@ -21,6 +22,8 @@ public sealed class MonsterElementalAilments
         // The player who caused it, by their PeerId (Program.ActingPlayer when it landed); 0 when no player did. A spread
         // copy keeps its source's.
         public uint Source { get; init; }
+        internal ulong? AuraSource { get; init; }
+        public double Duration { get; init; }
     }
     readonly List<Effect> effects = [];
     double expiryRate = 1;
@@ -69,6 +72,15 @@ public sealed class MonsterElementalAilments
     public double Magnitude(Kind kind, double now) =>
         effects.Count == 0 && spread.Count == 0 ? 0 : Active(kind, now).Select(e => e.Magnitude).DefaultIfEmpty().Max();
 
+    /// <summary>Removes the selected active ailment, including weaker sources under the strongest one.</summary>
+    public bool RemoveActive(Kind kind, double now)
+    {
+        if (Magnitude(kind, now) <= 0) return false;
+        effects.RemoveAll(e => e.Kind == kind && e.From <= now);
+        spread.Remove(kind);
+        return true;
+    }
+
     /// <summary>Whether it was frozen when it died: a shattered one was, though its freeze is gone.</summary>
     public bool FrozenAtDeath(double now) => Shattered || Magnitude(Kind.Freeze, now) > 0;
 
@@ -86,7 +98,8 @@ public sealed class MonsterElementalAilments
     {
         if (!Immune(shock.Kind, target))
         {
-            effects.Add(shock with { Until = RecipientEffectTime.RetimedDeadline(shock.Until, now, source.expiryRate, expiryRate), Spread = 0, OnKill = false });
+            double duration = Math.Max(0, shock.Until - now) * source.expiryRate;
+            effects.Add(shock with { From = now, Until = now + duration / expiryRate, Duration = duration, Spread = 0, OnKill = false });
             Interlocked.Increment(ref anyAdded);
         }
     }
@@ -94,12 +107,33 @@ public sealed class MonsterElementalAilments
     /// <summary>Seconds until the last active effect of <paramref name="kind"/> ends (0 when none).</summary>
     public double Remaining(Kind kind, double now) => Active(kind, now).Select(e => (e.Until - now) * expiryRate).DefaultIfEmpty().Max();
 
+    public void RefreshChillAndShock(double now)
+    {
+        for (int i = 0; i < effects.Count; i++)
+        {
+            var effect = effects[i];
+            if (effect.Kind is Kind.Chill or Kind.Shock && effect.From <= now && now < effect.Until && effect.Duration > 0)
+                effects[i] = effect with { From = now, Until = now + effect.Duration / expiryRate };
+        }
+    }
+
     /// <summary>Action speed: 0 while frozen, else less by the chill's effect.</summary>
     public double ActionFactor(double now) => Magnitude(Kind.Freeze, now) > 0 ? 0 : 1 - Magnitude(Kind.Chill, now) / 100;
 
     /// <summary>Glacial Wave: while a chill from such a hit lasts, the monster takes increased damage by its strongest
     /// chill's effect (from any source, wiki Glacial Wave; PoB CalcPerform DamageTaken INC).</summary>
     public double ChillDamageTakenPct(double now) => Active(Kind.Chill, now).Any(e => e.MoreTaken) ? Magnitude(Kind.Chill, now) : 0;
+
+    public double ColdDamageTakenFromChillPct(double now)
+    {
+        double strongest = 0;
+        foreach (var effect in effects)
+            if (effect.Kind == Kind.Chill && effect.ColdTaken && effect.From <= now && now < effect.Until)
+                strongest = Math.Max(strongest, effect.Magnitude);
+        if (spread.TryGetValue(Kind.Chill, out var copy) && copy.ColdTaken && copy.From <= now && now < copy.Until)
+            strongest = Math.Max(strongest, copy.Magnitude);
+        return strongest;
+    }
 
     /// <summary>Glacial Wave: and deals less damage by half that effect (PoB CalcPerform Damage MORE −effect / 2).</summary>
     public double ChillDamageDealtFactor(double now) =>
@@ -189,7 +223,12 @@ public sealed class MonsterElementalAilments
     /// attacker's Glacial Wave stats, and each its proliferation radius grown by the hit's area modifier <paramref name="area"/>.
     /// </summary>
     public List<Effect> Inflict(DamagePacket damage, bool critical, double threshold, double now,
-        Func<uint, int> attacker, Func<uint, int> target, Random random, double area = 1)
+        Func<uint, int> attacker, Func<uint, int> target, Random random, double area = 1) =>
+        Inflict(damage, critical, threshold, now, attacker, target, random, area, coldTakenFromChill: false, freezeDamageMultiplier: 1);
+
+    public List<Effect> Inflict(DamagePacket damage, bool critical, double threshold, double now,
+        Func<uint, int> attacker, Func<uint, int> target, Random random, double area,
+        bool coldTakenFromChill = false, double freezeDamageMultiplier = 1)
     {
         var added = new List<Effect>();
         if (threshold <= 0) return added;
@@ -210,18 +249,22 @@ public sealed class MonsterElementalAilments
                 EffectModifier(Kind.Chill, attacker, target), ChillCap(attacker), attacker(Stat.ChillMinimumSlowPct)))
             {
                 MoreTaken = attacker(Stat.EnemiesChilledByHitsTakeDamageIncreasedByChillEffect) != 0,
+                ColdTaken = coldTakenFromChill,
                 LessDealt = attacker(Stat.EnemiesChilledByHitsDealDamageLessenedByChillEffect) != 0,
                 Spread = SpreadRadius(Kind.Chill, attacker, area),
             });
         // The chance rolls first, so a prohibition leaves the random sequence of the hits after it unchanged.
-        int freezeChance = attacker(Stat.ChanceToFreezePct)
-            + (wasChilled ? attacker(Stat.AdditionalChanceToFreezeChilledEnemiesPct) : 0);
+        int freezeChance = (int)Math.Clamp((long)attacker(Stat.ChanceToFreezePct)
+            + (wasChilled ? attacker(Stat.AdditionalChanceToFreezeChilledEnemiesPct) : 0)
+            + target(Stat.ChanceToBeFrozenPct), int.MinValue, int.MaxValue);
         if (freezing > 0 && (critical || RandomRolls.Chance(freezeChance, 100, random))
             && !CannotInflict("freeze", attacker))
-            Add(new(Kind.Freeze, now, now + Math.Min(3, 6 * freezing * AsThough(Kind.Freeze, attacker) / threshold), 100)
+            Add(new(Kind.Freeze, now, now + Math.Min(3, 6 * freezing * AsThough(Kind.Freeze, attacker) * freezeDamageMultiplier / threshold), 100)
                 { Spread = SpreadRadius(Kind.Freeze, attacker, area) });
+        int shockChance = (int)Math.Clamp((long)attacker(Stat.ChanceToShockPct) + target(Stat.ChanceToBeShockedPct),
+            int.MinValue, int.MaxValue);
         if (shocking > 0 && (critical || attacker(Stat.AlwaysShock) != 0
-                || RandomRolls.Chance(attacker(Stat.ChanceToShockPct), 100, random))
+                || RandomRolls.Chance(shockChance, 100, random))
             && !CannotInflict("shock", attacker))
             Add(new(Kind.Shock, now, now + 2, Effectiveness(shocking * AsThough(Kind.Shock, attacker), threshold,
                 EffectModifier(Kind.Shock, attacker, target), ShockCap(attacker), attacker(Stat.ShockMinimumDamageTakenIncreasePct)))
@@ -250,7 +293,11 @@ public sealed class MonsterElementalAilments
         bool Counts(DamageType type)
         {
             string name = type.ToString().ToLowerInvariant();
-            return attacker(Stat.Of($"{name}_damage_cannot_{ailment}")) == 0 && (type == own
+            bool reassigned = (type, ailment) is (DamageType.Cold, "freeze" or "chill") && attacker(Stat.UniqueColdDamageIgnites) != 0
+                || (type, ailment) is (DamageType.Lightning, "shock") && attacker(Stat.UniqueLightningDamageFreezes) != 0;
+            bool enabled = (type, ailment) is (DamageType.Fire, "shock") && attacker(Stat.UniqueFireDamageShocks) != 0
+                || (type, ailment) is (DamageType.Lightning, "freeze") && attacker(Stat.UniqueLightningDamageFreezes) != 0;
+            return !reassigned && attacker(Stat.Of($"{name}_damage_cannot_{ailment}")) == 0 && (type == own || enabled
                 || attacker(Stat.Of($"all_damage_can_{ailment}")) != 0 || attacker(Stat.Of($"{name}_damage_can_{ailment}")) != 0
                 || critical && attacker(Stat.Of($"all_damage_from_critical_strikes_can_{ailment}")) != 0
                 || ailment == "shock" && DamageTypes.IsElemental(type) && attacker(Stat.ElementalDamageCanShock) != 0);
@@ -264,7 +311,14 @@ public sealed class MonsterElementalAilments
     /// ailments.</summary>
     public static bool CannotInflict(string ailment, Func<uint, int> attacker) =>
         attacker(Stat.CannotInflictStatusAilments) != 0 || attacker(Stat.NeverIgniteChillFreezeShock) != 0
-        || attacker(Stat.Of($"never_{ailment}")) != 0
+        || attacker(ailment switch
+        {
+            "ignite" => Stat.NeverIgnite,
+            "chill" => Stat.NeverChill,
+            "freeze" => Stat.NeverFreeze,
+            "shock" => Stat.NeverShock,
+            _ => Stat.Of($"never_{ailment}"),
+        }) != 0
         || ailment is "chill" or "freeze" && attacker(Stat.NeverFreezeOrChill) != 0
         || HandedProhibitions(ailment, attacker);
 
@@ -327,6 +381,35 @@ public sealed class MonsterElementalAilments
         Apply(new(kind, now, now + seconds, BaseWithoutDamage(kind, attacker, target, stated))
             { Spread = SpreadRadius(kind, attacker, area) }, attacker, target);
 
+    public void ApplyAura(Kind kind, ulong source, double seconds, double now, Func<uint, int> attacker, Func<uint, int> target,
+        int? stated = null) => ApplyAura(kind, source, seconds, now, attacker, target, stated, coldTakenFromChill: false);
+
+    public void ApplyAura(Kind kind, ulong source, double seconds, double now, Func<uint, int> attacker, Func<uint, int> target,
+        int? stated, bool coldTakenFromChill)
+    {
+        if (Apply(new(kind, now, now + seconds, BaseWithoutDamage(kind, attacker, target, stated))
+            { AuraSource = source, ColdTaken = kind == Kind.Chill && coldTakenFromChill }, attacker, target) is null)
+            RemoveAura(kind, source);
+    }
+
+    /// <summary>Keep a permanent aura at its current magnitude while its source covers the target.</summary>
+    public bool KeepPermanentAura(Kind kind, ulong source, double now, Func<uint, int> attacker, Func<uint, int> target)
+    {
+        double magnitude = Grace || Immune(kind, target) ? 0 : BaseWithoutDamage(kind, attacker, target);
+        for (int i = 0; i < effects.Count; i++)
+        {
+            var effect = effects[i];
+            if (effect.Kind != kind || effect.AuraSource != source) continue;
+            if (magnitude > 0 && effect.Magnitude == magnitude && double.IsPositiveInfinity(effect.Until)) return true;
+            RemoveAura(kind, source);
+            break;
+        }
+        return magnitude > 0 && Apply(new(kind, now, double.PositiveInfinity, magnitude) { AuraSource = source },
+            attacker, target) is not null;
+    }
+
+    public void RemoveAura(Kind kind, ulong source) => effects.RemoveAll(e => e.Kind == kind && e.AuraSource == source);
+
     // Chill and shock without damage: 10% and 15% base unless the source states its own (wiki Chill and Shock), through
     // the effect modifiers, up to the cap.
     static double BaseWithoutDamage(Kind kind, Func<uint, int> attacker, Func<uint, int> target, int? stated = null) =>
@@ -359,14 +442,14 @@ public sealed class MonsterElementalAilments
     static double AsThough(Kind kind, Func<uint, int> attacker) =>
         AsThoughStats[kind].Aggregate(1.0, (more, name) => more * Math.Max(0, 1 + attacker(name) / 100.0));
 
-    // The caps on the effect, 30% chill and 50% shock: Shaper of Winter's override ("Your Chills can reduce Action Speed by
-    // up to a maximum of 40%") and Voltaxic Rift's +40%, whose stat is stored as 100, the legacy override's value (wiki
-    // Voltaxic Rift). "+X% to Maximum Effect of Shock" is not read: only removed content (runesmithing, Royale) has it.
+    // Shaper of Winter can override the 30% chill cap. Shock's 50% cap has additive bonuses.
+    // Voltaxic Rift's +40% is carried by the legacy override stat, whose stored value is 100.
     static int ChillCap(Func<uint, int> attacker) =>
         attacker(Stat.ElementalistChillMaximumMagnitudeOverride) is > 0 and int cap ? cap : 30;
 
     static int ShockCap(Func<uint, int> attacker) =>
-        50 + (attacker(Stat.UniqueVoltaxicRiftShockMaximumMagnitudeOverride) != 0 ? 40 : 0);
+        (int)Math.Clamp(50L + (attacker(Stat.UniqueVoltaxicRiftShockMaximumMagnitudeOverride) != 0 ? 40 : 0)
+            + attacker(Stat.ShockMaximumMagnitudePlus), 0, int.MaxValue);
 
     static double EffectModifier(Kind kind, Func<uint, int> attacker, Func<uint, int> target) =>
         Math.Max(0, 1 + attacker(Stat.Of($"virtual_{Name(kind)}_effect_+%")) / 100.0)
@@ -390,17 +473,21 @@ public sealed class MonsterElementalAilments
     {
         if (Grace) return null;
         var (kind, now) = (effect.Kind, effect.From);
-        double seconds = (effect.Until - now) * Math.Max(0, 1 + (attacker(Stat.Of($"virtual_{Name(kind)}_duration_+%"))
-            - target(Stat.Of($"base_self_{Name(kind)}_duration_-%"))) / 100.0);
+        double seconds = effect.Until - now;
+        if (!double.IsPositiveInfinity(seconds))
+            seconds *= Math.Max(0, 1 + (attacker(Stat.Of($"virtual_{Name(kind)}_duration_+%"))
+                - target(Stat.Of($"base_self_{Name(kind)}_duration_-%"))) / 100.0);
         if (effect.Magnitude <= 0 || seconds <= 0 || kind == Kind.Freeze && seconds < .3 || Immune(kind, target)) return null;
         // Brine Bound (freeze_minimum_duration_X_ms): a freeze that passes the threshold lasts at least this long, which no
         // duration modifier changes (wiki Brine Bound).
         if (kind == Kind.Freeze) seconds = Math.Max(seconds, attacker(Stat.FreezeMinimumDurationXMs) / 1000.0);
-        effect = effect with { Until = now + seconds / expiryRate,
+        effect = effect with { Until = now + seconds / expiryRate, Duration = seconds,
             Source = effect.Source != 0 ? effect.Source : Program.ActingPlayer.Value?.Id ?? 0 };
         // A weaker one of the same sort that also ends sooner can never be the strongest again.
         effects.RemoveAll(e => e.Until <= now || e.Kind == kind && e.Magnitude <= effect.Magnitude && e.Until <= effect.Until
-            && (e.MoreTaken, e.LessDealt, e.Spread) == (effect.MoreTaken, effect.LessDealt, effect.Spread));
+            && e.ColdTaken == effect.ColdTaken
+            && (e.MoreTaken, e.LessDealt, e.Spread) == (effect.MoreTaken, effect.LessDealt, effect.Spread)
+            && e.AuraSource == effect.AuraSource);
         effects.Add(effect);
         Interlocked.Increment(ref anyAdded);
         if (effect.Spread > 0) Interlocked.Increment(ref spreadsAdded);

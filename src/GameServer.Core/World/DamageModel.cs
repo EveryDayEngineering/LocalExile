@@ -28,6 +28,7 @@ public static class DamageModel
 
     /// <summary>Path of Building's <c>SuppressionChanceCap</c>: Spell Suppression chance cannot exceed 100%.</summary>
     public const int SpellSuppressionChanceCap = 100;
+    public const int SpellDodgeChanceCap = 75;
 
     /// <summary>Path of Building's <c>SuppressionEffect</c>: a suppressed spell hit takes 40% less damage.</summary>
     public const int SpellSuppressionEffect = 40;
@@ -53,7 +54,7 @@ public static class DamageModel
     public static int CriticalDamage(int damage, int multiplier)
     {
         if (damage <= 0) return 0;
-        return (int)Math.Max(0, Math.Round(damage * Math.Max(0, multiplier) / 100.0));
+        return (int)Math.Min(int.MaxValue, Math.Round(damage * (double)Math.Max(0, multiplier) / 100));
     }
 
     /// <summary>Whether a Spell Suppression roll succeeds; <paramref name="roll"/> is 0..99. Lucky and unlucky roll
@@ -61,12 +62,21 @@ public static class DamageModel
     public static bool Suppresses(int chance, int roll, bool lucky = false, bool unlucky = false) =>
         roll < EffectiveSuppressionChance(chance, lucky, unlucky);
 
+    /// <summary>Rolls two independent chances when suppression is lucky or unlucky.</summary>
+    public static bool Suppresses(int chance, Random random, bool lucky = false, bool unlucky = false)
+    {
+        int roll = random.Next(100);
+        if (lucky != unlucky)
+            roll = lucky ? Math.Min(roll, random.Next(100)) : Math.Max(roll, random.Next(100));
+        return roll < Math.Clamp(chance, 0, SpellSuppressionChanceCap);
+    }
+
     /// <summary>The chance after a lucky or unlucky suppression roll, capped by <see cref="SpellSuppressionChanceCap"/>.</summary>
     public static double EffectiveSuppressionChance(int chance, bool lucky = false, bool unlucky = false)
     {
         double p = Math.Clamp(chance, 0, SpellSuppressionChanceCap) / 100.0;
-        if (lucky) p = 1 - (1 - p) * (1 - p);
-        else if (unlucky) p *= p;
+        if (lucky != unlucky)
+            p = lucky ? 1 - (1 - p) * (1 - p) : p * p;
         return p * 100;
     }
 

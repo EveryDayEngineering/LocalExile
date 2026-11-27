@@ -49,7 +49,7 @@ static partial class KitavaActTen
     {
         if (v.Id == Body)
             return [.. Effects.Select(e => Game.SkillsFor(c).FindByRow(Skill(e), e, Data(c, e, level).Level,
-                WithBehaviourVariation(c, e, Attack(c, v, level, e).InPlaceSkillStats()))).OfType<GrantedSkill>()];
+                WithBehaviourVariation(c, e, [.. Attack(c, v, level, e).InPlaceSkillStats(), (global::Stat.ActionDoNotFaceTarget, 1)]))).OfType<GrantedSkill>()];
         if (v.Id is Sin or Innocence)
         {
             int[] effects = v.Id == Sin ? [2790, 2791] : [2788, 2789];
@@ -104,7 +104,7 @@ static partial class KitavaActTen
         void CancelCombat() { hits.Clear(); struck.Clear(); body.ActionGeneration++; body.SwingGeneration = null; }
         (int X, int Y) ModelCell(double x, double y)
         {
-            double cos = Math.Cos(anchor.Rotation), sin = Math.Sin(anchor.Rotation);
+            double cos = Math.Cos(anchor.Angle), sin = Math.Sin(anchor.Angle);
             return (anchor.X + (int)Math.Round((x * cos - y * sin) / WorldUnits.PerCell),
                 anchor.Y + (int)Math.Round((x * sin + y * cos) / WorldUnits.PerCell));
         }
@@ -168,8 +168,8 @@ static partial class KitavaActTen
                 {
                     // Default stance omits these two ACT attachments; stance3 supplies them itself.
                     uint clip = effect == 8508 ? 0u : effect == 8510 ? 2u : 1u;
-                    await Fx(c, (anchor.X, anchor.Y), Art + "death_breath/rig.ao", now + 5, clip, anchor.Rotation);
-                    await Fx(c, (anchor.X, anchor.Y), Art + "DB_burning_grd/DB_burning_grd.ao", now + 6.433, clip, anchor.Rotation);
+                    await Fx(c, (anchor.X, anchor.Y), Art + "death_breath/rig.ao", now + 5, clip, anchor.Angle);
+                    await Fx(c, (anchor.X, anchor.Y), Art + "DB_burning_grd/DB_burning_grd.ao", now + 6.433, clip, anchor.Angle);
                 }
                 // Three normal breaths leave neighbouring lanes safe; the ultimate covers all but the far-side strip.
                 double from = ultimate ? .333 : .4, until = ultimate ? .9 : .87;
@@ -261,7 +261,7 @@ static partial class KitavaActTen
         }
         async Task Fx(Player c, (int X, int Y) at, string model, double until, uint? clip = 0, float rotation = 0)
         {
-            var fx = new Visual(c.Instance.World.NewMonsterId(), at, model, clip ?? uint.MaxValue, until, rotation); visuals.Add(fx);
+            var fx = new Visual(c.TakeObjectId(), at, model, clip ?? uint.MaxValue, until, rotation); visuals.Add(fx);
             if (Present.FirstOrDefault() is { } p) await CreateFx(p, fx);
         }
         static async Task CreateFx(Player p, Visual fx)

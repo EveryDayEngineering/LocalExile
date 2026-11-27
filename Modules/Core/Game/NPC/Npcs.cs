@@ -15,7 +15,7 @@ public static partial class Game
         // An NPC is the player's quest view: their quest state chose it, so it is theirs alone to see (AreaDelta's private entities).
         if (InAreaFrame(player))
         {
-            player.Area.Delta.Add(id, InstanceEntities.CreateObject(id, type, obj.Blob()), log, AreaDelta.Kind.Create, only: player);
+            player.Area.Delta.Add(id, InstanceEntities.CreateObject(id, type, obj.Blob(), headerU32: uint.MaxValue), log, AreaDelta.Kind.Create, only: player);
             player.Area.Delta.Add(id, InstanceProtocol.EnterWakeZone(id), null, only: player);
         }
         else
@@ -51,8 +51,9 @@ public static partial class Game
         var quests = QuestsOf(player);
         foreach (var p in placements)
         {
-            // A town NPC a quest stages (DiallaTown / DiallaTownWithered …) comes with the quest NPCs (World/Quest/QuestNpcs.cs).
-            if (quests.ManagesNpc(player.Layout.Id, p.Id)) continue;
+            // A town NPC a quest stages (DiallaTown / DiallaTownWithered, Lilly shipside / sitting …) comes with the quest NPCs (World/Quest/QuestNpcs.cs).
+            if (quests.ManagesNpc(player.Layout.Id, p.Id) || p.ShownBy is not null || p.GoneWith is not null) continue;
+            if (p.RequiredLeagueFlag is int reqLqf && !player.Character.LeagueQuestFlags.Contains(reqLqf)) continue;
             if (Npcs.Place(p) is not { Supported: true } npc) { Console.WriteLine($"[gateway] {player.Connection.Remote} npc {p.Id}: unknown or unsupported components"); continue; }
             var at = furniture is null ? TownNpcCell(player.Layout, p) : (p.X, p.Y);
             if (at != (p.X, p.Y))
@@ -68,11 +69,23 @@ public static partial class Game
         return !placement.FromRoom && layout.Walkable?.Invoke(at.X, at.Y) == false ? layout.Near(at) : at;
     }
 
+    public static int NpcInteractionSize(SpawnedNpc npc) =>
+        npc.MonsterBodySize ?? Math.Max(0, StationaryCollision.Resolve(npc.Npc.Id, npc.Npc.Model).Size);
+
     // A click on an NPC (C→S 0x24 on its object): the client walks to it first; follow it and answer once the player is there.
     public static async Task TalkToNpc(Player player,
         InstanceTransfer.UseSkillOnObject use, SpawnedNpc npc, double requestedAt)
     {
-        if (!TryBeginObjectWalk(player, requestedAt, npc.X, npc.Y, Math.Max(0, StationaryCollision.Resolve(npc.Npc.Id, npc.Npc.Model).Size), out var objectWalk)) return;
+        // Only a fresh click opens/reopens NPC dialogue; held-LMB repeats (~100 ms later, 0x0400 clear) must not wipe
+        // an open quest reward offer and send 0x0084 over it.
+        if (!use.InitialPress) return;
+        uint id;
+        lock (player.Npcs)
+        {
+            id = player.Npcs.FirstOrDefault(n => ReferenceEquals(n.Value, npc)).Key;
+            if (id == 0 && use.TargetId != 0 && player.Npcs.ContainsKey(use.TargetId)) id = use.TargetId;
+        }
+        if (!TryBeginObjectWalk(player, requestedAt, npc.X, npc.Y, NpcInteractionSize(npc), out var objectWalk)) return;
         var (action, now, here, stop, arrive) = objectWalk;
         Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0024 npc {npc.Npc} ({use}) from ({here.X}, {here.Y}): reached at ({stop.X}, {stop.Y}) in {arrive - now:0.00} s");
         if (arrive > now) await AreaDelay(player, arrive - now);
@@ -87,8 +100,27 @@ public static partial class Game
             Note("vendor restores life");
             await SendPlayerMana(player, "vendor restores mana");
         }
-        uint id;
-        lock (player.Npcs) id = player.Npcs.FirstOrDefault(n => ReferenceEquals(n.Value, npc)).Key;
+        lock (player.Npcs)
+        {
+            if (id != 0 && player.Npcs.TryGetValue(id, out var latest)) npc = latest;
+            else
+            {
+                uint resolved = player.Npcs.FirstOrDefault(n => ReferenceEquals(n.Value, npc)).Key;
+                if (resolved != 0) id = resolved;
+                else if (use.TargetId != 0 && player.Npcs.TryGetValue(use.TargetId, out var byTarget))
+                {
+                    id = use.TargetId;
+                    npc = byTarget;
+                }
+            }
+        }
+        player.StashOpen = false;
+        player.GuildStashOpen = false;
+        player.TradeStashOpen = false;
+        player.BenchOpen = false;
+        player.ModuleWindow = null;
+        player.ModuleWindowAnchor = null;
+        await RefreshBenchBalance(player, clear: true);
         player.AutomaticNpcTalkRows.Clear();
         player.TalkingTo = id;
         player.InNpcTalk = false;
@@ -163,6 +195,7 @@ public static partial class Game
         SpawnedNpc? npc;
         lock (player.Npcs) npc = player.Npcs.GetValueOrDefault(id);
         if (npc is null || player.TalkingTo != id) return false;
+        if (await GameEvents.ResolveNpcQuestConversation(player, id, npc) is bool handled) return handled;
         var flags = Quests.Names(PlayerQuestFlags(player));
         NpcCatalog.Talk? next;
         if (GameEvents.UsesNpcLeagueFlags(player, npc.Npc))

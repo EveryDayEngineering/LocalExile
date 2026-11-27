@@ -97,8 +97,12 @@ Part of [Status](../Status.md); what to build next in this area is in
   the gem), a2q8 (the Ancient Seal, the Dark Altar, the Vaal Oversoul, the pyramid's exit), a3q1–a3q5, a3q8, a3q9,
   a3q11–a3q13 and a3q10 (the Epic Door, Dominus' two forms, Lady Dialla on the tower, the exit to The Aqueduct) ran
   unattended in one pass and ended in Highgate with every flag of `Act2CompleteEramir` and `Act3Complete` and every
-  Act 2/3 quest log at "Quest Complete". In the Crematorium, Piety retreats at half life. Once the room guards
-  are gone each character can take Tolman's Bracelet, including before rescuing Clarissa.
+  Act 2/3 quest log at "Quest Complete".
+  In the Crematorium, Piety retreats at half life through a `PermanentServerEffect` portal (`close.ao`, clip 2, live
+  2026-11-27) with `AudioEventDrivenOffPiety`.
+  Once the room guards are gone each character can take Tolman's Bracelet.
+  Greust unlocks via `a2b-StartNewQuests` (quest items also read `extra_flag2`), `ClarissaTown` gates on
+  `a3q1-RescuedGirl` with legacy save recovery, and Docks Fairgraves runs his `Script2` timer/counter death transition.
   The tower legionnaires now precede the miscreations, then Dominus appears at the roof's boss point.
   Multi-item hand-ins take every item in one click (Eramir's amulets, Hargan's busts, Siosa's pages, Fairgraves' plum
   and decanter).
@@ -134,35 +138,29 @@ Part of [Status](../Status.md); what to build next in this area is in
    A party member can finish while the instance host stays at the entrance or dies; late joins retain valid packets.
   The Belly side door and the four arena entrances open (the doors go when used or their guardian dies). Malachai's
   first form retreats at 70% life. His second form starts at 92% in the next arena, and his portal returns to Highgate.
-  The Ossuary lever opens the passage after the Sign is taken.
+  The Ossuary `PurityBox` triggers a skeleton ambush and its lever opens the passage after the Sign is taken.
+  Control Blocks spawns `DestroyedOriathObstructions` after `a5q4-KilledBoss`.
   Original-server timing and damage comparison remain pending. Driver: `scripts/dev/campaign/quests/a[456]q*.py`.
   Code: `Acts/Act4.cs`, `Acts/Act5.cs`, `Acts/Act6.cs` (QuestObjects module), Highgate's two Diallas in `NPC/TownNpcs.cs`.
   Docs: [12](../docs/protocol/12-quests.md) §13–15; [act 4](../docs/game/campaign/act4.md),
   [act 5](../docs/game/campaign/act5.md), [act 6](../docs/game/campaign/act6.md).
-- The Pantheon (live 2026-10-30 before the game moved into modules: the campaign runner chose The Brine King and
-  Tukohama; on the modules checked by the oracle and the data test, not yet with the client): a god unlocks with its
-  boss's kill flag (Act 6's four, the later acts' as their tables come); C→S 0x1ee chooses the major or minor god of a
-  PantheonPanelLayout row in a town, a hideout, the Rogue Harbour or after Sin's god row (`CanChangePantheon`), saved
-  per character and shown by the Player component (creation blob and update 0x0080); the god's power (and the souls'
-  upgrades once `EndGameAvailable` is earned: every character is given it at login, so it counts only after a quest
-  set it) joins the stat sources. `/pantheon` and /state's `pantheon` for the driver.
-  The panel's highlight of the choice is not checked; the souls (Divine Vessels) are not built.
-  Code: the Pantheon module (`Modules/Core/Player/Pantheon`), Gateway `Player/PantheonCatalog.cs`, Core
-  `InstancePantheon.cs`. Docs: [pantheon](../docs/game/campaign/pantheon.md).
+- The Pantheon: all 12 gods unlock from their boss kills, C→S 0x1ee saves and publishes major/minor choices, every god
+  power and upgrade stat evaluates in combat/recovery/flasks, Divine Vessels capture souls in maps into the Map Device,
+  and Sin's `UnlockPantheonPowerFromItem()` consumes filled vessels and opens the panel (not checked live).
+  Code: `Modules/Core/Player/Pantheon`, Gateway `Player/PantheonCatalog.cs`, `World/MapDevice.cs`, Core
+  `InstancePantheon.cs`.
+  Docs: [pantheon](../docs/game/campaign/pantheon.md).
 - Acts 7–10 and the Epilogue (live 2026-10-31, seed 1, on the engine before the modules: one Witch from
   `/quest_preset E3StartOfAct7`, the runner unattended per act, no `/goto`; on the modules checked by the oracle and
-  the offline exit audit; firefly pickup and Arakaali entry checked in the client): a7q5, a7q2 (Maligaro's Map, the Reverie Device's portal into the
-  Sanctum, Black Death's venom), a7q3 (Silk's Obsidian Key, the Sins barrier, the passage into The Den), a7q1
-  (Greust), a7q8, a7q9, a7q7 (seven scattered Fireflies, unopened chests remain targetable;
-  Yeena burns the webs), a7q6, a7q4 (Arakaali's entrance lands inside the arena, the bridge into
-  the offline exit audit; Reverie device also checked in the client): a7q5, a7q2 (Maligaro's Map, the Reverie Device's
-  native inventory and six consumable portals into one Sanctum instance with return to the same device;
-  Black Death's venom), a7q3 (Silk's Obsidian Key, the Sins barrier, the passage into The Den), a7q1
-  (Greust), a7q8, a7q9, a7q7 (seven scattered Fireflies, unopened chests remain targetable; native pickup checked;
-  Yeena burns the webs), a7q6, a7q4 (Arakaali's entrance lands inside the arena, the bridge into
+  the offline exit audit; the Reverie device and Arakaali entry checked in the client): a7q5, a7q2
+  (Maligaro's Map, the Reverie Device's native inventory and six consumable portals into one Sanctum instance with
+  return to the same device; Black Death's venom), a7q3 (Silk's Obsidian Key, the Sins barrier, the passage into
+  The Den), a7q1 (Greust), a7q8, a7q9, a7q7 (seven scattered Fireflies, unopened chests remain targetable; native
+  pickup checked; Yeena burns the webs), a7q6, a7q4 (Arakaali's entrance lands inside the arena, the bridge into
   Act 8); a8q1, a8q5, a8q4, a8q6, a8q7 (the legion's multi-kill), a8q3 and a8q2 (both orbs at the fight starter,
   Solaris and Lunaris, the bridge exit into Act 9); a9q3 (the mummy event), a9q5 (the Bottled Storm carried to the
-  barrier, Shakari retreats at 65% life and resumes in her second arena), a9q4, a9q2 (the feather to Irasha), a9q1
+  barrier, Shakari retreats at 65% life and resumes in her second arena, and the last Oasis gate is the checkpoint),
+  a9q4, a9q2 (the feather to Irasha), a9q1
   (both ingredients in one click, the membrane, the three spirit gauntlets, the Trinity, Lilly's voyage); a10q1 (Plaguewing comes near Bannon), a10q6, a10q4, a10q5, a10q2
   (Bannon becomes Innocence: Oriath Docks' two stages; the Chambers shortcut waits for the instance's kill), a10q3 (the horns, Kitava's scripted end: `EndGameAvailable`
   earned, −60% with Act 5's, before him −30%; Sin's portal) and A11q0 (Lilly sails). Both routes arrive at
@@ -175,9 +173,18 @@ Part of [Status](../Status.md); what to build next in this area is in
   `Quests.EndgameOnly`). Every quest object, chest and NPC the rules name is placed at seed 1 but The Crossroads'
   BanditBlock (its sight is optional).
   Driver step files `scripts/dev/campaign/quests/a7q*.py` … `a10q*.py`, `A11q0.py`, `a10q3a11.py`.
-  Code: `Acts/Act7.cs` … `Acts/Act10.cs` (QuestObjects module), Oriath Docks' InnocenceTown line in `NPC/TownNpcs.cs`.
+  Code: `Acts/Act7.cs` … `Acts/Act11.cs` (QuestObjects module), `NPC/TownNpcs.cs`, `CharacterVoiceLines.cs`.
+  Act 6–10 quest/NPC fixes cover dual Shavronne/Brutus kill, Karui blockers, prerequisite-free Strand clear, all four
+  Ralakesh avatars, Nessa/Yeena post-kill NPCs, Tolman/Kira kills, and Bannon town gating (not checked live).
   Docs: [12](../docs/protocol/12-quests.md) §16–19; [act 7](../docs/game/campaign/act7.md) …
   [act 10](../docs/game/campaign/act10.md).
+- Act 11 endgame storylines (verified live in 3.29.3d): `a11q1` ("A Call to Arms") Karui Shores Helena/Kirac dialogue
+  and War Room Map Device progression without bypassing flags, `kirac_atlas` / Envoy encounters, `maven_atlas` and
+  `maven_boss` real witnessing and Crucible flow, `tangle` and `cleansing_fire` Eldritch influence, Altars, and 28-map
+  trackers, `ThreadsOfTheOriginator` and `Colourful Roses` Zana/Eagon Memory Tears, Astrolabes, Memory Vaults, 3.29
+  Atlas Anomalies, all nine Atlas Books of Skill, and Merciless/Eternal Labyrinth (`labyrinth_a11`).
+  Code: `Modules/Core/World/Atlas/`, `Modules/Core/World/QuestObjects/Acts/Act11.cs`, `NpcScripts.cs`.
+  Docs: [21](../docs/protocol/21-hideouts.md).
 
 - New characters pick up their class weapon, talk to the dying exile and kill the biting zombie for their skill gem.
   Their first arrival starts lying down, facing the room's fitted start direction, and the first click plays getup
@@ -205,16 +212,18 @@ Part of [Status](../Status.md); what to build next in this area is in
   See [opening encounter](../docs/protocol/12-quests.md#opening-encounter-2026-10-25).
 - Quest exits with a Transitionable (Merveil's exit, the arena doors) open without their animation (plain
   AreaTransition), and the arena doors are not created at all.
-- In Act 2, solo players talk to a bandit leader to open the native Help or Kill choice. An allied leader accepts both
-  rivals' amulets for the reward, then offers the Apex. Killing all three leads to Eramir's hand-in.
+- In Act 2, solo and party players talk to a bandit leader to open the native Help or Kill vote (S→C 0xbe / C→S 0xbd),
+  tracking in-area voters and out-of-area party members (`WaitingToEnterArea`) until all eligible voters answer.
+  An allied leader accepts both rivals' amulets for the reward, then offers the Apex; killing all three leads to Eramir.
+  Bandit respec uses the Book of Reform recipe (20 Regrets + amulet) and right-click flag, stat and passive swap.
 - Characters whose activated waypoints carry a quest flag as an access flag (a1q1's Hillock for the Coast) skip that
   flag's world changes: with OfflineWitch, The Twilight Strand's wall was not created and its gate stood open.
 - Merveil's Caverns Trick Chests (`AmarissaTrickChest` in `1_1_11_1`, `AmbrosiaTrickChest` in `1_1_11_2`) spawn in
   their chambers, open with loot and ambush with risen targetable Amarissa/Ambrosia plus Slimy Bloodsuckers
   (not checked live). Code: `Rules.TrickChests.cs`, `Act1.cs`.
-- Player character voice lines (`CharacterAudioEvents`): area entry (`Visited-*` via post-`0x2bb` `0x2bc` diff,
-  Act 4 mines, first Atlas map), campaign and pinnacle boss kills and first NPC meetings trigger natively via
-  `PlayerQuestFlagsUpdate` `0x2bc` (not checked live). Docs: [12](../docs/protocol/12-quests.md).
+- Player character voice lines (`CharacterAudioEvents`): area entry (`Visited-*`, `FirstEntry_NPCTextAudioKey`,
+  `WashedUp`, Act 4 mines, Atlas), boss kills (including `ZombieBite`), lore reactions and NPC meets (not checked live).
+  Docs: [12](../docs/protocol/12-quests.md).
 
 ## Not working yet
 

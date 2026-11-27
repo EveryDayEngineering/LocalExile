@@ -5,7 +5,7 @@ Part of [Status](../Status.md); what to build next in this area is in
 
 ## Works (verified with the real client)
 
-- Idols (Legacy of Phrecia): they drop in maps, the 41 unique ones too, can be gambled at Faustus, lie in the Atlas screen's side panel and add their modifiers to the maps opened.
+- Idols (Legacy of Phrecia; the mod `idols` in LocalExile-Mods): they drop in maps, the 41 unique ones too, can be gambled at Faustus, lie in the Atlas screen's side panel and add their modifiers to the maps opened.
   The 3.29.3 clients have no Idol panel, so the Idol inventory is the map device's storage grid: 4 by 5 cells, one loadout.
   Docs: [Idols](../docs/game/idols.md).
 - Heist Locker is placed in each hideout and opens its native window (0x7b kind 0x37).
@@ -16,11 +16,14 @@ Part of [Status](../Status.md); what to build next in this area is in
   the native recipe browser (0x7b kind 0x39).
   C→S 0x274 carries the selected HarvestCraftOptions HASH16 (captured live: ReforgeFire 0xa3e5); S→C 0x276 carries the
   crafted item id and clears the panel's pending state, so Craft can be clicked repeatedly without reopening.
-  Targeted/affinity reforges, augments and modifier conversions execute on the item in HarvestCraftingItem; the exact
-  Wild/Vivid/Primal/Sacred lifeforce cost is split across the main inventory and personal stash and commits with the
-  item atomically.
-  Refusals spend nothing; unsupported influence, exchange, divination-card, gem, corrupted-map and quality-enchant
-  recipes are reported in chat and wait for their prerequisite systems.
+  All 74 `HarvestCraftOptions` recipes execute on the item in HarvestCraftingItem, including targeted/affinity reforges,
+  augments, modifier conversions, body-armour/weapon quality enchants, essence/set exchanges (with stack and basetype
+  cost scaling), divination-card rerolls and gambles, influence rerolls/reforges, corrupted-map rerolls, Ruthless
+  support-gem swaps and Facetor's Lens (`StoredExperience`, applicable to skill gems).
+  Essence, set (oils, fossils, catalysts, fragments) and divination-card exchanges currently roll uniformly over the
+  eligible target pool rather than using retail drop weights.
+  Refusals spend nothing; the exact Wild/Vivid/Primal/Sacred/Rancour cost is split across the main inventory and
+  personal stash and commits with the item atomically (new non-item recipe families not yet tried in the client).
   Reforges need an identified rare, augments a non-influenced item.
   Uniques, unmodifiable items and a recipe of the other game mode (GameMode 1 not in Ruthless, 2 Ruthless only) are
   refused, and RancourCost charges Crystallised Rancour (these rules not yet tried in the client).
@@ -29,7 +32,7 @@ Part of [Status](../Status.md); what to build next in this area is in
   See [21](../docs/protocol/21-hideouts.md), Horticrafting Station.
 - Generic 3.29 maps, first slice (2026-10-27): `MapKeyTierN` items serialize their MapKey component and `/item Map
   (Tier N)` creates one; the map device accepts them and uses `MapKeys.dat` for the tier. The native hideout Atlas
-  window (S?C 0x7b kind 0x2b) shows the four starting layouts; a node click (C?S 0x00e7) selects one and Activate opens
+  window (S→C 0x7b kind 0x2b) shows the four starting layouts; a node click (C→S 0x00e7) selects one and Activate opens
   it. Every character has the epilogue quest flag `EndGameAvailable`, without which the client refuses Atlas activation
   (until Kitava earns it, only in a hideout and the maps, so the Epilogue's gates stay shut; checked offline).
   Live 2026-10-29: selecting Estuary opened Estuary; Cells is the default.
@@ -47,21 +50,32 @@ Part of [Status](../Status.md); what to build next in this area is in
   so the client ends on it; the lists are sorted; the budget adds node-granted points (Unwavering Vision). A refund
   spends one respec point (`atlas.respec`, starting at 0) and an Orb of Unmaking (Kirac's shop) grants one
   ([15](../docs/protocol/15-progression.md) §2; not yet tried live). Trees II and III unlock at 50 and 100 completed
-  maps (the stand-in for bonus objectives) through league flags 329-332, per character; a locked tab is refused. A map's area stats take the active preset's
+  bonus objectives through league flags 329-332, per character; a locked tab is refused. A map's area stats take the active preset's
   nodes (HardMode vectors in a HardMode league) composed by the tree's own rules (`AtlasStats`: Wandering Path, Grand
   Design, Unfettered Concentration, mod effect per mod and per fragment), with rarity-gated packs and Meticulous
   Appraiser resolved in the list; the vital/deadly keystones' monster life and damage, the map's card and scarab
   drop factors and the scarab-type weights (ScarabTypes: the Carapaces' `MoreLikely`, `DisableDrops`) act ([maps](../docs/game/maps.md); offline only).
+  Monster kills (ordinary, projectile and minion) use the map's Atlas drop-chance, no-map-drop and tier-upgrade rolls when selecting map-key loot.
   The selected layout is kept in the character save (an AtlasNode Id, `CharacterSaves.SelectedAtlasLayout`, chosen with
   `/atlas <layout>`), and a restarted Gateway reads it back instead of resetting to the starting node (#382). Generic
-  maps use their tier as the area level (tier + 67).
-  Atlas progress (2026-11-01): killing a map's WorldAreas boss (or any unique) in it completes its AtlasNode, saved per
-  character; S→C 0x1a4 and one chat line mark it the first time only. Area entry sends one 0x1a3 (both masks still include all on-Atlas rows) with the 0x3d
-  presets, before 0x21, so login does not announce every saved map. A completion re-sends that 0x1a3 right after the
-  0x1a4, so both panels (the Atlas and the map device's portals) draw the new mark without an area change.
+  maps use their tier as the area level (tier + 67). Layouts marked for a specific item require their designated map key or named map, and special map keys are refused on ordinary layouts.
+  Atlas progress (2026-11-01): killing the map's final WorldAreas boss completes its AtlasNode, saved per
+  character; S→C 0x1a4 and one chat line mark it the first time only. Area entry sends one 0x1a3 carrying saved completed
+  maps in the revealed mask and bonus-completed maps in the bonus mask so uncompleted maps stay fogged and uncounted,
+  along with the 0x3d presets and 0x3c tree names before 0x21, so login does not announce every saved map. First map
+  completion also grants league quest flag 295 (`CompletedMap`) so the Atlas opens zoomed out to scale 0.5. A completion
+  re-sends 0x1a3 right after 0x1a4 so the Atlas and portal labels update without an area change. Map-device rarity and
+  corruption qualify a separate, one-time passive point and objective count ([21](../docs/protocol/21-hideouts.md)).
+  Atlas passive gold respec (C→S 0x3f gold flag and 0x40 Refund All via Kirac's Atlas Respecialisation), preset
+  renaming (C→S 0x2a7 / S→C 0x3c), free resets (0x3d bit 0 / C→S 0x41) and 0x129 → 0x91/0x12a replies are wired.
+  Scrying Orbs carry their source map into the Atlas. Applying one changes the destination map’s divination-card pool. An Orb of Scouring clears the link.
+  Incremental Voidstone deltas (0x1a5),
+  Primordial Altar HUD ruleset 99 (0x1f/0x2c9), and 0x18/0x1d5 Atlas notifications are wired (live check pending).
+  Map device activations forward eligible primordial boss options (C→S 0xd8 index) to `map_atlas_primordial_boss_influence`
+  and handle Memory Line (C→S 0x297) and Maven Invitation (C→S 0x298) receptacles.
   `/atlas_complete <map | all>` and `/atlas_reset` (dev).
   Live: 0x1a4 for Chateau showed it completed and opened Springs and Arachnid Nest; a native Beach boss kill also sent
-  the completion and refreshed the Atlas state. Bonus objectives, Voidstones, map stash placement and official drop pools remain open.
+  the completion and refreshed the Atlas state. Voidstones, map stash placement and official drop pools remain open.
   Code: `AtlasCatalog.cs`, `AtlasPassives.cs`, `AtlasProgress.cs`, `MapDevice.cs`, `ItemDrops.cs`, `InstanceItems.cs`.
   Docs: [21](../docs/protocol/21-hideouts.md), [re/013](../docs/re/013-atlas-progress.md), [maps](../docs/game/maps.md), [05](../docs/protocol/05-inventories-and-ui.md).
 - Portal Scroll and the Portal skill (its 2.5 s cast): outside towns and hideouts a portal opens beside the player,
@@ -83,11 +97,14 @@ Part of [Status](../Status.md); what to build next in this area is in
   the map device can be clicked and opens its window (S→C 0x7b kind 5);
   maps go into its slots (dragged, or Ctrl + clicked: C→S 0x00e4 in and 0x00e5 out, live 2026-11-15), Activate
   (C→S 0x00d8) checks them (maps and map fragments only, one map), consumes them and
-  opens six portals (MultiplexPortal + S→C 0x008f) into one instance of the map's area, each used once (the one taken
+  opens up to six portals into one shared instance, subject to the map's portal limit (the one taken
   stays gone); a click on a run whose instance has expired (six minutes after its last player left) closes the run and
   its remaining portals and says so in chat, instead of spending a portal on a transfer that cannot arrive (2026-11-18);
   guests share that portal pool, map rules and return destination, and see the owner's saved furniture.
   Visiting another hideout preserves the visitor's own home; only the owner activates its device or edits its furniture.
+  A visitor sees the HUD's own Leave Hideout button (0x1d B20 = 11), which sends `/hideout`.
+  Code: `AreaInstance.UnownedHideoutKind`, Gateway (`UnownedHideout`).
+  `C→S 0x17a` resolves named online targets for party members, friends and `0x179` invitees (live check pending).
   The instance keeps the map's level and mods for its whole life (after its last portal or another
   activation, and for guests); 0x1d sends the map's area stats (its mods, tier and atlas) and the Gateway generates
   the level and applies the mods with them, the tier's more monster life and damage included;
@@ -113,11 +130,62 @@ Part of [Status](../Status.md); what to build next in this area is in
 
 ## Partly working
 
-- Named scarabs: Domination/Cloister, Ambush boxes, Essence release/Ascent/Calcification/Stability and Terrors bosses;
-  Essence: corruption/transfers, Toughness, enrage, Decay, Envy, Karui and death insects; other skills/scaling partial (#505).
-- Tormented Spirits in maps and the campaign: touch, possession, right-click Possession cancellation (`C→S 0x004b`),
-  rewards, the Torment scarabs, the Atlas tree's stats and the Idols' once they reach maps (#1091) (name plate update:
-  [14](../docs/protocol/14-monster-packs.md) §5).
+- Act 11 Atlas endgame progression (verified live in 3.29.3d): unconditional endgame flag bypass removed (kept as
+  `/atlas_unlock`), Karui Shores War Room Map Device works for `a11q1`, and Eagon stands in hideouts once unlocked.
+  `0x01a3` carries Tangle/Cleansing 28-map counts and sections `0x04` (Maven witnessed), `0x08` (Memory Lines), and
+  `0x10` (Astrolabe Shaped Regions); `0x01a4` bit `0x04` marks incremental witnessing.
+  Envoy encounters, Maven witnessing and Crucible (`0x7b` `0x52`, `0x0298`, Ruleset 112), Eldritch influence packs and
+  Altars (`0x028e`, Ruleset 99), Zana/Eagon Memory Tears (`0x7b` `0x42`, `0x0297`), Astrolabes (`0x0075`/`0x0076`),
+  Memory Vaults, 3.29 Atlas Anomalies, all nine Atlas Books of Skill (138-point retail budget), and Merciless/Eternal
+  Labyrinth (`labyrinth_a11`) are implemented.
+  See [21](../docs/protocol/21-hideouts.md).
+- Hideout template export and import (`0x0213`) save and restore doodads and music per account; live check pending.
+- Crafting bench close (`0x02b1`) and Horticrafting quick-move (`0x00f8`) update bench balance and slot state.
+- Guild hideouts (`0x7b` `0x22` arg 1, `0x1f2`/`0x1f5` guild bit, `0x254` bit 15, `Hideout2`): offline verified.
+- Smuggler's Caches in maps: one per map area from the Heist roll, opens on click, back open on re-entry; no loot yet.
+- Rogue Harbour: NPCs and stashes at the room's cells; Heist screens open (0x34, 0x35, 0x36), no contract start yet.
+- Tier 17 Marked for Death follows rare/unique kills; monster impales detonate on the fifth stack (checked offline).
+- Rogue Harbour: PlanningNPCs, 0x27c/0x164, 0x279/0x27d–0x27f planning ([21](../docs/protocol/21-hideouts.md)).
+- Map Delirium Mirror: all five scarabs, Mania depth/counter growth, Paranoia types, Neuroses bosses/kill types,
+  Delusions found-map enchants, shared reload/reentry and single payout ([boundaries](../docs/game/league-encounters.md#delirium-scarabs)).
+- Nightmare maps apply their levelled hexes while the player is in the map.
+- Map and Atlas modifiers govern scarab drops, monster combat and player recovery, skill area, defences, accuracy and aura effect.
+  The Tier 17 block, suppression, monster Energy Shield and recipient curse modifiers are checked offline.
+- Channel and Waterways use walkable arrival and portal anchors on generated layouts.
+- Nightmare map flask uses schedule meteors in the map instance.
+
+- Legendary maps: a unique map opens its own area (`UniqueMaps.WorldAreasKey`, by its name word) at the level of the
+  `Maps` tier that names it, on the tier-1 key or a MapWorlds base (#1092); checked offline.
+  The client still refuses them: on their own Atlas node it shows "The device requires a map" and sends no 0x00d8, and an
+  ordinary node does not take them (live 2026-11-22; a WorldAreas HASH16 in MapKey flag bit 1 did not change it).
+  Their fixed unique modifiers are not applied.
+- Named scarabs: Domination/Cloister, Ambush boxes, Essence release/Ascent/Calcification/Stability, Terrors bosses,
+  Bestiary's additional red beasts/family lures/Shadowed Crow/capture copies and Sulphite's owner yield/Fumes.
+  Delirium, Shaper/Elder influence, Legion, Abyss, Mercenary, Expedition, Incursion, Betrayal and Pandemonium inputs
+  use their existing encounter paths
+  ([encounters](../docs/game/league-encounters.md)); remaining families still report provider diagnostics.
+  Terrors' boss kit skills inherit map damage, speed, projectile and area modifiers alongside their default attacks.
+  Bestiary captures persist per account and league; mission identities and claims survive module reload.
+  The Bestiary book, itemisation and Blood Altar remain unimplemented; capture storage alone does not expose those UIs.
+  Selection weights, party capture chance, full-store replacement and Fumes placement retain local approximations
+  ([encounter boundaries](../docs/game/league-encounters.md#bestiary-and-sulphite-scarab-boundaries)).
+  Essence supports Vaal corruption, Adaptation transfers, low-life enrage, Decay, Toughness (damage-taken, not life),
+  the imprisoned pack (mini monoliths release magic guards with the rare), encased preview monsters (+0x104 panel),
+  the 3.29 Atlas cluster (CoreLeagues count, additional/higher-tier/max-tier/Remnant/Essence-Rare-Chance rolls, Crystal
+  Resonance boss inheritance) and all released rare/daemon behaviours in `Monster/Mods/`: Hatred/Anger/Wrath novas with
+  −10% res debuffs and Hatred's chilling trail, Misery's chaos aura (extra stacks on hit) and triggered proximity shield,
+  Envy's degen aura and grab, Rage's TrapFireRune mines, Suffering's Frost Bomb (−30% exposure) and on-death Arctic Golem,
+  Anguish's Meteor Firestorm and fracturing Fiery Rubble, Dread's chaos Firestorm and Guardian Golem, Greed's blood-orb
+  Corrupted Blood bombs, Torment's Ball Lightning, Sorrow's Vortex totems, Spite's Arc and shocked-ground totem, Doubt's
+  Flicker/Viper Strike spiders, Woe's Energy Locus, Fear's Charging Corsairs, Contempt's invulnerable chasing Karui
+  spirits, Zeal/Loathing/Scorn alternating buffs, Insanity's Storm Call beacons and invulnerable Spectral Spirits,
+  Hysteria's Flameblast, 8-Fireball burst, Meteor Golem and burning ground, Horror's 9-circle ice-explosion cascade,
+  chilled-ground Maelströms and periodic Endurance/Frenzy/Power charges, Delirium's piercing caustic chaos projectile,
+  Explosive Crawlers and on-death insect, Desolation's poison flesh boulder and Remnant of Corruption's slow/physical
+  aura and on-death Fleshmonsters.
+  Not right yet: crystal/statue visuals (`rig.ao` state-1 shards) and Adaptation's per-essence scaling (#505, #1206).
+- Tormented Spirits in maps and the campaign: touch, possession, rewards, the Torment scarabs, the Atlas tree's stats
+  and the Idols' once they reach maps (#1091) (name plate update: [14](../docs/protocol/14-monster-packs.md) §5).
   Not yet: the spirits' and Grips' own skills, possessed Rogue Exiles, scarab weights, Refiner's Bargain (#1129).
 - Beyond in maps (3.29 Scourge rework, #1156): kill-triggered blood orbs (`BeyondPortal1`) merge into pack
   (`BeyondPortal2`) and boss (`BeyondPortal3`) portals for the rolled `BeyondFactions` faction (Demon, Flesh, Pale),
@@ -136,6 +204,13 @@ Part of [Status](../Status.md); what to build next in this area is in
   hits once instead of zapping as it flies, The Beachhead unique map portal encounter and Harbinger unique piece
   assembly.
 
+- Expedition in maps and Acts 6-10 supports placing explosives, detonating markers and opening excavated chests.
+  The installed client produced chest loot in Forbidden Woods in Lockstep and on the Act 6 Coast in Predictive.
+- Expedition's faction leader (Tujen, Dannig) stands at an encounter and can be talked to; the other factions place
+  none yet (ExpeditionEncounter.cs).
+- Incursion (Alva, map master mission): per-instance spots, portal, timed room run; temple area pending.
+- Betrayal (Jun, map master mission): Transportation or Intervention, kneel, MakeChoice; board pending.
+
 - Sacred Grove (Harvest): the map rolls it from the composed area stats (Atlas, scarabs, sextants, Idols), on `.dgr`
   and `.tgr` maps; its `link` rooms are a gate each way inside the map instance where the league runs Harvest, and map
   packs stay out of the grove.
@@ -150,7 +225,7 @@ Part of [Status](../Status.md); what to build next in this area is in
   seeds; Corpse-Grown (Faridun) seeds replace Tier 3 seeds wherever `map_harvest_%_chance_for_faridun_seed` is granted.
   Tier 4 bosses drop the Sacred Blossom, which opens `HarvestLeagueBoss`: the soul tree starts Oshabi's four colour
   phases (Sacred first) and their adds, the Root Wall cage held by the walls' bodies (sent unblocked); her death sets
-  `HarvestOshabiDefeated`, opens the Groveseed Altar (Oshabi Bloodline) and drops her world.db rewards. The opt-in Legacy module `HarvestHeartOfTheGrove` (3.13) rarely puts her in a map's grove.
+  `HarvestOshabiDefeated`, opens the Groveseed Altar (Oshabi Bloodline) and drops her world.db rewards. The 3.13 Heart of the Grove, which rarely puts her in a map's grove, is the mod `harvestheartofthegrove` in LocalExile-Mods.
   Live 2026-11-18 (tier 16 Cage): the gate labelled "The Sacred Grove" leads in and back; the grove needs the client's
   HarvestRules ruleset (S→C 0x1f), without which an Extractor crashes the client once targetable; a Collector shows its
   seed list, one click hatched 23 Vivid monsters and withered the pair, and their lifeforce reached the Horticrafting
@@ -158,8 +233,25 @@ Part of [Status](../Status.md); what to build next in this area is in
   selector). Not compared with a retail capture: Oshabi's state sequence (soul tree progression, interactable, emerge, energy and colour stages, death; her emerge,
   travelling and repeat_fight states).
 
-- Simulacrum: five arenas and a 15-wave controller; opening and the wave-start prompt checked in the client, wave
-  combat and the reward display not yet. Starting a wave destroys every item on the ground, as the client warns.
+- Legion (partial): the Timeless Monolith with its timer, two armies in stasis, break-out on damage, release wave and war chests;
+  rewards (symbols, rolled drops, splinters, Ruthless scaling), the scarabs and the Atlas passives. The Domain of Timeless Conflict
+  follows 3.29: ghosts, revival waves in the control zone, the 100-crystal tracker, the generals' lines and recipe portals. The army
+  fills the arena; Aukuna fights mounted and dismounts on the mount's death; Hyrri is her Fish with the rider and water clones;
+  Generals and Sergeants use the S6 combo hooks. Scarab inputs, repeated breakouts and reward drops have native verification;
+  the rest is not checked in the client, and retail reward weights and difficulty need calibration.
+  Docs: [Legion](../docs/game/legion.md).
+
+- Blight: pump, lanes, enemies, foundations; only 17 of 30 towers act (HUD and chests pending).
+
+- Simulacrum: five arenas and a 15-wave controller; opening and the wave-start prompt checked in the client.
+  Per-type reward bars drive the native HUD via `AfflictionEndGameRules` (S→C 0x1f row 103 + S→C 0x2c9 mode 1; live
+  HUD check pending), and waves pay all counted rewards at wave end
+  ([protocol](../docs/protocol/21-hideouts.md#selected-encounter-inputs-simulacrum)).
+  Arenas hide their waypoint, use measured spots, clear hostile leftovers and keep Lunacy's Watch off its ship.
+  Starting a wave destroys every item on the ground, as the client warns.
+  Its arenas use their encounter rules independently of the owner's Atlas preset.
+  Scheduled bosses spawn before a scaled wave can award its rewards.
+- Simulacrum's flask drain and map hit effects work offline. See [map hits](../docs/game/maps.md#monster-hit-modifiers).
 
 - **Waypoint arrival.** Hideout entry uses the exact saved waypoint cell for spawn and movement origin,
   including login and returns from other areas.
@@ -179,11 +271,18 @@ Part of [Status](../Status.md); what to build next in this area is in
   The map-device underfoot escape and walking through its released old position were verified in the client.
   Extracted AO hull radii cover small and large map devices; persistence and clearance have automated coverage.
   Map-device, Nessa and stash movement/rotation and reconnect persistence were verified in the real client.
-  Adding/removing arbitrary decorations and changing their appearance remain unimplemented; the dev `/statue`
-  command places a saved stone Monster Statue of a chosen MonsterVarieties row (2026-11-01, live client verified:
-  no life bar or name, idle animation, survives leaving and re-entering). See
-  [21](../docs/protocol/21-hideouts.md), Monster Statue.
-  See [21](../docs/protocol/21-hideouts.md), Moving installed furniture and NPCs.
+  The Decorations panel loads its list in the owner's hideout (0x21 own-hideout bit; it stayed on "Loading…" without it,
+  live 2026-11-22). Placing (`C→S 0x59` by owned record, `0x5a` by hash), deleting (`0x5c` Delete key, `0x5d`) and
+  resetting (`0x5e`) custom decorations, capped at 750, are saved per account; pets stand as ownerless pet objects.
+  Entry, placement, removal, layout import (`0x0213`), and reset emit `S→C 0x0214` in-use decoration record updates.
+  A placed map device variant replaces the working device, with its button from MapDevices.dat, a blocker that stops
+  short of the button, and its model's own portal places or ring radius; the Puzzle Cube is refused.
+  `/save_hideout` (command 50), music box persistence (`0x255`, saved and reported in `/save_hideout`; no re-entry replay packet),
+  league-scoped Item Display Case (`0x7b` `0x49`, `0x67`, `0x68`), Horticrafting Ctrl + click (`0xf9`),
+  and `RecipeUnlockDisplay` area unlock flags are implemented (offline verified; live client checks pending).
+  The dev `/statue` command places a saved stone Monster Statue of a chosen MonsterVarieties row (live client verified:
+  no life bar or name, idle animation, survives leaving and re-entering).
+  See [21](../docs/protocol/21-hideouts.md), Monster Statue and Moving installed furniture and NPCs.
 - Ordinary crafting bench (2026-10-25, automated coverage; live client verification pending): all 765 active recipes
   and their 130 recipe flags are available.
   Exact modifiers, class masks, socket/link recipes, flask enchantments, replacement/removal and rare-affix rerolls
@@ -213,6 +312,8 @@ Part of [Status](../Status.md); what to build next in this area is in
   Faustus uses his native hideout NPC alongside them in every template, with the existing dialogue and saved editor placement.
   Kirac's hideout row has no dialogue of its own and uses the main Kirac's (`NpcCatalog.TalkSource`);
   Purchase Items sells maps. Kirac marks a conversation heard when chosen (NPCTalk column 15 league flags), which opens his next ones.
+  His first Karui Shores conversation plays Introduction and offers Enter the Atlas and Take Map in sequence.
+  The normal reward inventory grants one tier-one map per account league.
   Niko's Delve options need quest flag ThisIsMyHideout (sent in hideouts and the Mine Encampment) and league quest
   flag 68 DelveEncounterComplete (every character): NPCTalk columns 15-18 are league quest flag ids.
   See [21](../docs/protocol/21-hideouts.md).
@@ -228,6 +329,8 @@ Part of [Status](../Status.md); what to build next in this area is in
   their NPCs (Einhar, Divinia, the Kingsmarch villagers, the Heist crew, Ailith; Einhar also in every hideout).
   The hub waypoints stay unlit (client area-type rule).
   The upper hub entrance now reaches an initial Delve_Main mine section and its return gate leads back to the hub.
+  Delve_Main emits the 0x1d return-area hash (flag byte 0 bit 0x08) and handles C→S 0x186 (Return to World).
+  Owned hideouts emit 0x1d flag byte 1 bit 0x80 for hideout permissions.
   Native entry, ordinary walking and return were verified; see the initial terrain block below.
   Account checkpoint progression is implemented; physical terrain and encounter limitations are described below.
   See [16](../docs/protocol/16-waypoints.md) §4.
@@ -250,7 +353,8 @@ Part of [Status](../Status.md); what to build next in this area is in
   combat affixes, Soul Eater, free lanterns, Strongboxes, Essence monoliths, Torment cages, Izaro altars, Treasure
   Anchors, minibosses, rare-monster drops and post-roll drop conversions.
   Not applied: Wildwood Wisps, Pantheon rare mods, rare fracture-on-death, Friendly Jellyfish AI, wealthy barrel
-  clusters, highly fishy, and the Active Voyage window (0x72).
+  clusters, and highly fishy.
+  The Active Voyage window (0x7b kind 0x72) and Bathysphere descent countdown (0x162) are wired (live check pending).
   A new instance of an encounter area (`/goto DeepwaterEncounter`, `/goto DeepwaterEncounterVoyage`) gets a random grid
   of the Sandy, Coral Forest and Coral Reef rooms (one room, or a 3 × 3 Voyage) with The Sovereign in it, sent in
   0x1d's extra data, and ruleset 171, which the client keeps (verified live, 3.29.3d, 2026-11-18;
@@ -288,8 +392,8 @@ Part of [Status](../Status.md); what to build next in this area is in
   Ducat socketing and reclaim, and Message in a Bottle reveal.
   Ship upgrades (`DeepwaterUpgrades` rows 0–4: `+1` lantern, Sulphur scaling, extra scattered objects, final-lantern
   Adrenaline, all five upgrade pieces with Vesper turn-ins `#3920–3924` unlocking copy-cap tiers and
-  `GhostflameCraftingBenchProps_Stage1..6`), Act 1 Deepwater Fairgraves (`1_1_9` with `FlameBarrier1` and
-  `AllFlameLanternDeepwater`), and Kishara's Rest (`#29` barrier → `#30` imbued level ≥ 83 boss arena with two-phase
+  `GhostflameCraftingBenchProps_Stage1..6`), Act 1 Deepwater Fairgraves (`1_1_9` with dynamic `FlameBarrier1` and
+  `AllFlameLanternDeepwater`, crediting minion/totem/trap/mine kills too), and Kishara's Rest (`#29` barrier → `#30` imbued level ≥ 83 boss arena with two-phase
   Cressie and Velka, guaranteed unique + 8% Coursing Current Support + first-kill quest drops, and
   `VelkaDescensionObject` opening Velka Bloodline `Descendancy#15`) work
   ([03](../docs/protocol/03-area-and-world.md) §8, [12](../docs/protocol/12-quests.md) §5,
@@ -317,7 +421,8 @@ Part of [Status](../Status.md); what to build next in this area is in
 - **Delve sulphite and the Crawler (verified live, 2026-10-29).**
   - The character's Voltaxic Sulphite is saved, sent on entering the Mine Encampment or a Delve area (S→C 0x228), and
     shown by the Subterranean Chart's gauge. `/sulphite <n>` sets it.
-    Sulphite scarabs guarantee three shared, single-use map deposits with Niko; native area-level rewards scale with
+    Sulphite scarabs guarantee three shared, single-use map deposits with Niko. Natural encounters roll the area's
+    composed Delve chance using the map's seed. Native area-level rewards scale with
     map quantity and the owner's legacy scarab bonus, cap at equipment capacity, and survive reentry/module reload.
     Fumes adds mine guards and a native enrage visual with +50% item quantity on affected monsters; its radius,
     guard placement and exact official combat tuning remain server approximations.
@@ -367,6 +472,7 @@ Part of [Status](../Status.md); what to build next in this area is in
     confirmed cross-character checkpoint sharing and unfinished-trip death reset.
     DelveOwner enables chart continuity; Niko and Crawler center it on the last saved account checkpoint.
     Mine windows follow chart-cell origins so the underground position arrow follows the occupied checkpoint.
+    Live Azurite (0x227), chart delta (0x22c), and confirmed route echo (0x242) updates are wired (live check pending).
     General biome/encounter parity, darkness damage and consumable use remain partial.
   - The Crawler stands on the rails by the mine entrance at (408, 310), facing 90°, on every entry; the stash and the
     guild stash are at (355, 295) and (344, 295), facing 180°. Lioneye's Watch has them at (327, 270) and (317, 270).
@@ -389,11 +495,10 @@ Part of [Status](../Status.md); what to build next in this area is in
 
 ## Not working yet
 
-- Hideouts: adding/removing decorative trees/tents and changing decoration appearance are not implemented.
-  Personal template selection, saved home login and functional furniture placement are implemented
+- Hideouts: changing a placed decoration's appearance and the Puzzle Cube map device are not implemented
   ([21](../docs/protocol/21-hideouts.md)).
-- Map device: a map without a walk-map capture puts the player at an arbitrary cell (Beach is captured);
-  such a map now gets a random seed instead of seed 1, which is the seed captures are dumped at — pinning it there handed
+- Without a generated layout or walk-map capture, a map can place the player at an arbitrary cell.
+  Such a map gets a random seed instead of seed 1, which is the seed captures are dumped at — pinning it there handed
   the client a layout it could not build and it exited (`MapWorldsColosseum`: "no suitable room found … cage_turn");
   the arena gates land next to their pair, not on the telepads;
   the portals look like player portals; the open map is lost on a Gateway restart

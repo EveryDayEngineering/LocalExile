@@ -22,6 +22,9 @@ Items keep the Roadmap's priority groups, and are in rough priority order within
   Yugul has mirror intervals, pool chill, Fearful orbs and turret volleys; calibrate Fearful magnitudes and orb AI.
   Solaris/Lunaris have celestial fire/cold hazards; calibrate original handoff timing, target distribution and radii.
   Normal Sirus has its laboratory and four-phase controller; calibrate official decision weights and reward chances.
+  Act 11 pinnacle bosses (Maven, Infinite Hunger, Black Star, Eater of Worlds, Searing Exarch, and Incarnations of
+  Neglect, Fear, and Dread) have dedicated multi-phase controllers and boss drop tables; live verification and tuning
+  remain pending ([status](../status/monsters.md#partly-working)).
   Hits can make monsters flee ([11](../docs/protocol/11-skills.md) §6); a live check should settle the flee distance
   and whether the real server walks a fleeing monster with Monster.ot's `Flee` action instead of Move.
   Inherited Life corpse/sinking flags and the source eligibility predicate are implemented for ordinary creation
@@ -33,12 +36,11 @@ Items keep the Roadmap's priority groups, and are in rough priority order within
   Automated cadence and lifecycle checks retain interruption and stage-completion guards.
   Ordinary Melee follows resolved native clip clocks, including slow spans and published action-speed changes.
 - **Start:** the systems the 74 unsupported monster mods need (auras on allies, retaliation and on-death skills, ailments and
-  curses on the player; [14](../docs/protocol/14-monster-packs.md) §5), stages of other bosses (`BossFights.cs` has Hillock's
-  and `KingInMists.cs` the two-form Ritual pinnacle), pack
-  `Grounds`, the varieties with BlightTower / Mercenary … components (each needs its deserializer,
-  schema.md; NPC, InteractionAction and Timer are written), the bandit lords' help-or-kill dialogue, bosses' later
-  forms (Abberath2, Shakari2, Malachai's second form) created by their fight, tile spawner bosses
-  (Marceus).
+  curses on the player; [14](../docs/protocol/14-monster-packs.md) §5), live calibration of Act 1–10 boss controllers,
+  pack `Grounds`, the varieties with BlightTower / Mercenary … components
+  (each needs its deserializer, schema.md; NPC, InteractionAction and Timer are written), tile spawner bosses
+  (Marceus), and wiring campaign Bestiary, Blight, Delirium and Vaal Side Area encounters once their league
+  modules are implemented.
   Emerge monsters: the official emerge distance and whether a pack rises together are unknown (the server's `.ais`
   files); types whose Transitionable lists more states (SpiderBoss: 3) are still created risen.
   Corpse consumers still need authoritative final-death registration and identity; one-use consumption exists only as

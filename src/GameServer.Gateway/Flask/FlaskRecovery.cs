@@ -41,7 +41,7 @@ public static class FlaskRecovery
     /// / (1 + increased recovery rate), the character's flask recovery rate dividing it again.
     /// </remarks>
     public static Use For(Flasks.Flask type, Item flask, IReadOnlyDictionary<uint, int> local, Func<uint, int> character,
-        uint life, uint maxLife, int playerLevel = 1)
+        uint life, uint maxLife, int playerLevel = 1, double finalMultiplier = 1)
     {
         int L(uint name) => local.GetValueOrDefault(name);
         bool lowLife = LowLife(life, maxLife);
@@ -51,13 +51,14 @@ public static class FlaskRecovery
             + (L(Stat.LocalFlaskRecoversInstantly) > 0 ? 100 : 0)
             + (lowLife && L(Stat.LocalFlaskRecoverInstantlyWhenOnLowLife) > 0 ? 100 : 0));
         double durationInc = PanelStats.FlaskDurationIncrease(character, playerLevel);
-        double effect = FlaskEffectScaling.Multiplier(character, playerLevel, L(Stat.LocalFlaskEffectPlusPct));
+        double effect = FlaskEffectScaling.Multiplier(character, playerLevel, L(Stat.LocalFlaskEffectPlusPct), finalMultiplier: finalMultiplier);
         // The low-life more multiplier is not scaled by flask effect (Path of Building CalcPerform: "More life recovery
         // while on low life is not affected by flask effect (verified ingame)"): × (effect + more − 1), not × more × effect.
-        double Amount(int baseAmount, uint localSpecific, uint characterSpecific) =>
+        double Amount(int baseAmount, uint localSpecific, uint characterSpecific, int extraCharacterPct = 0) =>
             baseAmount * quality * (100 + L(Stat.LocalFlaskAmountToRecoverPlusPct) + L(localSpecific)) / 100.0
-            * (100 + character(characterSpecific) + character(Stat.FlaskLifeAndManaToRecoverPlusPct)) / 100.0 * (effect + lowLifeMore - 1);
-        double life0 = Amount(type.LifePerUse, Stat.LocalFlaskLifeToRecoverPlusPct, Stat.FlaskLifeToRecoverPlusPct);
+            * (100 + character(characterSpecific) + character(Stat.FlaskLifeAndManaToRecoverPlusPct) + extraCharacterPct) / 100.0 * (effect + lowLifeMore - 1);
+        double life0 = Amount(type.LifePerUse, Stat.LocalFlaskLifeToRecoverPlusPct, Stat.FlaskLifeToRecoverPlusPct,
+            lowLife ? character(Stat.LifeRecoveryPlusPctFromFlasksWhileOnLowLife) : 0);
         double mana0 = Amount(type.ManaPerUse, Stat.LocalFlaskManaToRecoverPlusPct, Stat.FlaskManaToRecoverPlusPct);
         double commonRate = (100.0 + L(Stat.LocalFlaskRecoverySpeedPlusPct)) / 100.0
             * (100.0 + character(Stat.FlaskRecoverySpeedPlusPct)) / 100.0;

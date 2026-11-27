@@ -20,7 +20,7 @@ public static partial class Game
     /// volley, so it stops there too. Other projectiles keep their full range.</summary>
     public static double PrimaryRange(string? effect, double range, double targetDistance, bool toTarget = false) =>
         // Caustic Arrow stops and bursts at the aimed point, where the client draws its impact (live 2026-11-17).
-        toTarget || effect is "TornadoShot" or "TornadoShotAltX" or "TornadoShotAltY"
+        toTarget || IsCreepingFrost(effect) || effect is "TornadoShot" or "TornadoShotAltX" or "TornadoShotAltY"
             || effect?.StartsWith("CausticArrow", StringComparison.Ordinal) == true
             ? Math.Min(range, Math.Max(.001, targetDistance)) : range;
 
@@ -35,26 +35,59 @@ public static partial class Game
             {
                 Width = get(Stat.TotalProjectileSpreadAngleOverride) is > 0 and var width
                     ? width / 10.869565 : 60 / 10.869565,
-                FixedDegrees = get(Stat.ProjectileRemoveDefaultSpread) != 0 ? -1 : get(Stat.FixedProjectileSpread),
+                FixedDegrees = get(Stat.ProjectileRemoveDefaultSpread) != 0 ? -1
+                    : get(Stat.FixedProjectileSpread) is int spread and not 0 ? spread
+                    : profile.NativeVolley?.FixedDegrees == -1 ? -1 : 0,
                 SpreadPercent = get(Stat.MultipleProjectilesProjectileSpreadPlusPct),
                 Nova = profile.NativeVolley?.Nova == true || get(Stat.ProjectilesNova) != 0
             }
         };
     }
 
+    /// <summary>Applies <c>random_projectile_direction</c> (e.g. Nimis) using the client's seeded draw before falling
+    /// back to the native fan, so non-<c>ClientPredicted</c> skills also randomize instead of firing a tight fan.</summary>
+    public static ProjectileProfile NativeVolley(ProjectileProfile profile, Func<uint, int> get,
+        ushort sequence, ProjectileVector aim, uint emitter, uint repeatsLeft = 0)
+    {
+        if (get(Stat.SupportParallelProjectileNumberOfPointsPerSide) == 0 && get(Stat.RandomProjectileDirection) != 0)
+            return profile with { NativeVolley = new() { Angles = RandomVolleyAngles(sequence, profile.Count, emitter, aim, repeatsLeft) } };
+        return NativeVolley(profile, get);
+    }
+
+    /// <summary>
+    /// 3.29.3c client spawn forward offset (<c>0x141ba7840</c> → <c>0x141ba7c30</c>):
+    /// only skills with <c>projectile_uses_contact_position</c> use the animation contact offset;
+    /// all other skills offset 30 world units (~2.76 cells, or <c>projectile_firing_forward_distance_override</c>)
+    /// along the aim direction unless <c>is_trap_object</c>, <c>is_remote_mine</c>, or <c>projectiles_not_offset</c> is set.
+    /// </summary>
+    public static double NativeProjectileForwardCells(Func<uint, int> get, ContactPoint? release, bool lightningStrike = false)
+    {
+        if (lightningStrike) return 3;
+        if (get(Stat.ProjectileUsesContactPosition) != 0 && release is { ForwardCells: > 0 } contact)
+            return contact.ForwardCells;
+        if (get(Stat.IsTrapObject) != 0 || get(Stat.IsRemoteMine) != 0 || get(Stat.ProjectilesNotOffset) != 0)
+            return 0;
+        int overrideUnits = get(Stat.ProjectileFiringForwardDistanceOverride);
+        return Math.Max(0, (overrideUnits != 0 ? overrideUnits : 30.0) / WorldUnits.PerCell);
+    }
+
     public static bool UsesProjectileRuntime(int effect) => Skills.IsProjectile(effect)
         || ProjectileDefinition(Skills.EffectId(effect) ?? "") is not null;
 
-    // Presentation only: Burning Arrow's real local input emits its own primary. Keep its existing simulation
-    // geometry separate from ClientPredicted, which also selects native range/contact/volley specialization.
+    // Presentation only: these skills emit their own primary projectiles locally in 3.29.3c (verified live for
+    // Burning Arrow, Caustic Arrow and Ice Shot). Keep their simulation geometry separate from ClientPredicted,
+    // which also selects native range/contact/volley specialization.
     public static bool ClientDrawsPrimaryProjectile(bool predicted, string? effect) =>
-        predicted || effect is "BurningArrow" or "CausticArrow" or "CausticArrowAltX" or "CausticArrowAltY" or "VaalCausticArrow";
+        predicted || effect is "BurningArrow" or "CausticArrow" or "CausticArrowAltX" or "CausticArrowAltY" or "VaalCausticArrow"
+            or "IceShot" or "IceShotAltX" or "IceShotAltY" or "IceShotRoyale" or "VaalIceShot";
 
     // Validate adopted paths before accepting an action, spending mana or reserving a cooldown.
     // Release still resolves again: equipment/stats may change during the ordinary cancellable windup.
     public static bool ProjectilePathAvailable(Player player, ushort skillId, int effect)
     {
         if (!TotemPathAvailable(player, skillId, effect)) return false;
+        if (CremationEffect(SkillsFor(player).EffectId(effect)))
+            return PlacedKind(SupportedSkill(player, skillId)) is (false, false);
         if (!UsesProjectileRuntime(effect)) return true;
         try
         {
@@ -81,7 +114,8 @@ public static partial class Game
     public static Task ScheduleGemProjectile(Player player,
         ushort skillId, (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem,
         (int X, int Y) aim, int action, int recoveryGeneration, CooldownUseTicket? ticket, SkillCriticalRoll criticalRoll,
-        ushort sequence = 0, double? swingAt = null, bool cryExerted = false, int seals = 0, double reoccurrenceMore = 1)
+        ushort sequence = 0, double? swingAt = null, bool cryExerted = false, int seals = 0, double reoccurrenceMore = 1,
+        int? rallyingDamage = null)
     {
         var session = ProjectilesFor(player);
         session.Advance();
@@ -95,7 +129,8 @@ public static partial class Game
         // From the swing's start when it began before now (a lockstep walk-up's goal frame, CastGemSkill's swingAt).
         double acceptedAt = swingAt ?? AreaTime(player);
         // A Spectral Throw's own weapon leaves on the client's swing (SpectralThrowRelease), without the server-object lead.
-        double? thrown = attack && SkillsFor(player).EffectId(gem.Effect) == "SpectralThrow"
+        var effect = SkillsFor(player).EffectId(gem.Effect);
+        double? thrown = attack && (GatewayProjectileSkillProfiles.IsSelfThrownSpectralWeapon(effect) || IsSpectralHelix(effect))
             ? SpectralThrowRelease.Delay(player, Environment.GetEnvironmentVariable("Game_PLAYER_AO")
                 ?? SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject, AnimationWeaponProfileFor(player),
                 SupportedAttackSeconds(player, skillId, sequence))
@@ -113,6 +148,13 @@ public static partial class Game
             ? PlayerActionCurrent(player, action)
             : player.PlayerLife > 0 && player.ElementalAilments.ActionFactor(AreaTime(player)) > 0 && !player.HitRecovery.Active(AreaTime(player))))
             && GemSkillInstanceDisabled(player, gem.Effect, skillId) is null;
+        if (IsBarrageGem(SkillsFor(player).EffectId(gem.Effect)))
+        {
+            ScheduleBarrage(player, session, skillId, gem.Effect, acceptedAt, SupportedAttackSeconds(player, skillId, sequence),
+                sequence, Valid, firstRelease => CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll,
+                    sequence, releaseDelay: firstRelease, cryExerted: cryExerted, sacrifice: sacrifice));
+            return Task.CompletedTask;
+        }
         // A spell's repeats (SpellRepeats) release again a cast time apart, with the use's critical roll; a new action
         // cancels the rest, as it ends the client's.
         // shortcut: a repeat keeps the cast's aim point; check live whether the client re-aims at a moving target.
@@ -122,7 +164,8 @@ public static partial class Game
                 return Task.CompletedTask;
             session.Schedule(ProjectileRuntime.Time(acceptedAt + delay), () => Valid() && VaalAdmissionCurrent(player, paid), () =>
             {
-                var use = CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, sequence, sacrifice: sacrifice);
+                var use = CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, sequence,
+                    sacrifice: sacrifice, reoccurrenceMore: paid.PactDamageMore);
                 var own = SupportedSkill(player, skillId).Stats;
                 // The default profile substitutes one shot for a missing base count. Vaal Spark
                 // already supplies that base as its hundred-shot stream; quality adds to the stream.
@@ -154,25 +197,51 @@ public static partial class Game
                     () => session.Active && player.PlayerLife > 0 && (captured is not null || Valid() && VaalAdmissionCurrent(player, paid)),
                     () =>
                     {
-                        captured ??= CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, sequence, sacrifice: sacrifice);
+                        captured ??= CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, sequence,
+                            sacrifice: sacrifice, reoccurrenceMore: paid.PactDamageMore);
                         var direction = (captured.Aim - captured.Origin).Unit.Rotate(turn * degrees * Math.PI / 180);
                         return captured with { Aim = captured.Origin + direction * captured.Profile.Range };
                     });
             }
             return Task.CompletedTask;
         }
+        if (effect == VaalVenomGyreEffect)
+        {
+            if (player.VaalUse is not { Executed: true } paid || paid.Skill != skillId || paid.Effect != gem.Effect)
+                return Task.CompletedTask;
+            session.ScheduleContact(ProjectileRuntime.Time(acceptedAt + delay),
+                () => Valid() && VaalAdmissionCurrent(player, paid), () =>
+                {
+                    var use = CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, sequence,
+                        sacrifice: sacrifice, reoccurrenceMore: paid.PactDamageMore);
+                    session.StartVaalVenomGyre(use);
+                });
+            return Task.CompletedTask;
+        }
         int repeats = attack ? 0 : SpellRepeats(player, skillId, gem.Effect);
+        var intensity = CastingIntensity(player, skillId);
+        var ghorr = CastingGhorrSpell(player, skillId);
+        var beidat = CastingBeidatSpell(player, skillId);
+        Action? completed = intensity is null ? null : intensity.Complete;
         for (int release = 0; release <= repeats + seals; release++)
         {
             int ordinal = Math.Max(0, release - seals);
             int left = repeats - ordinal;
             double more = release > 0 && release <= seals ? reoccurrenceMore : 1;
+            double beidatMore = beidat?.More ?? 1;
             double castOffset = ordinal + Math.Min(release, seals) * .1;
             session.Schedule(ProjectileRuntime.Time(acceptedAt + castOffset * cast.Value / 1000d + delay), Valid,
-                () => ClientDrawnVolley(player, session, skillId, gem,
-                    CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, sequence, (uint)left, delay,
-                        cryExerted: cryExerted, sacrifice: sacrifice, repeat: ordinal, reoccurrenceMore: more),
-                    sequence, (uint)left));
+                () =>
+                {
+                    using var scope = intensity is null ? null : new IntensityScope(intensity);
+                    using var pact = ghorr is null ? null : new GhorrCastScope(ghorr);
+                    using var beidatScope = beidat is null ? null : new BeidatCastScope(beidat);
+                    return ClientDrawnVolley(player, session, skillId, gem,
+                        CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, weaponHand: null, sequence, (uint)left, delay,
+                            cryExerted: cryExerted, sacrifice: sacrifice, repeat: ordinal, reoccurrenceMore: more,
+                            hitAndAilmentMore: beidatMore, rallyingDamage: rallyingDamage),
+                        sequence, (uint)left);
+                }, completed);
         }
         return Task.CompletedTask;
     }
@@ -184,27 +253,42 @@ public static partial class Game
         (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, ProjectileUse use, ushort sequence,
         uint repeatsLeft)
     {
-        if (use.Payload is not ProjectileOffense { ClientPredicted: true }) return use;
+        if (use.Payload is not ProjectileOffense initialOffense) return use;
+        var effect = SkillsFor(player).EffectId(gem.Effect);
+        bool spectralTrap = GatewayProjectileSkillProfiles.IsSpectralThrowTrap(effect);
+        // The trap's weapon needs the same flight rules even though the server draws it.
+        if (!initialOffense.ClientPredicted && !spectralTrap) return use;
         var playerStats = CharacterPlayerStats(player);
         var own = SupportedSkill(player, skillId).Stats;
         int Player(uint k) => playerStats.GetValueOrDefault(k);
         int Own(uint k) => own.GetValueOrDefault(k);
         int Get(uint key) => Player(key) + Own(key);
         use = use with { Profile = ClientDrawnProfile(player, use.Profile, Get, sequence, use.Aim - use.Origin, repeatsLeft, use.Emitter.Id) };
-        if (use.Emitter.Id != player.Id && NativeProjectileTotem(player, gem.Effect)
-            && use.Payload is ProjectileOffense nativeTotemShot && SkillsFor(player).Clips(use.Profile.Id) is { Flight: not null } clips)
-            use = use with { Payload = nativeTotemShot with { ClientPredicted = false,
-                Presentation = MonsterProjectilePresentation(clips, use.Profile.Range / Math.Max(1, use.Profile.Speed)) } };
-        if (SkillsFor(player).EffectId(gem.Effect) == "SpectralThrow")
+        if (CastingBeidatSpell(player, skillId) is { Projectiles: > 0 } && use.Profile.NativeVolley?.Angles is null)
+            use = use with { Profile = use.Profile with { NativeVolley = new() { Nova = true } } };
+        else if (GatewayProjectileSkillProfiles.IsBlazingSalvo(effect)
+            && use.Profile.NativeVolley is { Angles: null, Nova: false })
+            use = use with { Profile = use.Profile with { NativeVolley = null } };
+        // A totem's action plays its cast but spawns no projectile on the client (live 2026-11-19: a totem's Fireball
+        // cast and hit with nothing flying), so the server draws a totem's shots, with the rig's flight and impact clips.
+        if (use.Emitter.Id != player.Id && use.Payload is ProjectileOffense totemShot)
+            use = use with { Payload = totemShot with { ClientPredicted = false,
+                Presentation = WithProjectileClips(totemShot.Presentation, SkillsFor(player).Clips(use.Profile.Id),
+                    use.Profile.Range / Math.Max(1, use.Profile.Speed)) } };
+        bool selfThrown = GatewayProjectileSkillProfiles.IsSelfThrownSpectralWeapon(effect);
+        if (selfThrown || spectralTrap)
         {
+            bool materialising = effect == "SpectralThrowAltX";
             double thrown = use.Profile.Speed;
+            double deceleration = Math.Max(.01, 1 + Get(Stat.SpectralThrowProjectileDecelerationPlusPct) / 100d);
             return use with
             {
                 // Its hits showed no blood or particles without the 0x1af the ordinary arrow sends (live 2026-11-02).
-                Payload = (ProjectileOffense)use.Payload! with { HitPacket = true, ActionSequence = sequence },
+                Payload = selfThrown ? (ProjectileOffense)use.Payload! with { HitPacket = true, ActionSequence = sequence } : use.Payload,
                 Profile = use.Profile with
                 {
-                    Legs = _ => new SpectralThrowLegs(thrown), LegLeash = SpectralThrowLegs.Leash(thrown), ReturnOvershoot = 0,
+                    Legs = _ => new SpectralThrowLegs(thrown, deceleration, returnAtWall: materialising),
+                    LegLeash = SpectralThrowLegs.Leash(thrown, deceleration), ReturnOvershoot = 0,
                     ReturnSpeedMultiplier = use.Profile.ReturnSpeedMultiplier * SpectralThrowLegs.ReturnSpeedMultiplier
                 }
             };
@@ -227,6 +311,7 @@ public static partial class Game
             ? ProjectileSession.Vector(player.Walk.Position(session.Runtime.Now / (double)ProjectileRuntime.QuantaPerSecond))
             : use.Origin;
         double speed = use.Profile.Speed;
+        bool unpredictable = SkillsFor(player).EffectId(gem.Effect) == "SparkAltY";
         var shot = (ProjectileOffense)use.Payload!;
         // The proxy's Actor action does not draw Spark. Give its simulated legs a flight object and the art's own clip.
         if (use.Emitter.Id != player.Id)
@@ -241,7 +326,7 @@ public static partial class Game
             Payload = shot,
             Profile = use.Profile with
             {
-                Legs = i => new SparkLegs(sequence, i, use.Emitter.Id, life, randomDuration, speed, repeatsLeft),
+                Legs = i => new SparkLegs(sequence, i, use.Emitter.Id, life, randomDuration, speed, repeatsLeft, unpredictable),
                 // 0x141b38c00: a spark ends 150 cells from where it started.
                 LegLeash = SkillsFor(player).EffectId(gem.Effect) == TwisterEffect ? 0 : 150
             }
@@ -262,6 +347,8 @@ public static partial class Game
         profile = profile with { Range = range, ReturnOvershoot = range, ContactCells = SkillsFor(player).ProjectileContactCells(profile.Id) };
         if (profile.ReturnChancePercent is > 0 and < 100)
             profile = profile with { ReturnRolls = ReturnRolls(sequence, profile.Count, player.Id, repeatsLeft) };
+        // Keep a release recipe's explicit spiral angles after applying client range, contact and return rules.
+        if (profile.NativeVolley?.Angles is not null) return profile;
         if (get(Stat.SupportParallelProjectileNumberOfPointsPerSide) == 0 && get(Stat.RandomProjectileDirection) != 0)
             return profile with { NativeVolley = new() { Angles = RandomVolleyAngles(sequence, profile.Count, emitter ?? player.Id, aim, repeatsLeft) } };
         // 0x141bb5e80 (the Disgorge nova and the action's own flags are not tracked here).
@@ -303,7 +390,18 @@ public static partial class Game
         (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, (int X, int Y) aim,
         SkillCriticalRoll criticalRoll, ushort sequence = 0, uint repeatsLeft = 0, double releaseDelay = 0,
         TotemState.Totem? totem = null, bool cryExerted = false, int repeat = 0, SacrificeUse? sacrifice = null, double reoccurrenceMore = 1,
-        (int X, int Y)? from = null)
+        (int X, int Y)? from = null, SupportedGem? capturedSkill = null, int otherWarcryExertions = 0,
+        int? rallyingDamage = null, bool fromMirage = false) =>
+        CaptureGemProjectile(player, session, skillId, gem, aim, criticalRoll, weaponHand: null, sequence, repeatsLeft,
+            releaseDelay, totem, cryExerted, repeat, sacrifice, reoccurrenceMore, from, capturedSkill, otherWarcryExertions: otherWarcryExertions,
+            rallyingDamage: rallyingDamage, fromMirage: fromMirage);
+
+    internal static ProjectileUse CaptureGemProjectile(Player player, ProjectileSession session, ushort skillId,
+        (ushort Id, int Effect, string Name, int Level, int Quality, uint Gem) gem, (int X, int Y) aim,
+        SkillCriticalRoll criticalRoll, AttackHand? weaponHand, ushort sequence = 0, uint repeatsLeft = 0, double releaseDelay = 0,
+        TotemState.Totem? totem = null, bool cryExerted = false, int repeat = 0, SacrificeUse? sacrifice = null, double reoccurrenceMore = 1,
+        (int X, int Y)? from = null, SupportedGem? capturedSkill = null, double hitAndAilmentMore = 1, int otherWarcryExertions = 0,
+        int? rallyingDamage = null, bool fromMirage = false, bool seismicExerted = false, bool ancestralExerted = false)
     {
         // from: where a placed trap or mine stands, when it and not the player releases the skill.
         // A delayed release reads current combat state once, independently of the input handler's earlier snapshot.
@@ -311,20 +409,57 @@ public static partial class Game
         // equipment/requirements/support walk for every field while holding the combat lock.
         using var snapshot = new PlayerStatScope(player, fresh: true);
         var playerStats = CharacterPlayerStats(player);
-        var admittedGem = SupportedSkill(player, skillId);
+        var admittedGem = capturedSkill ?? SupportedSkill(player, skillId);
+        bool projectileDamage = admittedGem.WildStrikeFollowupElement is null or DamageType.Cold;
         var own = admittedGem.Stats;
         var merged = MergeSkillStats(playerStats, own);
-        int Get(uint k) => merged.GetValueOrDefault(k);
+        if (SkillsFor(player).EffectId(gem.Effect) is "Fireball" or "FireballAltX" or "FireballAltY")
+        {
+            bool cannotIgnite = merged.GetValueOrDefault(Stat.FireballCannotIgnite) != 0;
+            int scorch = merged.GetValueOrDefault(Stat.FireballChanceToScorchPct);
+            if (cannotIgnite || scorch != 0)
+            {
+                var projected = new Dictionary<uint, int>(own);
+                if (cannotIgnite) projected[Stat.NeverIgnite] = 1;
+                if (scorch != 0) projected[Stat.ChanceToScorchPct] =
+                    ActorScale.Add(Stat.ChanceToScorchPct, projected.GetValueOrDefault(Stat.ChanceToScorchPct), scorch);
+                own = projected;
+                admittedGem = admittedGem with { Stats = own };
+                merged = MergeSkillStats(playerStats, own);
+            }
+        }
+        int extraBeidatProjectiles = CastingBeidatSpell(player, skillId)?.Projectiles ?? 0;
+        int Get(uint k) => k == Stat.NumberOfAdditionalProjectiles
+            ? merged.GetValueOrDefault(k) + extraBeidatProjectiles : merged.GetValueOrDefault(k);
         int Player(uint k) => playerStats.GetValueOrDefault(k);
         int Own(uint k) => own.GetValueOrDefault(k);
         var definition = ResolveProjectileDefinition(gem.Effect) ?? (ArrowRain(SkillsFor(player).EffectId(gem.Effect)) ? GroundArrow : null)
             ?? throw new InvalidOperationException("No projectile definition at release.");
         string metadata = definition.Metadata;
-        int baseSpeed = SkillsFor(player).Projectile(metadata)?.Speed ?? 1000;
-        double speed = ProjectileSpeed.CellsPerSecond(baseSpeed, Player, Own, Environment.GetEnvironmentVariable("Game_PROJECTILE_SPEED"));
+        string? effect = SkillsFor(player).EffectId(gem.Effect);
+        int baseSpeed = IsSpectralHelix(effect) ? 1500 : SkillsFor(player).Projectile(metadata)?.Speed ?? 1000;
+        string? speedOverride = Environment.GetEnvironmentVariable("Game_PROJECTILE_SPEED");
+        double speed = SkillsFor(player).EffectId(gem.Effect) == "BallLightningAltX"
+            ? ProjectileSpeed.SpeedOverride(speedOverride)
+                ?? baseSpeed * .092f * (1 + .01f * OrbitingBallLightningSpeedPercent(Player, Own))
+            : ProjectileSpeed.CellsPerSecond(baseSpeed, Player, Own, speedOverride);
+        bool forbiddenRite = GatewayProjectileSkillProfiles.IsForbiddenRite(SkillsFor(player).EffectId(gem.Effect));
+        if (forbiddenRite) speed *= Math.Max(.01, 1 + Get(Stat.ForbiddenRiteProjectileSpeedPlusPct) / 100d);
         if (!double.IsFinite(speed) || speed <= 0)
             throw new InvalidOperationException("Projectile release requires a finite positive speed.");
         var profile = definition.Parameters.Resolve(Get, speed, ArrowsFor(player, gem.Effect));
+        var concoction = IsConcoction(effect) && totem is null && from is null && !fromMirage
+            ? SpendConcoctionFlasks(session, effect!, profile.Count, Get)
+            : default;
+        if (concoction.Modifiers is { } paidStats)
+        {
+            var withFlasks = new Dictionary<uint, int>(own);
+            foreach (var (key, value) in paidStats)
+                withFlasks[key] = ActorScale.Add(key, withFlasks.GetValueOrDefault(key), value);
+            own = withFlasks;
+            admittedGem = admittedGem with { Stats = own };
+            merged = MergeSkillStats(playerStats, own);
+        }
         var at = totem?.At ?? from ?? player.Walk.Position(session.Runtime.Now / (double)ProjectileRuntime.QuantaPerSecond);
         var origin = ProjectileSession.Vector(at);
         if (definition.RequiresTerrain && ProjectileGrid.Blocks(player.Layout.Id, player.Seed, at.X, at.Y) is null)
@@ -341,11 +476,14 @@ public static partial class Game
         var release = spell ? null : Animations.AttackContactPoint(
             Environment.GetEnvironmentVariable("Game_PLAYER_AO") ?? SkillsFor(player).ClassFor(player.Character.ClassRow).AnimatedObject,
             AnimationWeaponProfileFor(player));
-        // LightningSlash is released three cells ahead at ground level, not at the sword's contact point
-        // (3.29.3c Positioned trace: player (391,352), every bolt starts (388,352) aimed left).
-        double ahead = IsLightningStrike(gem.Effect) ? 3 : release is { ForwardCells: > 0 } point ? point.ForwardCells : 1.5;
+        // 3.29.3c client spawn forward offset (0x141ba7840 -> 0x141ba7c30): 30 world units (~2.76 cells) unless
+        // projectile_uses_contact_position, projectile_firing_forward_distance_override, or projectiles_not_offset applies.
+        double ahead = NativeProjectileForwardCells(Get, release, IsLightningStrike(gem.Effect));
+        bool radialRelease = extraBeidatProjectiles > 0
+            || SkillsFor(player).EffectId(gem.Effect) == "SoulrendAltY" && profile.SequentialDelay > 0;
         // A point closer than the muzzle must not end up behind the released projectile.
-        if (totem is null && from is null) origin += direction * Math.Min(ahead, (target - origin).Length / 2);
+        if (!radialRelease && totem is null && from is null && ahead > 0)
+            origin += direction * Math.Min(ahead, (target - origin).Length / 2);
         profile = profile with { Range = PrimaryRange(SkillsFor(player).EffectId(gem.Effect), profile.Range,
             (target - origin).Length, toTarget: rain) };
         // Arrow Nova's payload takes the rig's fixed timeline, not the arrow's speed: the official landing rig came
@@ -356,80 +494,126 @@ public static partial class Game
             double untilLanding = Math.Max(0.05, 0.415 - releaseDelay);
             profile = profile with { Speed = Math.Max(0.001, flight / untilLanding) };
         }
-        if (!spell) profile = NativeVolley(profile, Get);
+        if (!spell) profile = NativeVolley(profile, Get, sequence, target - origin, totem?.Id ?? player.Id, repeatsLeft);
+        else if (extraBeidatProjectiles > 0 && profile.NativeVolley?.Angles is null)
+            profile = profile with { NativeVolley = new() { Nova = true } };
         int variation = SkillArtVariation(player, gem.Gem);
         profile = profile with { Id = Art.Projectile(profile.Id, variation) };
         // A dual-wielded attack's projectiles carry the hand this use swings (AttackHands): its weapon's damage, local
         // modifiers, accuracy and critical chance. A totem's own use swings the main hand.
-        var swingHand = spell || totem is not null ? AttackHand.Main : AttackHandFor(player, skillId, sequence);
-        var handWeapon = OffHandSwing(player, swingHand);
-        int? handCritical = SwingWeaponCritical(player, swingHand);
-        var local = spell ? null : HandLocalSources(player, swingHand);
+        var swingHand = spell || totem is not null ? AttackHand.Main : weaponHand ?? AttackHandFor(player, skillId, sequence);
+        var shield = spell ? null : ShieldWeapon(player, skillId);
+        var handWeapon = shield ?? OffHandSwing(player, swingHand);
+        int? handCritical = SwingWeaponCritical(player, swingHand, playerStats);
+        var attackSource = spell || shield is not null ? null : HandWeapon(player, swingHand);
+        var local = attackSource?.LocalSources;
         int addedChaos = sacrifice?.AddedChaos() ?? 0;
         string hand = spell ? "spell" : "main_hand";
-        var hitInputs = SupportedHitInputsFor(player, skillId, area: false, weapon: handWeapon, capturedGem: admittedGem, projectile: true, addedChaos: addedChaos, totem: totem is not null);
-        var areaHitInputs = SupportedHitInputsFor(player, skillId, area: true, weapon: handWeapon, capturedGem: admittedGem, projectile: true, addedChaos: addedChaos, totem: totem is not null);
-        var ailmentRows = hitInputs is null ? [] : SupportedAilmentRowsFrom(hitInputs, hand);
+        var hitInputs = SupportedHitInputsFor(player, skillId, area: false, weapon: handWeapon, capturedGem: admittedGem,
+            projectile: true, addedChaos: addedChaos, totem: totem is not null, projectileTotemLife: totem?.MaxLife);
+        var areaHitInputs = SupportedHitInputsFor(player, skillId, area: true, weapon: handWeapon, capturedGem: admittedGem,
+            projectile: true, addedChaos: addedChaos, totem: totem is not null, projectileTotemLife: totem?.MaxLife);
+        if (!spell) otherWarcryExertions += MeleeWarcryTriggersFor(criticalRoll)?.Count ?? 0;
+        int totalExertWarcries = spell ? 0 : (cryExerted ? 1 : 0) + otherWarcryExertions + (rallyingDamage.HasValue ? 1 : 0);
+        long exertedIncreased = spell ? 0 : ExertedAttackIncreasedDamage(playerStats, own, totalExertWarcries, seismicExerted, ancestralExerted);
+        int exertedBaseCrit = spell ? 0 : ExertedAttackBonusCritPermyriad(totalExertWarcries, playerStats, own);
+        long exertedAccuracyIncrease = spell ? 0 : ExertedAttackAccuracyIncrease(totalExertWarcries, playerStats, own);
+        var ailmentRows = hitInputs is null ? [] : SupportedAilmentRowsFrom(hitInputs, hand, exertedIncreased);
         long additionalBlindedIncreased = (long)Player(PlayerHitDamage.VsBlindedDamageStat)
             + Own(PlayerHitDamage.VsBlindedDamageStat);
         var blindedRows = hitInputs is null || additionalBlindedIncreased == 0 ? null
-            : SupportedAilmentRowsFrom(hitInputs, hand, additionalBlindedIncreased);
+            : SupportedAilmentRowsFrom(hitInputs, hand, exertedIncreased + additionalBlindedIncreased);
+        var ignite = hitInputs is null ? IgniteSettingsFrom(ailmentRows, hand, Get)
+            : IgniteWithTargetCondition(ailmentRows, hitInputs, hand, Get, exertedIncreased);
         bool weaponAttack = !spell && local is not null && SkillsFor(player).IsAttack(gem.Effect) && !SkillsFor(player).RequiresShield(gem.Effect);
+        AttackAccuracyProfile? accuracy = spell ? null : SupportedAccuracy(player, skillId, swingHand, exertedAccuracyIncrease);
+        int rating = shield is not null && accuracy is { } shieldAccuracy ? shieldAccuracy.Rating
+            : handWeapon is null
+                ? (exertedAccuracyIncrease == 0 ? PlayerAccuracy(player, playerStats)
+                    : WeaponAccuracyFor(player, null, playerStats, own, gem.Effect, exertedAccuracyIncrease))
+                : HandAccuracy(player, swingHand, playerStats, exertedAccuracyIncrease);
+        int damagePerChain = Get(Stat.ProjectileDamagePlusPctPerChain);
+        int damagePerPierce = Get(Stat.ProjectileDamagePlusPctPerPiercedEnemy);
+        bool trackTrajectoryDamage = damagePerChain != 0 || damagePerPierce != 0;
+        int criticalMultiplier = SupportedCriticalMultiplier(player, skillId, handWeapon);
+        if (concoction.CriticalMultiplier != 0)
+            criticalMultiplier = ActorScale.Add(Stat.BaseCriticalStrikeMultiplier, criticalMultiplier, concoction.CriticalMultiplier);
         var shot = new ProjectileOffense(
-            hitInputs is null ? DamagePacket.Empty : SupportedHitFrom(hitInputs, suppress: false),
-            spell, handWeapon is null ? PlayerAccuracy(player, playerStats) : HandAccuracy(player, swingHand, playerStats),
-            SupportedCriticalChanceFor(player, skillId, release: true, weaponCritical: handCritical),
-            SupportedCriticalMultiplier(player, skillId), gem.Name)
+            hitInputs is null ? DamagePacket.Empty : SupportedHitFrom(hitInputs, suppress: false, additionalIncreased: exertedIncreased),
+            spell, rating,
+            SupportedCriticalChanceFor(player, skillId, release: true, extraIncrease: 0, weaponCritical: handCritical, extraBaseCrit: exertedBaseCrit),
+            criticalMultiplier, gem.Name)
         {
             WeaponAttack = weaponAttack,
+            DirectAttackContact = hitInputs is { Attack: true, Secondary: false },
+            OffHandWeapon = swingHand == AttackHand.Off,
+            TargetCritical = TargetCriticalBonuses.From(playerStats, own),
+            SkeletonWeaponContactSource = weaponAttack && totem is null ? SkeletonWeaponContactSource(player, swingHand, local) : null,
+            ProjectileAttack = projectileDamage && !spell && SkillsFor(player).IsProjectile(gem.Effect),
+            SkillResistanceInversionChance = Own(Stat.TreatEnemyResistancesAsNegatedOnElementalDamageHitPctChance),
             TinctureKill = weaponAttack && totem is null ? TinctureKillBonusFor(player, playerStats, swingHand) : null,
             NoExtraCriticalDamage = CriticalHitsDealNoExtraDamage(playerStats, own),
             // Child stages and release specialization can introduce areas after this root is resolved.
-            AreaHit = areaHitInputs is null ? DamagePacket.Empty : SupportedHitFrom(areaHitInputs, suppress: false),
-            VsBlindedCriticalChance = SupportedCriticalChanceVsBlinded(player, skillId, release: true, handCritical),
-            VsGroundCriticalChance = SupportedCriticalChanceVsGround(player, skillId, release: true, handCritical),
+            AreaHit = areaHitInputs is null ? DamagePacket.Empty : SupportedHitFrom(areaHitInputs, suppress: false, additionalIncreased: exertedIncreased),
+            VsBlindedCriticalChance = SupportedCriticalChanceVsBlinded(player, skillId, release: true, handCritical, extraIncrease: 0, extraBaseCrit: exertedBaseCrit),
+            VsGroundCriticalChance = SupportedCriticalChanceVsGround(player, skillId, release: true, handCritical, extraIncrease: 0, extraBaseCrit: exertedBaseCrit),
             ActualCaster = totem is null ? null : TotemCasterStats(playerStats), FromTotem = totem is not null,
             Effect = gem.Effect, Level = gem.Level, Quality = gem.Quality, SourceSkill = skillId, Gem = gem.Gem,
             HitPacket = true, ActionSequence = sequence,
             SkillStats = new Dictionary<uint, int>(own), FirstHit = new(),
+            FreezingPulseFalloff = SkillsFor(player).EffectId(gem.Effect) is
+                "FreezingPulse" or "FreezingPulseAltX" or "FreezingPulseAltY" or "FreezingPulseRoyale",
+            RemainingChainDamagePercent = Own(Stat.CobraLashHitAndAilmentDamagePlusPctFinalForEachRemainingChain),
+            CompletedChainDamagePercent = Own(Stat.SkillDamagePlusPctFinalPerChainFromSkillSpecificStat),
+            DamageIncreasePerChain = damagePerChain,
+            DamageIncreasePerPierce = damagePerPierce,
+            DamageMoreAfterPierce = Get(Stat.ProjectileDamagePlusPctFinalIfPiercedEnemy),
+            DamageMorePerElementalAilment = effect == SpectrumHitEffect
+                ? Get(Stat.ElementalHitDamagePlusPctFinalPerEnemyElementalAilment) : 0,
             Spider = hitInputs is null ? null : CaptureSpiderDamage(player, hitInputs,
-                AddedEffectiveness(player, gem.Effect, gem.Level), local: local,
-                bow: !spell && WeaponProfileFor(player, activeSet: true).Bow),
+                AddedEffectiveness(player, gem.Effect, gem.Level), context: false, local: local,
+                bow: !spell && WeaponProfileFor(player, activeSet: true).Bow, offHand: swingHand == AttackHand.Off,
+                required: trackTrajectoryDamage, extraIncreased: exertedIncreased),
             SpiderArea = areaHitInputs is null ? null : CaptureSpiderDamage(player, areaHitInputs,
-                AddedEffectiveness(player, gem.Effect, gem.Level), local: local,
-                bow: !spell && WeaponProfileFor(player, activeSet: true).Bow),
+                AddedEffectiveness(player, gem.Effect, gem.Level), context: false, local: local,
+                bow: !spell && WeaponProfileFor(player, activeSet: true).Bow, offHand: swingHand == AttackHand.Off,
+                required: trackTrajectoryDamage, extraIncreased: exertedIncreased),
             MirageSource = totem is null && Own(Stat.SupportMirageArcherBaseDuration) > 0 ? SupportedSkill(player, skillId) : null,
             CriticalTrigger = spell ? null : CaptureCriticalTriggerSource(player, skillId),
             Penetration = Penetration.Of(playerStats, Stats, !spell, own, local), ResistanceMods = HitResistMods(playerStats, own),
-            ImpaleSettings = ImpaleStats.From(playerStats, Stats, !spell, own, local),
-            CriticalImpaleSettings = ImpaleStats.From(playerStats, Stats, !spell, own, local, critical: true),
-            AccuracyProfile = spell ? null : SupportedAccuracy(player, skillId, swingHand), CriticalRoll = criticalRoll,
-            Leech = HitLeechSources(playerStats, !spell, own, local), WeaponLocal = local,
+            ImpaleSettings = WeaponImpaleSettings(playerStats, Stats, !spell, own, attackSource),
+            CriticalImpaleSettings = WeaponImpaleSettings(playerStats, Stats, !spell, own, attackSource, critical: true),
+            AccuracyProfile = accuracy, CriticalRoll = criticalRoll,
+            Leech = HitLeechSources(playerStats, !spell, own, weaponAttack ? local : null), WeaponLocal = local,
             ImpaleChance = spell ? 0 : Get(Stat.ImpaleOnHitPctChance),
             // Burning Arrow's 25% base_chance_to_ignite_% and the caster's sources, with the panel's ignite range.
-            Ignite = WithOverheat(player, skillId, NotedIgnite(player, skillId, WithIgniteSpread(MonsterIgnites.Settings.From(ailmentRows, hand, Get), playerStats, own, spell, hand))),
-            Poison = WithOverheat(player, skillId, MonsterPoisons.Settings.From(ailmentRows, hand, Get, local,
-                projectileAttack: !spell)),
+            Ignite = WithOverheat(player, skillId, NotedIgnite(player, skillId,
+                WithIgniteSpread(ignite, playerStats, own, spell, hand))),
+            Poison = WithOverheat(player, skillId, PoisonSettingsFrom(ailmentRows, hand, Get, local,
+                projectileAttack: projectileDamage && !spell)),
             EssenceDrain = EssenceDrainCast(player, skillId, gem.Effect),
+            GhorrDotMore = GhorrDotMore(player, skillId),
             Bleed = spell ? MonsterIgnites.Settings.None : WithOverheat(player, skillId, BleedSettings(ailmentRows, "main_hand", Get, local, melee: false,
-                bow: WeaponProfileFor(player, activeSet: true).Bow, projectileAttack: true)),
+                bow: WeaponProfileFor(player, activeSet: true).Bow, projectileAttack: projectileDamage)),
             VsBlinded = blindedRows is null || hitInputs is null ? null : new(
-                SupportedHitFrom(hitInputs, suppress: false, additionalIncreased: additionalBlindedIncreased),
+                SupportedHitFrom(hitInputs, suppress: false, additionalIncreased: exertedIncreased + additionalBlindedIncreased),
                 areaHitInputs is null ? DamagePacket.Empty
                     : SupportedHitFrom(areaHitInputs, suppress: false,
-                        additionalIncreased: additionalBlindedIncreased),
+                        additionalIncreased: exertedIncreased + additionalBlindedIncreased),
                 WithOverheat(player, skillId, NotedIgnite(player, skillId, WithIgniteSpread(
-                    MonsterIgnites.Settings.From(blindedRows, hand, Get), playerStats, own, spell, hand))),
+                    IgniteWithTargetCondition(blindedRows, hitInputs, hand, Get, exertedIncreased + additionalBlindedIncreased),
+                    playerStats, own, spell, hand))),
                 spell ? MonsterIgnites.Settings.None
                     : WithOverheat(player, skillId, BleedSettings(blindedRows, "main_hand", Get, local, melee: false,
-                        bow: WeaponProfileFor(player, activeSet: true).Bow, projectileAttack: true)),
-                WithOverheat(player, skillId, MonsterPoisons.Settings.From(blindedRows, hand, Get, local, projectileAttack: !spell))),
+                        bow: WeaponProfileFor(player, activeSet: true).Bow, projectileAttack: projectileDamage)),
+                WithOverheat(player, skillId, PoisonSettingsFrom(blindedRows, hand, Get, local, projectileAttack: projectileDamage && !spell))),
             MaimChance = spell ? 0 : Get(Stat.ProjectileAttacksChanceToMaimOnHitPctIfYouHaveBeastMinion),
             AccuracyMoreUnique = player.Pools.AccuracyMoreVsUniquePct,
             LocalStunThresholdReduction = spell ? 0 : local?.GetValueOrDefault(Stat.LocalStunThresholdReductionPlusPct) ?? 0,
+            WeaponClass = spell ? null : (handWeapon ?? WeaponFor(player)).ItemClass ?? "",
             AccuracyMoreClose = player.Pools.AccuracyMoreInCloseRangePct,
-            AlwaysHits = Get(Stat.GlobalAlwaysHit) != 0, FarShot = Get(Stat.PlayerFarShot) != 0,
-            PointBlank = Get(Stat.KeystonePointBlank) != 0,
+            AlwaysHits = Get(Stat.GlobalAlwaysHit) != 0, FarShot = projectileDamage && Get(Stat.PlayerFarShot) != 0,
+            PointBlank = projectileDamage && Get(Stat.KeystonePointBlank) != 0,
             ReturnMultiplier = ProjectileReturn.DamageMore(Get), Blind = BlindHitInput.Capture(playerStats, own),
             // A spell's action spawns its projectiles itself, every one of a volley, from where it stands (Frida
             // 2026-10-29, 0x141ec47e0 from the action at 0x141e9a160): a server object for them was a second fireball.
@@ -441,7 +625,9 @@ public static partial class Game
             // Kinetic Bolt's ZigZagProjectile action creates and zig-zags both primary and secondary projectiles locally.
             // Molten Strike's action spawns its local chunks on melee hit (0x141a6a4b0 -> 0x141ba7c30); server objects would duplicate them.
             ClientPredicted = totem is not null || spell
-                || SkillsFor(player).EffectId(gem.Effect) is "SpectralThrow" or "KineticBolt" or "KineticBoltAltX" or "KineticBoltAltY" || IsLightningStrike(gem.Effect)
+                || GatewayProjectileSkillProfiles.IsSelfThrownSpectralWeapon(SkillsFor(player).EffectId(gem.Effect))
+                || effect == SpectralHelixEffect && from is null
+                || SkillsFor(player).EffectId(gem.Effect) is "KineticBolt" or "KineticBoltAltX" or "KineticBoltAltY" || IsLightningStrike(gem.Effect)
                 || GatewayProjectileSkillProfiles.IsMoltenStrike(SkillsFor(player).EffectId(gem.Effect)),
             // Only where the skill's recipe draws nothing of its own (PresentationFor prefers this one).
             Presentation = rain
@@ -471,7 +657,28 @@ public static partial class Game
                 }
                 : release is { } launch && definition.Presentation is null ? new() { LaunchHeight = launch.HeightSteps } : null,
         };
-        shot = shot with { IntimidatingCryExerted = cryExerted };
+        shot = shot with { IntimidatingCryExerted = cryExerted, OtherWarcryExertions = otherWarcryExertions, RallyingDamage = rallyingDamage };
+        if (SkillsFor(player).EffectId(gem.Effect) == "LightningArrowAltX")
+            shot = shot with { Electrocution = CaptureElectrocution(Get) };
+        if (GatewayProjectileSkillProfiles.IsIceShot(SkillsFor(player).EffectId(gem.Effect)) && areaHitInputs is { } coneInputs)
+        {
+            shot = shot with
+            {
+                ConeAilments = CaptureConeAilments(0),
+                BlindedConeAilments = additionalBlindedIncreased == 0 ? null : CaptureConeAilments(additionalBlindedIncreased),
+            };
+
+            ProjectileOffense.AreaAilments CaptureConeAilments(long additionalIncreased)
+            {
+                var rows = SupportedAilmentRowsFrom(coneInputs, hand, additionalIncreased);
+                var ignite = IgniteWithTargetCondition(rows, coneInputs, hand, Get, additionalIncreased);
+                return new(WithOverheat(player, skillId, WithIgniteSpread(ignite, playerStats, own, spell, hand)),
+                    WithOverheat(player, skillId, BleedSettings(rows, hand, Get, local, melee: false, bow: true, projectileAttack: true)),
+                    WithOverheat(player, skillId, PoisonSettingsFrom(rows, hand, Get, local, projectileAttack: true)));
+            }
+        }
+        if (forbiddenRite)
+            shot = shot with { ForbiddenRite = CaptureForbiddenRite(player, admittedGem, totem, Get, variation) };
         if (spell && repeat > 0)
         {
             double more = GreaterEchoHitMore(repeat, Own);
@@ -480,21 +687,47 @@ public static partial class Game
         if (totem is not null || reoccurrenceMore != 1)
         {
             double totemMore = reoccurrenceMore * (totem is null ? 1 : Math.Max(0, 1 + Get(Stat.SupportTotemDamagePlusPctFinal) / 100d));
-            shot = shot with { Hit = shot.Hit.Scale(totemMore), AreaHit = shot.AreaHit?.Scale(totemMore),
-                HitProfileMore = shot.HitProfileMore * totemMore, AilmentProfileMore = totemMore,
-                Ignite = shot.Ignite with { Min = shot.Ignite.Min * totemMore, Max = shot.Ignite.Max * totemMore,
-                    CriticalMin = shot.Ignite.CriticalMin * totemMore, CriticalMax = shot.Ignite.CriticalMax * totemMore },
-                Poison = shot.Poison with { Min = shot.Poison.Min * totemMore, Max = shot.Poison.Max * totemMore,
-                    CriticalMin = shot.Poison.CriticalMin * totemMore, CriticalMax = shot.Poison.CriticalMax * totemMore },
-                Bleed = shot.Bleed with { Min = shot.Bleed.Min * totemMore, Max = shot.Bleed.Max * totemMore,
-                    CriticalMin = shot.Bleed.CriticalMin * totemMore, CriticalMax = shot.Bleed.CriticalMax * totemMore },
+            shot = shot.ScaleDamage(totemMore) with
+            {
                 // Pending casts still require their source; released projectiles live with the area session.
-                Leech = totem is null ? shot.Leech : new(DamagePacket.Empty, DamagePacket.Empty, DamagePacket.Empty) };
+                Leech = totem is null ? shot.Leech : new(DamagePacket.Empty, DamagePacket.Empty, DamagePacket.Empty),
+            };
+        }
+        if (hitAndAilmentMore != 1) shot = shot.ScaleHitAndAilmentDamage(hitAndAilmentMore);
+        if (VenomGyreEffect(effect) && totem is null && from is null && !fromMirage
+            && sacrifice is { Triggered: false })
+        {
+            shot = shot with { VenomGyre = CaptureVenomGyre(player, gem.Effect, Get, Player, Own, variation, sacrifice) };
         }
         uint emitter = totem?.Id ?? player.Id;
-        var use = new ProjectileUse(profile, new(emitter, player.ProjectileEpoch), new(emitter, player.ProjectileEpoch), 1, origin, target)
-            { Payload = shot, ReturnAnchor = new(emitter, player.ProjectileEpoch), Sequence = sequence, RepeatsLeft = repeatsLeft };
-        var context = new ProjectileReleaseContext(player, session, skillId, gem, variation, Get, Player, Own);
-        return definition.SpecializeRelease?.Invoke(context, use) ?? use;
+        int epoch = player.ProjectileEpoch;
+        var use = new ProjectileUse(profile, new(emitter, epoch), new(emitter, epoch), 1, origin, target)
+        {
+            Payload = shot, ReturnAnchor = new(emitter, epoch), Sequence = sequence, RepeatsLeft = repeatsLeft,
+            RadialLaunchOffset = radialRelease && totem is null && from is null ? ahead : 0,
+        };
+        bool ownerAttack = !spell && totem is null && from is null && !fromMirage
+            && !SkillsFor(player).HasType(gem.Effect, "InbuiltTrigger");
+        int steelCost = ownerAttack ? Own(Stat.SteelAmmoConsumedPerUse)
+            : totem is not null ? Own(Stat.SteelAmmoConsumedPerUseByTotem) : 0;
+        int extraSteelCost = ownerAttack && Get(Stat.ProjectilesAreNotFired) == 0
+            ? Player(Stat.SteelAmmoConsumedPerUseWithAttacksThatFireProjectiles) : 0;
+        int spent = SpendProjectileSteelShards(player, session, steelCost, extraSteelCost,
+            Player(Stat.SkillsFireXAdditionalProjectilesFor4SecondsAfterConsuming8SteelAmmo));
+        var context = new ProjectileReleaseContext(player, session, skillId, gem, variation, Get, Player, Own)
+        {
+            NotHandCast = totem is not null || from is not null || sacrifice?.Triggered == true,
+            SteelShardsSpent = spent,
+        };
+        if (IsExplosiveArrow(SkillsFor(player).EffectId(gem.Effect)) && areaHitInputs is not null)
+            use = use with { Payload = shot with { ExplosiveFuse = CaptureExplosiveFuse(context, areaHitInputs, playerStats, own, hand, local) } };
+        use = definition.SpecializeRelease?.Invoke(context, use) ?? use;
+        if (use.Profile.SequentialDelay > 0 && use.CanEmit is null)
+            use = use with
+            {
+                CanEmit = () => session.Active && player.PlayerLife > 0 && player.ProjectileActive(epoch)
+                    && (totem is null || SpellTotemCurrent(player, totem)),
+            };
+        return use;
     }
 }

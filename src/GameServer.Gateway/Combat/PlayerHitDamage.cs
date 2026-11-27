@@ -16,7 +16,7 @@ public static class PlayerHitDamage
         bool spell, bool melee = false, bool area = false, bool projectile = false,
         IEnumerable<(uint Id, int Value)>? supportModifiers = null, IReadOnlySet<int>? skillTypes = null,
         bool secondary = false, bool wieldingWand = false, bool retaliation = false, long additionalIncreased = 0, bool wieldingBow = false,
-        HitIncreases additional = default)
+        HitIncreases additional = default, bool trackPhysicalOrigin = false)
     {
         // Secondary damage (Bear Trap, Herald of Ice's shatter) is neither an attack nor a spell: only the generic,
         // area and projectile buckets apply, and no attack/spell support classification.
@@ -50,28 +50,37 @@ public static class PlayerHitDamage
             + (fullShield ? get(Stat.DamagePlusPctOnFullEnergyShield) : 0);
         bool bowAttack = wieldingBow && !spell && !secondary;
         if (bowAttack) common += (double)get(Stat.BowDamagePlusPct) + get(Stat.BowHitAndAilmentDamagePlusPct);
+        bool attack = !spell && !secondary;
         // Precise Technique: "40% more Attack Damage if Accuracy Rating is higher than Maximum Life".
-        bool preciseTechnique = !spell && !secondary && get(Stat.KeystonePreciseTechnique) != 0
+        bool preciseTechnique = attack && get(Stat.KeystonePreciseTechnique) != 0
             && get(Stat.AccuracyRating) > get(Stat.MaximumLife);
         var typed = DamageTypes.ConversionOrder.Select(type =>
             (History: DamageTypes.HistoryOf(type), Increased: get(TypedIncreased[(int)type]))).ToArray();
         int elemental = get(Stat.ElementalDamagePlusPct)
-            + (!spell && !secondary ? get(Stat.ElementalDamageWithAttackSkillsPlusPct) : 0), meleePhysical = melee ? get(Stat.MeleePhysicalDamagePlusPct) : 0;
+            + (attack ? get(Stat.ElementalDamageWithAttackSkillsPlusPct) : 0), meleePhysical = melee ? get(Stat.MeleePhysicalDamagePlusPct) : 0;
+        int physicalAttack = attack ? get(Stat.PhysicalAttackDamagePlusPct) : 0;
+        int attackFire = attack ? get(Stat.FireDamageWithAttackSkillsPlusPct) : 0,
+            attackCold = attack ? get(Stat.ColdDamageWithAttackSkillsPlusPct) : 0,
+            attackLightning = attack ? get(Stat.LightningDamageWithAttackSkillsPlusPct) : 0;
         double charges = ChargeEffects.DamageMore(get, spell);
+        double elementalMore = DamageStats.ElementalMore(get(Stat.CombinedElementalDamagePlusPctFinal));
         var result = DamagePacket.Empty;
         foreach (var path in conversion.Trace(raw))
         {
             // Prohibitions constrain the final damage dealt, not a type the portion used to have.
-            if (DamageStats.Prohibited(path.Type, get, attack: !spell && !secondary)
+            if (DamageStats.Prohibited(path.Type, get, attack: attack)
                 || GemSupportDamage.Prohibited(path.Type, modifiers)) continue;
             double increased = common;
             if (bowAttack && (path.History & DamageTypeHistory.Physical) != 0) increased += get(Stat.PhysicalBowDamagePlusPct);
             if (bowAttack && (path.History & DamageTypeHistory.Elemental) != 0) increased += get(Stat.BowElementalDamagePlusPct);
             foreach (var source in typed)
                 if ((path.History & source.History) != 0) increased += source.Increased;
+            if (attackFire != 0 && (path.History & DamageTypeHistory.Fire) != 0) increased += attackFire;
+            if (attackCold != 0 && (path.History & DamageTypeHistory.Cold) != 0) increased += attackCold;
+            if (attackLightning != 0 && (path.History & DamageTypeHistory.Lightning) != 0) increased += attackLightning;
             if ((path.History & DamageTypeHistory.Elemental) != 0) increased += elemental + additional.Elemental;
             if ((path.History & DamageTypeHistory.Physical) != 0)
-                increased += meleePhysical + additional.Physical
+                increased += (double)physicalAttack + meleePhysical + additional.Physical
                     + (!melee && !spell && projectile && get(Stat.KeystoneStrongBowman) != 0 ? strength : 0)
                     + (lifeLeech ? (double)get(Stat.PhysicalDamagePlusPctWhileLifeLeeching) : 0);
             if (additional.Typed is { } extra)
@@ -86,7 +95,12 @@ public static class PlayerHitDamage
             var support = GemSupportDamage.Multipliers(path.History, modifiers, supportTypes, fullShield, shieldLeech);
             range = range.Scale(support.GeneralOrPhysical).Scale(support.ElementalOrChaos);
             if ((path.History & DamageTypeHistory.Physical) != 0)
+            {
                 range = range.Scale(Math.Max(0, 1 + get(Stat.HeraldOfPurityPhysicalDamagePlusPctFinal) / 100.0));
+                if (attack) range = range.Scale(Math.Max(0, 1 + get(Stat.CombinedAttackPhysicalDamagePlusPctFinal) / 100.0));
+                if (melee && additional.MeleePhysicalMorePct != 0)
+                    range = range.Scale(Math.Max(0, 1 + additional.MeleePhysicalMorePct / 100d));
+            }
             if (melee && area)
                 range = range.Scale(Math.Max(0, 1 + get(get(Stat.InSandStance) != 0
                     ? Stat.BloodSandStanceMeleeSkillsAreaDamagePlusPctFinalInSandStance
@@ -96,8 +110,11 @@ public static class PlayerHitDamage
             // stat is the client's own carrier, published by the live stat view; a converted portion is elemental by
             // its history, as the other elemental buckets are.
             if ((path.History & DamageTypeHistory.Elemental) != 0)
-                range = range.Scale(Math.Max(0, 1 + get(Stat.KeystoneElementalOverloadDamagePlusPctFinal) / 100.0));
-            result = result.Add(path.Type, range);
+                range = range.Scale(elementalMore * Math.Max(0, 1 + get(Stat.KeystoneElementalOverloadDamagePlusPctFinal) / 100.0));
+            if ((path.History & additional.MaximumMore.History) != 0 && additional.MaximumMore.Percent != 0)
+                range = range with { Max = Math.Max(range.Min,
+                    range.Max * Math.Max(0, 100d + additional.MaximumMore.Percent) / 100d) };
+            result = result.Add(path.Type, range, trackPhysicalOrigin && (path.History & DamageTypeHistory.Physical) != 0);
         }
         // WithCharges expands increases and additions, but leaves more multipliers separate. Spell portions retain
         // their existing aura/charge factor grouping before support scaling; attack packets receive the common
@@ -108,6 +125,8 @@ public static class PlayerHitDamage
         // per hit, so the skill's damage stats (its tooltip) carry it too; a totem's hits read its owner's stats.
         if (get(Stat.HierophantPassiveDamagePlusPctFinalPerTotem) is var perTotem and not 0)
             result = result.Scale(Math.Max(0, 1 + (double)perTotem * get(Stat.NumberOfActiveTotems) / 100));
+        if (attack && additional.AttackMorePct is int attackMore and not 0)
+            result = result.Scale(Math.Max(0, 1 + attackMore / 100d));
         return spell || charges == 1 ? result : result.Scale(charges);
     }
 
@@ -131,8 +150,12 @@ public static class PlayerHitDamage
     }
 }
 
-/// <summary>Increases the caller computed for this hit beyond the resolver's generic buckets: a physical-only one, an
-/// elemental-only one, and per damage-type ones (a history so a converted portion inherits each type it was). The tree's
-/// "with &lt;weapon type&gt;" rows arrive here.</summary>
+/// <summary>Additional modifiers supplied by the caller. Typed modifiers follow the conversion history so a portion keeps
+/// each damage type it inherited.</summary>
 public readonly record struct HitIncreases(int Physical = 0, int Elemental = 0,
-    IReadOnlyList<(DamageTypeHistory History, int Increased)>? Typed = null);
+    IReadOnlyList<(DamageTypeHistory History, int Increased)>? Typed = null)
+{
+    public int MeleePhysicalMorePct { get; init; }
+    public (DamageTypeHistory History, int Percent) MaximumMore { get; init; }
+    public int AttackMorePct { get; init; }
+}

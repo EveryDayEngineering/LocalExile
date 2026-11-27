@@ -5,7 +5,7 @@ static partial class Game
     internal const uint ExpandedInventoryStat = Stat.PrimalistAscendancyExpandedMainInventory;
 
     // The grant is the real source value, never the presentation-only recovery flag below.
-    internal static bool ExpandedInventoryGranted(Player player)
+    public static bool ExpandedInventoryGranted(Player player)
     {
         if (!(ExpandedInventoryStat is var key)) return false;
         long value = StatSourceValues(player).GetValueOrDefault(key);
@@ -42,6 +42,10 @@ static partial class Game
             SetStats(player, player.Id, [(key, mode == 0 ? 0 : 1)]);
             return null;
         });
+        await Send(player,
+            InstanceInventories.InventoryPermissions(PlayerInventories.InventoryId(PlayerInventories.ExpandedInventory),
+                notWritable: mode != 1, skipScans: false),
+            $"0x00c2 expanded backpack writable={(mode == 1 ? "on" : "off")}");
         if (mode == 2 && player.Commands is { } commands)
             await commands.Reply("Extra backpack is in recovery mode: take its items out; deposits are disabled until its enabling mod is active again.");
     }

@@ -1,11 +1,14 @@
 using GameServer.Core.Protocol.Instance;
+using GameServer.Core.World;
 using static Game;
 using static Program;
 
 /// <summary>
 /// Currency used on a box (C→S 0x74, <see cref="InstanceItems.UseItemOnObject"/>): the orbs that change an item's rarity
 /// and explicit mods change a closed, uncorrupted box's the same way; one leaves its stack only when the box changed, and
-/// the box is created again (same id) with its new rarity and mods, as when it opens.
+/// the box's rarity and mods are updated in place (ObjectMagicProperties' S→C 0x2bc reader), as when it opens. The orb may
+/// sit in a character inventory or in the open stash / currency tab — the client sends the tab's inventory id either way —
+/// and is consumed from whichever source holds it (character <c>ConsumeOne</c>, stash <c>Pay</c> + <c>SendStashPayment</c>).
 /// </summary>
 public static partial class MapStrongboxes
 {
@@ -16,18 +19,63 @@ public static partial class MapStrongboxes
 
     /// <summary>GameEvents.Packet(0x74): true when the target is one of this instance's boxes (handled, or refused with
     /// the reason logged); false for any other object.</summary>
-    public static async Task<bool> UseItemOn(Player player, byte[] message)
+    public static Task<bool> UseItemOn(Player player, byte[] message) =>
+        message.Length < InstanceItems.UseItemOnObjectLength
+            ? Task.FromResult(false)
+            : UseItemOnCore(player, InstanceItems.ReadUseItemOnObject(message), "0x0074", allowPublicStash: true);
+
+    static readonly byte[] CurrencyRows = [PlayerInventories.MainInventory, PlayerInventories.ExpandedInventory];
+
+    /// <summary>GameEvents.Packet(0x79): Shift-click / repeat currency use by type hash on a strongbox.</summary>
+    public static Task<bool> UseItemTypeOn(Player player, byte[] message)
     {
-        if (message.Length < InstanceItems.UseItemOnObjectLength) return false;
-        var use = InstanceItems.ReadUseItemOnObject(message);
+        if (message.Length < InstanceItems.UseItemTypeOnObjectLength) return Task.FromResult(false);
+        var req = InstanceItems.ReadUseItemTypeOnObject(message);
+        if (player.Instance is null || !Areas.TryGetValue(player.Instance, out var area)
+            || area.Boxes?.FirstOrDefault(b => b.Id == req.TargetObjectId) is null)
+            return Task.FromResult(false);
+        var items = ItemsOf(player);
+        foreach (byte row in CurrencyRows)
+            if (items.Items(row).FirstOrDefault(i => i.Item.TypeHash == req.TypeHash && items.RowOf(i.Id) == row) is { } stack)
+                return UseItemOnCore(player, new(PlayerInventories.InventoryId(row), stack.Id, req.TargetObjectId), "0x0079", allowPublicStash: false);
+        if (OpenStash(player) is { } stash)
+            for (int tab = 0; tab < stash.Count; tab++)
+                if (stash.IsShownTab(tab) && !stash.IsPublic(tab)
+                    && stash.Inventory(tab).Items.FirstOrDefault(i => i.Item.TypeHash == req.TypeHash) is { } stashStack)
+                    return UseItemOnCore(player, new(stash.InventoryOf(tab), stashStack.Id, req.TargetObjectId), "0x0079", allowPublicStash: false);
+        Console.WriteLine($"[map-content] {player.Connection.Remote} <= 0x0079 type 0x{req.TypeHash:x8} on strongbox 0x{req.TargetObjectId:x}: none left in inventory or stash");
+        return Task.FromResult(true);
+    }
+
+    static AccountStash? OpenStash(Player player) =>
+        player.StashOpen || (player.GuildStashOpen && !player.Character.Ssf) ? StashOf(player) : null;
+
+    static async Task<bool> UseItemOnCore(Player player, InstanceItems.UseItemOnObject use, string opcode, bool allowPublicStash)
+    {
         if (player.Instance is null || !Areas.TryGetValue(player.Instance, out var area)
             || area.Boxes?.FirstOrDefault(b => b.Id == use.TargetObjectId) is not { } target) return false;
-        string Log(string text) => $"[map-content] {player.Connection.Remote} <= 0x0074 item {use.ItemId} (inventory {use.InventoryId}) on strongbox 0x{use.TargetObjectId:x}: {text}";
+        string Log(string text) => $"[map-content] {player.Connection.Remote} <= {opcode} item {use.ItemId} (inventory {use.InventoryId}) on strongbox 0x{use.TargetObjectId:x}: {text}";
         var items = ItemsOf(player);
-        if (items.RowOf(use.ItemId) is not byte row || PlayerInventories.InventoryId(row) != use.InventoryId
-            || items.Items(row).FirstOrDefault(i => i.Id == use.ItemId) is not { } used)
+        // The orb may sit in a character inventory or in the open stash / currency tab: the client sends 0x74 with that
+        // inventory's id either way (live: a currency-tab orb clicked on a box). Resolve the source before the gate.
+        byte row = 0; bool fromChar = false; InventoryItem? used = null;
+        if (items.RowOf(use.ItemId) is byte r && PlayerInventories.InventoryId(r) == use.InventoryId
+            && items.Items(r).FirstOrDefault(i => i.Id == use.ItemId) is { } ci) { row = r; fromChar = true; used = ci; }
+        else if (PlayerInventories.InventoryId(PlayerInventories.Cursor) == use.InventoryId
+            && items.Items(PlayerInventories.Cursor).FirstOrDefault(i => i.Id == use.ItemId) is { } hi)
+        { row = PlayerInventories.Cursor; fromChar = true; used = hi; }
+        AccountStash? stash = null; int stashTab = -1;
+        // The explicit click names the tab and the item, so any shown tab of the account stash answers it — public or not,
+        // and whether or not the panel is open: a currency tab is usually listed for trade, and this is the player's own
+        // click on their own orb (live 2026-11-27: every orb clicked from a public currency tab was refused). The
+        // open-private rule belongs to the repeat path (0x79), which spends without naming an item.
+        var candidateStash = allowPublicStash ? StashOf(player) : OpenStash(player);
+        if (used is null && candidateStash is { IsTrade: false } s && s.TabOf(use.InventoryId) is int t && s.IsShownTab(t)
+            && (allowPublicStash || !s.IsPublic(t))
+            && s.Inventory(t).Items.FirstOrDefault(i => i.Id == use.ItemId) is { } si) { stash = s; stashTab = t; used = si; }
+        if (used is null)
         {
-            Console.WriteLine(Log("no such item in the character's inventories (currency from the stash is not handled)"));
+            Console.WriteLine(Log("no such item in the character's inventories or stash"));
             return true;
         }
         var currency = ItemsFor(player).ByHash(used.Item.TypeHash);
@@ -35,28 +83,77 @@ public static partial class MapStrongboxes
         try
         {
             var box = area.Boxes![target.Index];
+            // A box is used from nearby: an open, living player within the object's interaction reach of it (the client
+            // enforces its own; this refuses a use that cannot be a click on the box).
+            if (player.Closed || player.LeavingArea || player.PlayerLife == 0) return true;
+            if (!PlayerWalk.InWalkUpRange(player.Walk.Position(AreaTime(player)), (box.X, box.Y), 20))
+            {
+                Console.WriteLine(Log("too far from the strongbox"));
+                return true;
+            }
             if (StrongboxCatalog.Find(box.Type) is not { } type) return true;
             var (changed, refusal) = Change(ItemsFor(player).Mods, type, box, currency?.Id, AreaLevel(player), AreaMods(player), AreaRng(player));
             if (changed is null)
             {
                 Console.WriteLine(Log($"{currency?.Name ?? $"0x{used.Item.TypeHash:x8}"} refused: {refusal}"));
+                ushort error = box.Corrupted ? InstanceItems.ItemErrorTargetCorrupted : (ushort)0x04D7;
+                string reason = GameServer.Core.ClientTables.TableOrNull("ClientStrings")?.Row(error - 1)?.TextOrNull("Text") is { Length: > 0 } known
+                    ? known : refusal ?? "The operation could not be completed.";
+                await Send(player, InstanceChat.ChatLine($"Failed to apply item: {reason}"), $"0x0017 \"{reason}\"");
                 return true;
             }
-            if (items.ConsumeOne(row, used.Id) is not { } taken)
+            // Consume one orb from whichever source holds it; only then commit the box.
+            Func<Task> notify;
+            if (fromChar)
             {
-                Console.WriteLine(Log("the item is gone"));
-                return true;
+                if (items.ConsumeOne(row, used.Id) is not { } taken) { Console.WriteLine(Log("the item is gone")); return true; }
+                uint inventory = PlayerInventories.InventoryId(row);
+                notify = () => Send(player, InstanceItems.InventoryChange(inventory, items.NextRevision(row), [used.Id], taken.Left is { } left ? [left] : []),
+                    $"0x00bf inventory {inventory}: {currency!.Name} used" + (taken.Left is { } l ? $", {l.Item.StackSize} left" : ", stack gone"));
+            }
+            else
+            {
+                // One orb from the clicked stack, not the smallest stack of its type anywhere in the stash: the client
+                // named (tab, item). SendStashPayment notifies the tab it changed.
+                if (stash!.PayOne(stashTab, used, allowPublic: allowPublicStash) is not { } paid) { Console.WriteLine(Log("the item is gone")); return true; }
+                notify = () => SendStashPayment(player, stash!, paid);
             }
             area.Boxes[box.Index] = changed;
             Keep(player, area);
-            uint inventory = PlayerInventories.InventoryId(row);
-            await Send(player, InstanceItems.InventoryChange(inventory, items.NextRevision(row), [used.Id], taken.Left is { } left ? [left] : []),
-                $"0x00bf inventory {inventory}: {currency!.Name} used" + (taken.Left is { } l ? $", {l.Item.StackSize} left" : ", stack gone"));
-            Console.WriteLine(Log($"{currency.Name}: {Label(player, box)} → {Label(player, changed)}"));
-            foreach (var member in Members(player)) await Present(member, changed, true);
+            await notify();
+            Console.WriteLine(Log($"{currency!.Name}: {Label(player, box)} → {Label(player, changed)}"));
+            // ObjectMagicProperties has a 0x2bc reader: update the box's rarity and mods in place, where the client's
+            // nameplate and selection stay put (a new object dropped the label). A unique roll and a change of the Chest
+            // flag byte (the trap mods' warning bit, which has no 0x2bc reader) are create-only: words and model come
+            // with the object. Both go out once for the area, not once per member.
+            bool recreate = changed.Unique != box.Unique || ChestFlags(player, type, box) != ChestFlags(player, type, changed);
+            if (recreate)
+                foreach (var member in Members(player)) await Present(member, changed, true);
+            else
+            {
+                await UpdateBoxMods(player, type, changed);
+                area.Shown[changed.Id] = changed;
+                // The closed glow is the rarity's: an in-place update keeps the box object, so its effect is worn again
+                // for the new rarity (one glow for the area, not one per member).
+                await Wear(player, changed);
+            }
         }
         finally { area.Gate.Release(); }
         return true;
+    }
+
+    /// <summary>The box's ObjectMagicProperties by S→C 0x2bc: the same bytes a created box's component carries
+    /// (<see cref="QuestObject"/>), so the client rerolls the nameplate, rarity colour and mod lines without a new object.</summary>
+    static async Task UpdateBoxMods(Player player, StrongboxCatalog.Definition type, Box box)
+    {
+        int index = type.Components.ToList().IndexOf("ObjectMagicProperties");
+        if (index < 0) return;
+        var mods = box.Mods.Length > 0 ? [.. type.Mods, .. box.Explicits] : type.Mods;
+        var w = new BlobWriter();
+        if (mods.Count == 0 && box.Rarity == 0 && !box.Corrupted) w.U16(0).U8(0).U8(0);
+        else { MagicProperties.Write(w, box.Rarity, true, mods); w.U8((byte)(box.Corrupted ? 1 : 0)); }
+        await SendWorldRecord(player, box.Id, InstanceEntities.ComponentUpdate(box.Id, (byte)index, w.ToArray()),
+            $"strongbox 0x{box.Id:x} mods updated in place: {Label(player, box)}");
     }
 
     /// <summary>What the currency (a BaseItemTypes id) makes of the box, or null with the reason: only a closed,

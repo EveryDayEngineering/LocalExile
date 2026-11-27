@@ -29,7 +29,8 @@ public static partial class Game
     /// aggravate_bleeding_on_attack_crit_chance_%), and aggravate_inflicted_bleeding aggravates the hit's own; Crimson
     /// Dance (keystone_crimson_dance) stacks 8 instead and cannot aggravate (ReminderTextKeystoneCrimsonDance). It lasts
     /// 5 s × (1 + bleed_duration_+%, base_bleed_duration_+% and
-    /// base_all_ailment_duration_+%); faster_bleed_% and damaging_ailments_deal_damage_+%_faster multiply its damage per
+    /// base_all_ailment_duration_+% and, for a bow, status_ailments_you_inflict_duration_+%_with_bows);
+    /// faster_bleed_% and damaging_ailments_deal_damage_+%_faster multiply its damage per
     /// second and divide its duration, as ignite's faster stats do. cannot_cause_bleeding and never_damaging_ailments stop
     /// it; a physical prohibition already leaves its rows empty.
     /// </summary>
@@ -58,9 +59,12 @@ public static partial class Game
         // Puncture (bleed_duration_is_skill_duration): its bleed lasts the skill's duration, with the skill duration
         // modifiers (ActiveSkills puncture: "affected by modifiers to skill duration"), then the bleed's own.
         double baseSeconds = get(Stat.BleedDurationIsSkillDuration) != 0 && get(Stat.BaseSkillEffectDuration) > 0
-            ? SkillDurationModifiers.Seconds(get(Stat.BaseSkillEffectDuration), _ => 0, get) : Ailments.BleedDurationSeconds;
+            ? SkillDurationModifiers.Seconds(get(Stat.BaseSkillEffectDuration), _ => 0, get,
+                bow ? SkillDurationModifiers.Kinds.Bow : SkillDurationModifiers.Kinds.None)
+            : Ailments.BleedDurationSeconds;
         double seconds = baseSeconds * Math.Max(0, 1 + ((double)get(Stat.BleedDurationPlusPct)
-            + get(Stat.BaseBleedDurationPlusPct) + get(Stat.BaseAllAilmentDurationPlusPct)) / 100) / faster
+            + get(Stat.BaseBleedDurationPlusPct) + get(Stat.BaseAllAilmentDurationPlusPct)
+            + (bow ? get(Stat.StatusAilmentsYouInflictDurationPlusPctWithBows) : 0)) / 100) / faster
             * MonsterIgnites.DurationMultiplier(get);
         bool dance = get(Stat.KeystoneCrimsonDance) != 0;
         int aggravate = dance ? 0 : get(Stat.BaseAggravateBleedingOnAttackHitChancePct);
@@ -69,7 +73,8 @@ public static partial class Game
             ? Math.Max(0, get(Stat.SupportRuptureBleedingDamageTakenPlusPctFinal)) : 0;
         return new((int)Math.Clamp(chance, 0, 100), Row("minimum", "non_critical"), Row("maximum", "non_critical"),
             Row("minimum", "critical"), Row("maximum", "critical"), seconds, (int)Math.Clamp(critical, 0, 100),
-            dance ? CrimsonDanceStacks : 1, Math.Clamp(aggravate, 0, 100),
+            Math.Max(dance ? CrimsonDanceStacks : 1, Math.Clamp(get(Stat.BleedingStacksUpToXTimes), 1, 100)),
+            Math.Clamp(aggravate, 0, 100),
             dance ? 0 : (int)Math.Clamp((long)aggravate + get(Stat.AggravateBleedingOnAttackCritChancePct), 0, 100),
             !dance && get(Stat.AggravateInflictedBleeding) != 0, rupture,
             NeverFromCrit: get(Stat.KeystoneElementalOverload) != 0,
@@ -83,19 +88,13 @@ public static partial class Game
         long additionalIncreased = 0, SupportedHitInputs? capturedInputs = null)
     {
         if (spell) return MonsterIgnites.Settings.None;
-        Func<uint, int> get;
-        if (capturedInputs is null)
-        {
-            var merged = MergeSkillStats(playerStats, SupportedSkill(player, skillId).Stats);
-            get = name => name is var key ? merged.GetValueOrDefault(key) : 0;
-        }
-        else
-            get = capturedInputs.Get;
+        var get = SupportedAilmentStats(player, skillId, playerStats, capturedInputs);
         var rows = capturedInputs is null
             ? SupportedAilmentRows(player, skillId, "main_hand", weapon, additionalIncreased)
             : SupportedAilmentRowsFrom(capturedInputs, "main_hand", additionalIncreased);
+        bool bow = capturedInputs?.WieldingBow ?? (weapon ?? WeaponFor(player)).Bow;
         return WithOverheat(player, skillId, BleedSettings(rows, "main_hand", get,
-            weapon is null ? MainHandLocalSources(player) : weapon.LocalSources, melee, bow: false));
+            weapon is null ? MainHandLocalSources(player) : weapon.LocalSources, melee, bow));
     }
 
     /// <summary>The default melee attack's bleed, from the rows <see cref="DefaultAttackIgnite"/> reads.</summary>
@@ -105,8 +104,9 @@ public static partial class Game
     {
         int Get(uint key) => playerStats.GetValueOrDefault(key);
         var sourceWeapon = weapon ?? WeaponFor(player);
-        return BleedSettings(AilmentPanelStats.Compute(new("main_hand", Spell: false, Melee: true),
-            SupportedAttackDamage.Raw(sourceWeapon, Get, new(accuracy ?? PlayerAccuracy(player, playerStats))), conversion ?? DamageStats.Conversion(playerStats, Stats, attack: true),
+        return BleedSettings(AilmentPanelStats.Compute(new("main_hand", Spell: false, Melee: true) { WeaponStats = sourceWeapon.LocalSources },
+            SupportedAttackDamage.Raw(sourceWeapon, Get, new(accuracy ?? PlayerAccuracy(player, playerStats)), melee: true),
+            conversion ?? SupportedAttackDamage.WithWeaponGains(DamageStats.Conversion(playerStats, Stats, attack: true), sourceWeapon, Get),
             Get, additionalIncreased),
             "main_hand", Get, sourceWeapon.LocalSources, melee: true, bow: false);
     }
@@ -129,7 +129,11 @@ public static partial class Game
         if (target.Bleeds.Burning
             && RandomRolls.Chance(critical ? settings.CriticalAggravate : settings.Aggravate, 100, player.IgniteRandom))
             target.Bleeds.Aggravate();
-        if (!RandomRolls.Chance(critical ? settings.CriticalChance : settings.Chance, 100, player.IgniteRandom)) return null;
+        if (settings.Seconds <= 0 || settings.OnlyFromCrit && !critical
+            || (critical ? settings.CriticalMax : settings.Max) <= 0) return null;
+        int chance = ActorScale.Saturate((long)(critical ? settings.CriticalChance : settings.Chance)
+            + target.Effects[Stat.ReceiveBleedingChancePctWhenHitByAttack]);
+        if (!RandomRolls.Chance(chance, 100, player.IgniteRandom)) return null;
         var e = target.Mods.Effects;
         if (!target.Bleeds.TryApply(settings with { Chance = 100 }, critical, now, e[Stat.AvoidBleedPct] + e[Stat.BaseAvoidBleedPct],
                 e[Stat.ImmuneToBleeding] != 0 || e[Stat.CannotGainBleeding] != 0 || e[Stat.BaseCannotGainBleeding] != 0,
@@ -181,14 +185,16 @@ public static partial class Game
     /// <summary>A bleeding monster's mitigation: its physical damage over time taken (resistance, damage taken, Pride;
     /// armour stops hits only), times <see cref="BleedMovingMore"/> while it moves, but not for Crimson Dance's
     /// stacks.</summary>
-    public static double BleedTaken(SpawnedMonster m, double now) =>
+    public static double BleedTaken(SpawnedMonster m, double now) => BleedTaken(m, now, preventsMovingBonus: false);
+
+    static double BleedTaken(SpawnedMonster m, double now, bool preventsMovingBonus) =>
         MonsterDotTaken(m, DamageType.Physical, now) * m.Ruptures.More(now)
-        * (m.Bleeds.Stacks == 1 && m.Walk.Moving(now) ? BleedMovingMore : 1);
+        * (!preventsMovingBonus && m.Bleeds.Stacks == 1 && (m.Walk.Moving(now) || IsEnsnared(m, now)) ? BleedMovingMore : 1);
 
     /// <summary>A standing monster's strongest aggravated bleed deals its moving bonus on top of the strongest bleed's
     /// damage; moving, the strongest already deals it, and the two do not stack (wiki Bleeding, Aggravate).</summary>
     public static double AggravatedExtra(SpawnedMonster m, double now) =>
-        m.Bleeds.Stacks == 1 && !m.Walk.Moving(now) ? BleedMovingMore - 1 : 0;
+        m.Bleeds.Stacks == 1 && !m.Walk.Moving(now) && !IsEnsnared(m, now) ? BleedMovingMore - 1 : 0;
 
     // Rupture changes the target's running bleed clocks, including the bleed from the hit that applied it.
     // GGG's mechanics Q&A: https://www.pathofexile.com/forum/view-thread/3123794

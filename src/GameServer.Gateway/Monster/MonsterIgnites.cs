@@ -9,12 +9,17 @@ using GameServer.Core.World;
 /// </summary>
 public sealed class MonsterIgnites
 {
+    public readonly record struct DamageRanges(double Min, double Max, double CriticalMin, double CriticalMax)
+    {
+        public DamageRanges Scale(double factor) => new(Min * factor, Max * factor, CriticalMin * factor, CriticalMax * factor);
+    }
+
     /// <summary>What a hit can ignite with, captured at release: the chance, the ignite's fire damage per second for a
     /// non-critical and a critical hit (the panel's ignite rows, <see cref="AilmentPanelStats"/>, already scaled by the
     /// damage-over-time buckets), and the duration in seconds.</summary>
     /// <param name="CriticalChance">The chance on a critical strike, for an ailment that rolls it there too (bleed);
     /// a critical strike always ignites.</param>
-    /// <param name="Stacks">Bleed only: how many of the strongest deal damage at once (Crimson Dance: 8).</param>
+    /// <param name="Stacks">How many of the strongest instances may deal damage together.</param>
     /// <param name="Aggravate">Bleed only: the chance a hit (<paramref name="CriticalAggravate"/>: a critical strike)
     /// aggravates the bleeds already on its target; <paramref name="Aggravated"/>: its own bleed is aggravated too.</param>
     public readonly record struct Settings(int Chance, double Min, double Max, double CriticalMin, double CriticalMax,
@@ -31,42 +36,75 @@ public sealed class MonsterIgnites
 
         /// <summary>Whether a hit of <paramref name="hit"/> (rolled, before mitigation) can ignite: its fire damage, or any
         /// damage with "All Damage can Ignite" (<see cref="AllDamage"/>, Shaper of Flames).</summary>
-        public bool CanIgnite(DamagePacket hit) =>
-            AllDamage ? hit.Components.Any(c => c.Range.Max > 0) : hit[DamageType.Fire].Max > 0;
+        public bool CanIgnite(DamagePacket hit)
+        {
+            if (!AllDamage)
+                return (!FireCannotIgnite && hit[DamageType.Fire].Max > 0) || (ColdCanIgnite && hit[DamageType.Cold].Max > 0);
+            foreach (var type in DamageTypes.ConversionOrder)
+                if ((type != DamageType.Fire || !FireCannotIgnite) && hit[type].Max > 0) return true;
+            return false;
+        }
+
+        public bool FireCannotIgnite { get; init; }
+        public bool ColdCanIgnite { get; init; }
+        public DamageRanges? ChilledTarget { get; init; }
+        public DamageRanges Ranges => new(Min, Max, CriticalMin, CriticalMax);
+
+        public Settings WithRanges(DamageRanges range) => this with
+        {
+            Min = range.Min, Max = range.Max, CriticalMin = range.CriticalMin, CriticalMax = range.CriticalMax,
+        };
+
+        public Settings ScaleDamage(double factor) =>
+            WithRanges(Ranges.Scale(factor)) with { ChilledTarget = ChilledTarget?.Scale(factor) };
 
         /// <summary><paramref name="rows"/>: a context's ailment rows (per minute); <paramref name="get"/>: the merged
         /// caster and skill stats. Base duration 4 s (<see cref="Ailments.IgniteDurationSeconds"/>); the ignite
         /// prohibitions (<see cref="MonsterElementalAilments.CannotInflict"/>) and never_damaging_ailments stop it. faster_burn_% and damaging_ailments_deal_damage_+%_faster multiply the damage
         /// per second and divide the duration (wiki Ignite; PoB IgniteBurnFaster).</summary>
-        public static Settings From(IEnumerable<(uint Stat, int Value)> rows, string hand, Func<uint, int> get)
+        public static Settings From(IEnumerable<(uint Stat, int Value)> rows, string hand, Func<uint, int> get) =>
+            From(rows, hand, get, 0);
+
+        public static Settings From(IEnumerable<(uint Stat, int Value)> rows, string hand, Func<uint, int> get,
+            int additionalDurationPct)
         {
             if (MonsterElementalAilments.CannotInflict("ignite", get) || get(Stat.NeverDamagingAilments) != 0) return None;
             var r = rows.ToDictionary(x => x.Stat, x => x.Value);
-            double faster = Faster(get);
+            bool attackHand = hand is "main_hand" or "off_hand";
+            double faster = Faster(get, attackHand);
             if (faster <= 0) return None;
             double Row(string bound, string kind) =>
                 r.GetValueOrDefault(Stat.Of($"{bound}_ignite_damage_to_deal_per_minute_from_{kind}_{hand}_damage")) / 60.0 * faster;
-            // Shaper of Flames: "Hits always Ignite" (always_ignite). Weapon tincture ignite stats apply to weapon hands only.
-            bool tinctureWeapon = hand is "main_hand" or "off_hand" && get(Stat.TinctureApplied) != 0;
+            // Shaper of Flames: "Hits always Ignite" (always_ignite). Attack and weapon tincture ignite stats apply to weapon hands only.
+            bool tinctureWeapon = attackHand && get(Stat.TinctureApplied) != 0;
             long chance = (long)get(Stat.BaseChanceToIgnitePct) + get(Stat.ChanceToFreezeShockIgnitePct)
+                + (attackHand ? get(Stat.AttackIgniteChancePct) : 0)
                 + (tinctureWeapon ? get(Stat.ChanceToIgnitePctWithTincturedWeapons) : 0)
                 + (get(Stat.AlwaysIgnite) != 0 ? 100 : 0);
             double seconds = Ailments.IgniteDurationSeconds
-                * Math.Max(0, 1 + ((double)get(Stat.IgniteDurationPlusPct) + get(Stat.BaseAllAilmentDurationPlusPct)
+                * Math.Max(0, 1 + ((double)get(Stat.IgniteDurationPlusPct) + get(Stat.BaseAllAilmentDurationPlusPct) + additionalDurationPct
                     + (tinctureWeapon ? get(Stat.ElementalAilmentDurationPlusPctWithTincturedWeapons) : 0)) / 100) / faster
                 * DurationMultiplier(get);
             return new((int)Math.Clamp(chance, 0, 100), Row("minimum", "non_critical"), Row("maximum", "non_critical"),
                 Row("minimum", "critical"), Row("maximum", "critical"), seconds,
+                Stacks: (int)Math.Clamp(1L + get(Stat.NumberOfAdditionalIgnitesAllowed), 1, int.MaxValue),
                 FireExposure: get(Stat.IgnitesApplyFireResistancePlus),
                 AllDamage: get(Stat.AllDamageCanIgnite) != 0 || tinctureWeapon && get(Stat.AllDamageWithTincturedWeaponsCanIgnite) != 0,
                 NeverFromCrit: get(Stat.KeystoneElementalOverload) != 0,
-                OnlyFromCrit: get(Stat.KeystoneAilmentCrit) != 0);
+                OnlyFromCrit: get(Stat.KeystoneAilmentCrit) != 0)
+            {
+                FireCannotIgnite = get(Stat.UniqueFireDamageShocks) != 0,
+                ColdCanIgnite = get(Stat.UniqueColdDamageIgnites) != 0,
+            };
         }
     }
 
     /// <summary>The "deal damage faster" factor of the attacker's ignites (1 without one).</summary>
-    public static double Faster(Func<uint, int> get) =>
-        Math.Max(0, 1 + ((double)get(Stat.FasterBurnPct) + get(Stat.DamagingAilmentsDealDamagePlusPctFaster)) / 100.0);
+    public static double Faster(Func<uint, int> get) => Faster(get, attack: false);
+
+    static double Faster(Func<uint, int> get, bool attack) =>
+        Math.Max(0, 1 + ((double)get(Stat.FasterBurnPct) + get(Stat.DamagingAilmentsDealDamagePlusPctFaster)
+            + (attack ? get(Stat.FasterBurnFromAttacksPct) : 0)) / 100.0);
 
     /// <summary>The target's base_self_ignite_duration_-% (Fire and Ignite Resistant) on an ignite's duration.</summary>
     public static double SelfDuration(Func<uint, int> target) =>
@@ -81,7 +119,7 @@ public sealed class MonsterIgnites
     // Spread: its proliferation radius in cells (0: it does not spread). Proliferated: the copy another monster's
     // spreading ignite puts on this one, set again every AI tick (<see cref="Proliferated"/>).
     readonly record struct Ignite(double From, double Until, double DamagePerSecond, bool Aggravated = false, int Spread = 0,
-        bool Proliferated = false, int DamageTakenPct = 0);
+        bool Proliferated = false, int DamageTakenPct = 0, ulong? Source = null, int ConcurrentLimit = 1);
     readonly List<Ignite> active = [];
     // The spreading ignites it had when it died: a corpse goes on spreading them until they end (wiki Ignite
     // Proliferation Support: the aura continues through death on intact corpses). They deal no damage.
@@ -119,9 +157,16 @@ public sealed class MonsterIgnites
 
     // The damage per second of the live instances: the Stacks strongest, plus aggravatedExtra × the strongest aggravated
     // one (an aggravated bleed's "as though moving" part, which does not stack with the moving bonus).
-    double Dealing(List<Ignite> live, double aggravatedExtra) =>
-        live.Select(i => i.DamagePerSecond).OrderDescending().Take(Math.Max(1, Stacks)).Sum()
-        + aggravatedExtra * live.Where(i => i.Aggravated).Select(i => i.DamagePerSecond).DefaultIfEmpty().Max();
+    double Dealing(List<Ignite> live, double aggravatedExtra)
+    {
+        int limit = Math.Max(1, Stacks);
+        if (hasConcurrentIgnites)
+            foreach (var ignite in live) limit = Math.Max(limit, ignite.ConcurrentLimit);
+        return live.Select(i => i.DamagePerSecond).OrderDescending().Take(limit).Sum()
+            + aggravatedExtra * live.Where(i => i.Aggravated).Select(i => i.DamagePerSecond).DefaultIfEmpty().Max();
+    }
+
+    bool hasConcurrentIgnites;
     double last, carry;
     int accrued;
 
@@ -192,8 +237,13 @@ public sealed class MonsterIgnites
     }
 
     /// <summary>Whether this monster or its intact corpse still has an unexpired ignite.</summary>
-    public bool IgnitedAt(double now) => active.Count > 0
-        ? active.Any(i => i.From <= now && now < i.Until) : now < corpseIgnitedUntil;
+    public bool IgnitedAt(double now)
+    {
+        if (active.Count == 0) return now < corpseIgnitedUntil;
+        foreach (var ignite in active)
+            if (ignite.From <= now && now < ignite.Until) return true;
+        return false;
+    }
 
     /// <summary>The strongest ignite's damage per second at <paramref name="now"/> (0 when none burns; the
     /// <see cref="Stacks"/> strongest together).</summary>
@@ -221,7 +271,7 @@ public sealed class MonsterIgnites
             || avoid > 0 && RandomRolls.Chance(avoid, 100, random)) return false;
         var (min, max) = critical ? (settings.CriticalMin, settings.CriticalMax) : (settings.Min, settings.Max);
         perSecond = min + (Math.Max(min, max) - min) * random.NextDouble();
-        return Add(now, perSecond, settings.Seconds, settings.Aggravated, settings.Spread, damageTakenPct);
+        return Add(now, perSecond, settings.Seconds, settings.Aggravated, settings.Spread, damageTakenPct, settings.Stacks);
     }
 
     /// <summary>An ignite already worked out (its chance rolled, its damage and duration final). True when added.</summary>
@@ -235,16 +285,40 @@ public sealed class MonsterIgnites
     /// <summary>True when this monster has any active or corpse-retained ignite that might spread.</summary>
     public bool MaySpread => active.Count > 0 || corpse.Count > 0;
 
-    public bool Add(double now, double perSecond, double seconds, bool aggravated, int spread, int damageTakenPct)
+    public bool Add(double now, double perSecond, double seconds, bool aggravated, int spread, int damageTakenPct) =>
+        Add(now, perSecond, seconds, aggravated, spread, damageTakenPct, 1);
+
+    bool Add(double now, double perSecond, double seconds, bool aggravated, int spread, int damageTakenPct, int concurrentLimit)
     {
         if (!(perSecond > 0) || !(seconds > 0)) return false;
         if (active.Count == 0) { last = now; carry = 0; }
         int radius = Math.Max(0, spread);
         if (radius > 0) Interlocked.Increment(ref spreadsAdded);
         active.Add(new(now, now + seconds / expiryRate, perSecond, aggravated, radius,
-            DamageTakenPct: Math.Max(0, damageTakenPct)));
+            DamageTakenPct: Math.Max(0, damageTakenPct), ConcurrentLimit: concurrentLimit));
+        hasConcurrentIgnites |= concurrentLimit > 1;
         LastApplied = now;
         return true;
+    }
+
+    /// <summary>Renews a strongest-only damage effect while its source still reaches this actor.</summary>
+    public void Renew(double now, double perSecond, double seconds, ulong source)
+    {
+        if (!(perSecond > 0) || !(seconds > 0)) return;
+        double end = now + seconds / expiryRate;
+        int index = active.FindIndex(effect => effect.Source == source && effect.Until > now);
+        if (index >= 0)
+        {
+            var current = active[index];
+            if (current.DamagePerSecond == perSecond)
+            {
+                active[index] = current with { Until = end };
+                return;
+            }
+            active[index] = current with { Until = now };
+        }
+        if (active.Count == 0) { last = now; carry = 0; }
+        active.Add(new(now, end, perSecond, Source: source));
     }
 
     /// <summary>The whole damage the strongest ignites deal (<see cref="Dealing"/>) from the last advance to

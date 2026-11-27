@@ -33,7 +33,17 @@ Part of [Status](../Status.md); what to build next in this area is in
   scattered set on top of them (#668). The scattered packs stand only on cells the arrival can walk to, so the pockets
   a generated map's walk map walls off from the entrance get none: a pack standing in one was a monster the area
   counted and nobody could reach or kill.
-  Code: `MonsterPacks.cs`, Gateway (`PopulateArea`), `scripts/walkmaps`, `scripts/re/atlas room-points`.
+  A map area adds a draw from the shared `chaos-*` pool to its Maps.dat signature packs, cut to the packs whose `Tags`
+  suit the area's `AreaTypeTags`: before that Forbidden Woods had only `chaos-vendigo1` and every monster of the map was
+  a Vendigo. The draw is the instance's one set of packs (`AreaPopulation.ForInstance`, asked for through
+  `Game.InstancePacks`): the scattered monsters, a strongbox's guards and summons, an Essence's monster, a Harbinger's
+  wave and the Torment dig pick from it where they run. The Harbinger and Torment on/off checks
+  read the instance's own packs, and the Essence opening checks the signature packs and the pool alike, so on an
+  ordinary map whose list is empty they start from the pool draw.
+  Unique map areas (WorldAreas `IsUniqueMapArea`) get no pool. Which key the areas whose `AreaTypeTags` is not their
+  terrain use (Summit, Estuary, Pier) is open; the per-instance draw size is our own number.
+  Code: `MonsterPacks.cs`, Gateway (`PopulateArea`, `Game.InstancePacks`), `scripts/walkmaps`,
+  `scripts/re/atlas room-points`.
   Docs: [14](../docs/protocol/14-monster-packs.md).
 - The map overlay's "X monsters remain" line: S→C 0x1a0 carries living hostile monsters, including dormant enemies,
   excluding friendly summons and corpses. Shared-instance updates follow entry, kills, spawns and removals; emerging
@@ -86,7 +96,7 @@ Part of [Status](../Status.md); what to build next in this area is in
   physical reduction, block, evasion, critical strikes and regeneration act on the server (each checked live); the
   instance keeps them.
   Only the 37 mods the server can honour roll; the other 74 are listed in [14](../docs/protocol/14-monster-packs.md)
-  §5.
+  §5. Monster species mods, ES/armour/evasion/accuracy/crit/ailment thresholds, pack aggro and leash also apply.
   Code: `MonsterMods.cs`, `Modules/Core/Game/Monster/Mods/MonsterMods.cs`, `MagicProperties.cs`.
   Docs: [14](../docs/protocol/14-monster-packs.md) §5.
 - Monster decisions use 50 ms of elapsed game time, with no catch-up burst after pauses or slow steps.
@@ -114,7 +124,8 @@ Part of [Status](../Status.md); what to build next in this area is in
   Ordinary monster spells use level-scaled `GrantedEffectStatSets` elemental/chaos base damage, native cast-speed
   modifiers and cooldowns, and on-screen reach capped by `spell_maximum_action_distance_+%`.
   `MinimumAttackDistance` is not read yet.
-  A give-up beyond twice the aggro range ends the client's chase action with S→C 0x1ac before its Move (GGG's server
+  A monster notices at its MinAgroRange and gives up past its MaxAgroRange (twice the aggro range for a row
+  without a MinAgroRange); a give-up ends the client's chase action with S→C 0x1ac before its Move (GGG's server
   does the same: 925 of 1166 live give-ups carried one, 3.29 capture; a predictive client needs it, a lockstep one
   ignores it — [07](../docs/protocol/07-latency-visibility-movement.md) §11).
   Attack busy time covers the full attack duration; pending swing and stage generations prevent duplicate work.
@@ -182,20 +193,47 @@ Part of [Status](../Status.md); what to build next in this area is in
   shaped by type and client action class (rains, class radii and projectiles, grounds that burn and debuffs on the
   player: Fire Trap, Bear Trap, Desecrate, Caustic Arrow, Wither, Ensnaring Arrow, the totems' arrows and flames)); the
   map's, the Anarchy scarabs' and the Atlas wheel's stats add, pair, gigantify and make exceptional exiles, guard map
-  bosses and change their drops (extra jewels; fully linked, fractured, corrupted, duplicated items). All 71 exile
-  varieties played headless against the real client; map stats and guards not yet seen live. Left out: Flameblast and Toxic Rain (no radius found), Desecrate's corpses, the tether's break by distance, the
+  bosses and strongboxes and change their drops (extra jewels; fully linked, fractured, corrupted, duplicated items).
+  Rewards follow retained world ids across players and reentry; Anarchy scarab counts and strongbox guards seen live.
+  All 71 exile varieties played headless; other map modifiers and boss guards not yet seen live.
+  Left out: Flameblast and Toxic Rain (no radius found), Desecrate's corpses, the tether's break by distance, the
   alternate-minion skills (Raise Zombie, Summon Raging Spirit, Ice Golem), Cremation's and Volatile Dead's flights;
   possessed exiles (Torment) and the special and exceptional rewards' contents are guesses or missing; the active Atlas
   preset is the last one changed.
   Docs: [league encounters](../docs/game/league-encounters.md).
+- Bestiary: maps roll Einhar's mission from their master-mission stats; red and yellow beasts, captured at the kill.
+- Abyss: pit, crack arms, wave, reward chest per instance. [Docs](../docs/game/league-encounters.md)
+- Mercenaries & Luminary: Act 3+ campaign and map encounters (`0xa1`/`0xa2`, `0x7b` `0x60`/`0x61`, `0x010c`), Take Item/Rucksack, Rematch Warrants, temporary recruits, persistent 3-slot permanent roster (`Mercenary1..3`), full `CanMercenaryEquipItem` validation, companion AI/auras/taunt/recoup/death/revive, and all Scion Luminary ascendancy passives (`Noble Blood`, `Oath of Fealty`, `Golden Glory`, `Loyal Bodyguard`, `Bestowed Knighthood`, `Legendary Arms` + unique-slot nodes). Verified live on 3.29.3d.
+  Docs: [league encounters](../docs/game/league-encounters.md).
+- Ritual: maps and Act 2 campaign altars, waves, Tribute, Favour window, Vessels, Scarabs, Atlas, and Omens.
+  Docs: [league encounters](../docs/game/league-encounters.md).
 - Population follows local gates and waits for walkability; isolated pockets stay empty and cleared saves stay cleared.
 
-- Native variety weapons reach ordinary monster inventories; explicit equipment overrides remain authoritative.
-  Native appearance references resolve; rendered model parity remains unverified.
+- Native variety weapons, helmets, back attachments, `MonsterArmours` slots, and deterministic non-zero `Actor`
+  animation seeds (`+0x21c`) reach ordinary monster inventories/creation; explicit equipment overrides remain
+  authoritative. Native appearance references resolve; rendered model parity remains unverified.
 
 - Native ranged actions receive final projectile counts, including `MonsterProjectileSpell` and `rolling_magma`
   server-published projectiles; other than simulated mortars and spell projectiles, flight damage remains incomplete.
+- Weapon projectile attacks with a `monster_projectile_variation` fly their `MonsterProjectileAttack` projectile through
+  kit shaping (`BossKits.ArtShot`, including `ScavengerThrow` variation 0, sibling `ActionType`s, `SkillArtProjectile`
+  variant-0 fallback, ahead of the shared-skill borrow); the default attack (`MavenNucleus.Shot`) still has none.
+- Monster skill data, combos, kits & `.ot` state flags (PR #1618 S0–S6; automated coverage only, not yet verified live
+  with the real client): `monster-contacts` v9 extracts profile-normalized `Animation.dat` pools, ACT modifiers, `.ao`
+  views, named clip events, and `GE.Animation` priority (missing projectile clips 811 → 185/2,342; `EmptyAction*` parent
+  clip coverage 896 → 1,993/2,050); `MonsterCombos` drives `EmptyAction*` child actions on `AreaTime` clip events;
+  ordinary monster kits scale up to 16 skills with `MinRange`, `CooldownGroup`, cached `GrantedSkill` reuse, and
+  module-agnostic `MonsterKitHooks`; `object-types` v14 adds `object_type_state_meta` for data-driven default visibility
+  (`MonsterStates.DefaultVisibleStates`) and `MonsterStateMachine` runtime `0x2bc` state updates.
+  Code: `MonsterCombos.cs`, `MonsterKits.cs`, `MonsterKitHooks.cs`, `MonsterStates.cs`, `MonsterStateMachine.cs`,
+  `scripts/re/monster_contacts.py`, `scripts/re/ot_components.py`. Docs: [11](../docs/protocol/11-skills.md) §6.
 - Normal Sirus: entry, four phases and rewards; AI/drop tuning provisional ([14](../docs/protocol/14-monster-packs.md)).
+- Act 11 pinnacle bosses (arenas and spawns verified live in 3.29.3d; full AI/combat tuning pending): The Maven (with
+  Nucleus and Ruleset 112 memory game), The Infinite Hunger (drown swamp), The Black Star (astral polarity), The Eater
+  of Worlds (energising orbs), The Searing Exarch (ball phase), and the Zana Memory Incarnations of Neglect, Fear, and
+  Dread run dedicated multi-phase controllers with `world.db` `drop_boss_items` tables.
+  Code: `Modules/Core/Game/Monster/PinnacleBosses/`, `ItemDrops.cs`, `sql/updates/pending_world/`.
+  Docs: [21](../docs/protocol/21-hideouts.md).
 
 - Monsters using the ordinary AI can acquire an in-range fighting golem even while its owner is outside aggro range.
 - Campaign bosses play their whole skill kit rather than one attack: a monster an act's area names as its boss
@@ -213,24 +251,35 @@ Part of [Status](../Status.md); what to build next in this area is in
   refreshes the timer. The five-second duration follows the other three-stack monster beam since Piety's rows omit it.
   In a shared instance the same sweep reached a Predictive and a Lockstep player. Both reached ten stacks, and clearing
   or escaping the effect on one player left the other player's stacks independent.
+  A skill that declares a duration and a per-stack percentage but no stack count applies one stack: the blood-projectile
+  and bonespire family (Greed's essence nova, Belly Totem, Breach, Pyramid, Vendigo) rows omit the count.
   Death-triggered skills such as the Noble Dead and Rhys of Abram soul explosions stay out of living monsters’ attack choices.
-  Arakaali's unsafe generic laser activators stay out; a dedicated controller supplies linked native turret rails.
-  Her Silk transition and stance-specific attacks run; corner travel, laser ordering and collision calibration remain.
+  Arakaali's unsafe generic laser activators and entity-targeted `ArakaaliHide` stay out of generic kits; her dedicated
+  controller supplies linked native turret rails, engagement-gated combat/relocation timers, and created
+  `TeleportMarkerSerialized1..4` scene objects for native `ArakaaliHide[6885]` corner travel (with server-hidden fallback).
   Campaign Yugul finishes his native entrance before generic AI, making him targetable on first entry as on reentry;
   his two mirror intervals hide the body until ten images die; pools chill, Fearful orbs chase and four native turrets
   fire piercing volleys with terminal bursts. Fearful magnitudes, orb escalation and aura radii remain calibrated.
   Solaris/Lunaris hand off corporeal/celestial forms; celestial fire sweeps/flares and lunar darkness/ice cascades
   have typed contacts. Official cadence, heading distribution and some hazard radii remain calibrated.
   Effects that hit for nothing, summon nothing and fire nothing (a breath's own segments, geometry triggers,
-  `EmptyAction`s) stay out, and the attack a boss had before is still its first, unchanged. Checked against the tables
-  and in `BossKitsTests`; **not yet played against the real client**: which of the list a client animates, and how the
-  bosses' official AI weights compare, are unverified. Code: `BossKits`, `MonsterKitSkill`, `Monsters.PlanMonsterAi`.
+  unbound `EmptyAction` shells), ungrounded `CastGroundEffect` rows (such as The Faun's `TheFaunCastGroundEffectLavaTemporary`),
+  and secondary `GA*` `GeometryAttack` leap payloads (`GANavaliGoatmanLeapDamage`) stay out of boss kits and default
+  attacks (verified live on The Faun), and the attack a boss had before is still its first, unchanged. Checked against
+  the tables and in `BossKitsTests`; **not yet played against the real client**: which of the remaining list a client
+  animates, and how the bosses' official AI weights compare, are unverified.
+  Boss kits also cover teleports, movement moves, family summons, barrages, geyser hazards and second-form transitions.
+  Code: `BossKits`, `BossMoves`, `BossSummons`, `BossForms`, `MonsterKitSkill`, `Monsters.PlanMonsterAi`.
 - The campaign Trinity has native attacks and two scorpion phases; organ portals use their native domain labels,
   room entrance pads and return pairs; Doedre's soul starts visible on creation and instance restore.
   Exact official AI weights remain unverified.
   Docs: [Act 9](../docs/game/campaign/act9.md).
 - Act 10 Kitava: three hearts, finale and manual Epilogue portal; allies retain visibility for later observers.
+  Kitava's Act 5 and Act 10 bodies stay at the terrain's exact boss point and keep its facing during combat.
   AI provisional ([Act 10](../docs/game/campaign/act10.md)).
+- Act 1–10 boss encounters have dedicated staged controllers (Hillock through Kitava, including Act 6–10 Pantheon gods,
+  Ryslatha, Abberath, Tukohama, Shavronne/Brutus, Tolman, General Adus, Basilisk and Plaguewing) and multi-skill AI
+  (not all verified live).
 - Act 5 Kitava: body/heart sequence and rescue; AI tuning provisional ([Act 5](../docs/game/campaign/act5.md)).
 - Doedre: cauldron and effluent modes; AI tuning provisional ([Act 8](../docs/game/campaign/act8.md)).
 
@@ -352,23 +401,8 @@ Part of [Status](../Status.md); what to build next in this area is in
   74 monster mods need systems the server lacks (auras on allies, monster skills, ailments on the player …) and do
   not roll;
   Drowned ignore their ground types; how near the player must come before an emerge monster rises is our choice;
-  a boss's stages exist for Hillock only (`BossFights.cs`; other bosses with `BossHealthBar` get the bar, and a
-  campaign boss with no controller plays its kit, but no act boss changes phase mid-fight); monsters respawn on every
-  entry;
-  a new (area, seed) needs a `-Walkmaps` visit for its unique boss ([14](../docs/protocol/14-monster-packs.md) §4).
-  the boss life bar and boss stages exist for Hillock only (`BossFights.cs`;
-  other bosses with `BossHealthBar` get the bar too); monsters respawn on every entry;
   a layout that gives an area no boss room point stands its unique boss at the walk map's deepest cell from the
   entrance, so a new (area, seed) has its boss; the room points themselves are still what `-Walkmaps` captures
   ([14](../docs/protocol/14-monster-packs.md) §4).
-  Act 2's bandit lords (Kraityn, Alira, Oak) are created hostile without their help-or-kill dialogue
-  ([17](../docs/protocol/17-npcs.md)).
   Not placed: Marceus the Defaced (a tile's statue spawner), The Solaris Temple Level 2's three Banners (a room the
   layouts never place) and Thistlesage (no room names his pack) ([14](../docs/protocol/14-monster-packs.md) §3).
-  A boss's later form is created where its act forms one: the quest's second-form rule spawns it on the boss's death
-  (Merveil's twisted form, Abberath2, Shakari2, Malachai's second form; `Act1.cs`, `Act4.cs`, `Act6.cs`, `Act9.cs`).
-  Marceus the Defaced (a tile's statue spawner) and Thistlesage (no room names his pack) have no boss room point of
-  their own: the deepest-cell fallback above is where they stand, not at the statue or the pack room
-  ([14](../docs/protocol/14-monster-packs.md) §3).
-  A boss's later form (Abberath2, Shakari2, Malachai's second form) is left to a fight or quest
-  that does not create it yet.

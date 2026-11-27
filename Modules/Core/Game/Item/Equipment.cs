@@ -5,6 +5,9 @@ using GameServer.Core.Protocol.Login;
 
 public static partial class Game
 {
+    static bool IsTwoHandMeleeClass(string? itemClass) => itemClass is "Two Hand Sword" or "Two Hand Axe"
+        or "Two Hand Mace" or "Staff" or "Warstaff";
+
     // Pools and published stats already include effective item ES. Raw bases would count suppressed/converted ES.
     public static bool PlayerHasEnergyShieldForRecovery(Player player, Func<uint, int> get) =>
         player.Pools.EnergyShield > 0 || PlayerHitRecovery.EnergyShieldPresent(get);
@@ -105,7 +108,10 @@ public static partial class Game
         var result = new Dictionary<uint, int>(weaponSources ?? SupportedAttackDamage.WeaponSources(item, ItemsFor(player).Mods));
         var local = ItemModStats.Local(item, ItemsFor(player).Mods);
         if (!local.Keys.Any(name => StatConditions.PlainOf(Stats.Name(name)) is not null)) return result;
-        var flags = player.StatSourcesCache?.Key.Flags ?? ItemConditionFlags(player, ResourceEffectsTime(player));
+        // The cached key's flags are the build-time values: a flag the sum never read can flip while the cache still
+        // hits, and the first local-mods read after the flip would see the build-time value. Read the live flags, so
+        // a conditional local mod always answers from the flag as it is now.
+        var flags = ItemConditionFlags(player, ResourceEffectsTime(player));
         foreach (uint name in local.Keys) result.Remove(name);
         foreach (var (name, value) in ItemModStats.Local(item, ItemsFor(player).Mods, new(Flags: flags), Stats.Has))
             result[name] = value;
@@ -119,10 +125,13 @@ public static partial class Game
         if (hand is not var (item, type) || type is null || skills.WeaponBase(type.Row) is not var (ms, min, max, range)) return null;
         var local = ItemWeaponStats.Calculate(item, (ms, min, max, range), catalog.Mods);
         var physical = local.Damage[GameServer.Core.World.DamageType.Physical];
+        var sources = SupportedAttackDamage.WeaponSources(item, catalog.Mods);
+        // "+# to Weapon Range" is in the same tenths of a metre as WeaponTypes' range.
+        range += sources.GetValueOrDefault(Stat.LocalWeaponRangePlus);
         // The weapon's class decides Arcane Might's wand-only grant and the melee context of its own components.
         return new SkillCatalog.Unarmed(local.AttackMs, (int)physical.Min, (int)physical.Max, Math.Max(range, unarmed.Range))
         {
-            LocalDamage = local.Damage, LocalSources = SupportedAttackDamage.WeaponSources(item, catalog.Mods),
+            LocalDamage = local.Damage, LocalSources = sources,
             ItemClass = type.Class,
             WieldingWand = type.Class == "Wand", Bow = type.Class == "Bow", Melee = type.Class is not ("Wand" or "Bow"),
         };
@@ -131,7 +140,8 @@ public static partial class Game
     // The off-hand weapon of a dual-wielded attack (the active set's Offhand1), with the same values WeaponIn gives the main
     // hand. Null when there is nothing to swing with there (empty, a shield, a quiver) or the main hand holds no weapon.
     public static SkillCatalog.Unarmed? OffhandWeaponFor(Player player) =>
-        WeaponIn(player, ActiveMainHand(player)) is null ? null : WeaponIn(player, ActiveOffHand(player));
+        WeaponIn(player, ActiveMainHand(player)) is not null && WeaponIn(player, ActiveOffHand(player)) is { } off
+            ? off with { OffHand = true } : null;
 
     public static (Dictionary<uint, int> Main, Dictionary<uint, int> Off) HandLocalStats(Player player)
     {
@@ -177,8 +187,7 @@ public static partial class Game
         ItemCatalog.BaseType? At(byte row) => rowItems(row).Where(i => !inactive(i.Id))
             .Select(i => catalog.ByHash(i.Item.TypeHash)).FirstOrDefault(t => t is not null);
         static bool OneHand(ItemCatalog.BaseType t) => OneHandMelee(t) || t.Class == "Wand";
-        static bool TwoHandMelee(ItemCatalog.BaseType t) => t.Class is "Two Hand Sword" or "Two Hand Axe"
-            or "Two Hand Mace" or "Staff" or "Warstaff";
+        static bool TwoHandMelee(ItemCatalog.BaseType t) => IsTwoHandMeleeClass(t.Class);
         static bool Pair(ItemCatalog.BaseType? main, ItemCatalog.BaseType? off) =>
             main is { } m && off is { } o && OneHand(m) && OneHand(o);
         var main1 = At(2);
@@ -247,7 +256,8 @@ public static partial class Game
 
     public static PlayerInventories.Shape? ShapeOf(Item i) => Items.ByHash(i.TypeHash) is { } t
         ? new PlayerInventories.Shape(t.Width, t.Height, t.Class, t.MaxStack,
-            t.BecomesWhenFull && Items.Row(t.FullStackRow) is { Supported: true } full ? () => ItemCatalog.Create(full) : null)
+            t.BecomesWhenFull && Items.Row(t.FullStackRow) is { Supported: true } full ? () => ItemCatalog.Create(full) : null,
+            t.IsFossil)
         : null;
 
     // The weapon type of an equipment row's item (its BaseItemTypes row), or null: the active (not inactive) item.
@@ -294,10 +304,11 @@ public static partial class Game
         foreach (var worn in WornCosmetics(player))
         {
             if (MtxEffects.SlotOf(worn.Slot) is not { ModelSlot: byte model } slot || MtxEffects.Of(worn.MtxTypeHash) is not { } fx) continue;
+            byte tier = fx.ResolveTier(worn.Option);
             if (cosmeticSlots.ContainsKey(model))
             {
                 if (fx.Visual != 0)
-                    cosmeticSlots[model] = new VisibleItem(model, fx.Visual) { SkinVisual = fx.Visual, SkinHash = worn.MtxTypeHash };
+                    cosmeticSlots[model] = new VisibleItem(model, fx.Visual) { SkinVisual = fx.Visual, SkinHash = worn.MtxTypeHash, SkinTier = tier };
                 continue;
             }
             // With a bow the main hand's cosmetics dress the bow, which is the left hand's entry, and the off hand's dress
@@ -307,9 +318,9 @@ public static partial class Game
             if (at < 0 || looks[at].VisualIdentity == 0) continue;   // nothing equipped there to dress
             if (!classes.TryGetValue(model, out int itemClass) || !fx.Fits(itemClass)) continue;   // not an item it dresses
             if (slot.IsWeaponEffect && fx.WeaponEffect != 0)
-                looks[at] = looks[at] with { EffectVisual = fx.WeaponEffect, EffectHash = worn.MtxTypeHash };
+                looks[at] = looks[at] with { EffectVisual = fx.WeaponEffect, EffectHash = worn.MtxTypeHash, EffectTier = tier };
             else if (!slot.IsWeaponEffect && fx.Visual != 0)
-                looks[at] = looks[at] with { SkinVisual = fx.Visual, SkinHash = worn.MtxTypeHash };
+                looks[at] = looks[at] with { SkinVisual = fx.Visual, SkinHash = worn.MtxTypeHash, SkinTier = tier };
         }
         return [.. looks, .. cosmeticSlots.Values];
     }
@@ -317,12 +328,14 @@ public static partial class Game
     // The stats worn cosmetics give the character (footprints, apparitions, …), summed per stat. A pet is the stat the client
     // spawns it from: pet_slot1 for the first Pet slot (MicrotransactionSlot 18), pet_slot2 for the second (19).
     // Skill Gem Effect (slot 49) is left out: its skill_art_variation belongs to one skill's stats, not the character's.
+    // A Flask Effect slot's flask_effect_variation belongs to its flask's buff (FlaskEffectVisual); its other stats stay.
     // The stats the client reads in place of a cosmetic's own join them (CosmeticDerivedStats): it does not work out a
     // derived stat for a player the server describes.
     public static IEnumerable<(uint Stat, int Value)> CosmeticStats(Player player)
     {
         var worn = WornCosmetics(player).Where(w => w.Slot != 49).SelectMany(w => MtxEffects.Of(w.MtxTypeHash) is not { } fx ? [] :
-                fx.Pet != 0 ? [.. fx.Stats, (w.Slot == 19 ? Stat.PetSlot2 : Stat.PetSlot1, fx.Pet)] : fx.Stats)
+                (fx.Pet != 0 ? [.. fx.Stats, (w.Slot == 19 ? Stat.PetSlot2 : Stat.PetSlot1, fx.Pet)] : fx.Stats)
+                    .Where(s => !IsFlaskEffectSlot(w.Slot) || s.Stat != Stat.FlaskEffectVariation))
             .GroupBy(s => s.Stat, s => s.Value).Select(g => (Stat: g.Key,
                 Value: ActorScale.IsInput(g.Key) ? ActorScale.Saturate(g.Sum(v => (long)v)) : g.Sum())).ToList();
         return [.. worn, .. CosmeticDerivedStats(player, worn.ToDictionary(s => s.Stat, s => s.Value))];
@@ -333,7 +346,7 @@ public static partial class Game
 
     // What the player wears changed (an item went into or out of a visible equipment row): 0x2bc Inventories for the model,
     // then the Actor skill list again, since the gems socketed in the equipment grant skills.
-    public static async Task SendEquipment(Player player, PlayerInventories items)
+    public static async Task SendEquipment(Player player, PlayerInventories items, bool refreshCosmetics = true)
     {
         RefreshVaalSouls(player);
         // Refresh the canonical inactive qualification before reconciling grants: a swapped item may change another
@@ -346,12 +359,13 @@ public static partial class Game
         }
         await SendModel(player, Looks(player, items), "equipment");
         // The socketed gems may have changed: the Cosmetics tab's skill slots follow them.
-        await SendWornCosmetics(player, "equipment changed");
+        if (refreshCosmetics) await SendWornCosmetics(player, "equipment changed");
         await SendSkills(player);
         await SendPlayerStatSnapshot(player,
             () => PlayerStatsOffFrames(player),
             "0x01b3 player stats (equipment)");
         await SendPlayerMana(player, $"0x01b1 player mana {player.PlayerMana} (equipment)");
+        await CheckEquipmentAchievements(player, items);
     }
 
     public static async Task SendModel(Player player,

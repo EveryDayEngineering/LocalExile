@@ -19,12 +19,14 @@ public static partial class Game
         if (!player.Connection.PlayerSent) return;
         await SendWorldRecord(player, player.Id, InstanceEntities.PlayerLeagueQuestFlagsUpdate(player.Id, Quests.League.Bits(all)),
             $"0x02bc player league quest flags: {string.Join(", ", all)}");
+        await UpdateQuestNpcs(player, $"league quest flag(s) {string.Join(", ", wanted)} {(on ? "set" : "cleared")}");
     }
 
     // Sets or clears quest flags for the character (saved at once) and sends the player's flag set again; one change at a
     // time per connection (QuestGate), so a background sync never interleaves with another change.
     public static async Task SetQuestFlags(Player player, IEnumerable<string> flags, bool on = true)
     {
+        if (flags is ICollection<string> { Count: 0 }) return;
         if (QuestKillCommitOutput is not null)
         {
             await SetQuestFlagsHeld(player, flags, on);
@@ -41,9 +43,16 @@ public static partial class Game
     // Gameplay and persistence commit before any notification. Caller holds the combat lock when used by simulation.
     public static QuestFlagCommit? CommitQuestFlags(Player player, IEnumerable<string> flags, bool on = true)
     {
+        if (flags is ICollection<string> { Count: 0 }) return null;
+        List<string>? wanted = null;
+        foreach (string flag in flags)
+        {
+            wanted ??= [];
+            if (!wanted.Contains(flag)) wanted.Add(flag);
+        }
+        if (wanted is null) return null;
         // Queued work cannot mutate progress after a committed Hardcore death.
         if (HardcoreProgressBlocked(player)) return null;
-        var wanted = flags.Distinct().ToList();
         var clientBefore = PlayerQuestFlags(player);
         var ownBefore = player.Character.QuestFlagsSnapshot();
         bool InstanceHas(string flag) => player.Instance?.HasState(flag) == true;
@@ -98,7 +107,7 @@ public static partial class Game
     public static async Task PublishQuestFlags(Player player, QuestFlagCommit change, bool on = true)
     {
         foreach (string flag in change.Changed) Console.WriteLine($"[gateway] {player.Connection.Remote} {CharacterName(player)}: quest flag {flag} {(on ? "set" : "cleared")}");
-        if (!player.Connection.PlayerSent) return;
+        if (player.Closed || !player.Connection.PlayerSent) return;
         if (QuestKillCommitOutput is { } output)
             output.Add(new([], "current quest flags", Kind: PlayerMinions.OutputKind.QuestFlags));
         else
@@ -123,7 +132,11 @@ public static partial class Game
         foreach (uint id in change.Removed)
             await SendWorldRemoval(player, id, $"0x02bd remove room object 0x{id:x} (quest flag set)", atGate: () =>
             { return player.Closed || player.LeavingArea || player.QuestRoomObjects.ContainsKey(id) ? null : InstanceProtocol.RemoveObject(id); });
-        if (on) await CharacterVoiceLines.OnQuestFlagsPublishedHeld(player, change.Effective);
+        if (on)
+        {
+            await CharacterVoiceLines.OnQuestFlagsPublishedHeld(player, change.Effective);
+            await CheckQuestFlagAchievements(player, change.Changed);
+        }
     }
 
     // Whole flag sets are projections, not snapshots: combat can commit while a normal setter awaits the cipher gate.
@@ -133,6 +146,12 @@ public static partial class Game
         return player.Closed || player.LeavingArea || !player.Connection.PlayerSent ? null
             : InstanceEntities.PlayerQuestFlagsUpdate(player.Id, PlayerQuestFlags(player));
     }
+
+    /// <summary>Sends the player's current effective quest flags (including transient <c>GameEvents.AreaQuestFlags</c>)
+    /// without mutating saved character flags.</summary>
+    public static Task SendPlayerQuestFlags(Player player, string log = "0x02bc player quest flags (current)") =>
+        player.Closed || !player.Connection.PlayerSent ? Task.CompletedTask
+            : SendWorldRecord(player, player.Id, [], log, atGate: () => QuestFlagPresentation(player));
 
     static OutputBatch? QuestTransitionRecords(Player player, WorldAdmission admission, uint id, AreaTransitionObject transition)
     {
@@ -169,13 +188,70 @@ public static partial class Game
         return count > 0 && done == count;
     }
 
+    const string OfferingToTheGoddessId = "Metadata/Items/MapFragments/CurrencyOfferingToTheGoddess";
+    const string LegacyOfferingToTheGoddessId = "Metadata/Items/Labyrinth/OfferingToTheGoddess";
+
+    static int[]? _labyrinthMinLevels;
+
+    static int LabyrinthMinLevel(int tier)
+    {
+        if (_labyrinthMinLevels is null)
+        {
+            int[] levels = [0, 0, 40, 50, 68];
+            if (GameServer.Core.ClientTables.Has("Labyrinths"))
+                foreach (var row in GameServer.Core.ClientTables.Table("Labyrinths"))
+                    if (row.IntOrNull("Tier") is int t and >= 1 and <= 4 && row.IntOrNull("MinLevel") is int min)
+                        levels[t] = min;
+            _labyrinthMinLevels = levels;
+        }
+        return tier is >= 1 and <= 4 ? _labyrinthMinLevels[tier] : 0;
+    }
+
+    static bool IsOfferingToTheGoddess(ItemCatalog catalog, Item item) =>
+        catalog.ByHash(item.TypeHash)?.Id is OfferingToTheGoddessId or LegacyOfferingToTheGoddessId;
+
+    static (byte Row, InventoryItem Item)? FindLabyrinthOffering(Player player)
+    {
+        var items = ItemsOf(player);
+        var catalog = ItemsFor(player);
+        byte[] rows = ExpandedInventoryGranted(player)
+            ? [PlayerInventories.MapDevice, PlayerInventories.MainInventory, PlayerInventories.ExpandedInventory]
+            : [PlayerInventories.MapDevice, PlayerInventories.MainInventory];
+        foreach (byte row in rows)
+            foreach (var entry in items.Items(row))
+                if (IsOfferingToTheGoddess(catalog, entry.Item))
+                    return (row, entry);
+        return null;
+    }
+
+    /// <summary>Atomically consumes one Offering to the Goddess from the Labyrinth altar (MapDevice row 13) or inventory.</summary>
+    public static (byte Row, uint ItemId, InventoryItem? Left)? ConsumeLabyrinthOffering(Player player)
+    {
+        var items = ItemsOf(player);
+        return Saves.Atomically<(byte Row, uint ItemId, InventoryItem? Left)?>(() =>
+        {
+            if (FindLabyrinthOffering(player) is not var (row, entry)) return null;
+            if (items.ConsumeOne(row, entry.Id) is not { } taken) return null;
+            return (row, entry.Id, taken.Left);
+        });
+    }
+
     public static string? LabyrinthAdmissionFailure(Player player, int tier)
     {
-        if (tier is not (1 or 2)) return "this difficulty is not supported";
-        if (tier == 2 && player.Pools.Level < 40) return "requires level 40";
-        if (tier == 2 && !player.Character.HasQuestFlag("LabyrinthComplete1")
-            && !player.Character.MainAscendancy.EarnedAwards.Contains(global::AscendancyRules.AwardKeys[0]))
-            return "requires completing the Normal Labyrinth";
+        if (tier is < 1 or > 4) return "this difficulty is not supported";
+        int minLevel = LabyrinthMinLevel(tier);
+        if (minLevel > 0 && player.Pools.Level < minLevel) return $"requires level {minLevel}";
+        if (tier >= 2)
+        {
+            string prevFlag = tier switch { 2 => "LabyrinthComplete1", 3 => "LabyrinthComplete2", _ => "LabyrinthComplete3" };
+            string prevName = tier switch { 2 => "Normal", 3 => "Cruel", _ => "Merciless" };
+            if (!player.Character.HasQuestFlag(prevFlag)
+                && !player.Character.MainAscendancy.EarnedAwards.Contains(global::AscendancyRules.AwardKeys[tier - 2]))
+                return $"requires completing the {prevName} Labyrinth";
+        }
+        // Eternal Labyrinth (tier 4) requires an Offering to the Goddess (since 3.16, map trials are not required).
+        if (tier == 4)
+            return FindLabyrinthOffering(player) is not null ? null : "requires an Offering to the Goddess";
         return LabyrinthTrialsDone(player, tier, out int done, out int count)
             ? null : $"requires all {count} trials ({done} completed)";
     }
@@ -198,13 +274,53 @@ public static partial class Game
     {
         if (player.Layout.Id != LabyrinthDay.Plaza) return;
         string? failure;
-        try { failure = OpenLabyrinthEntrance(player, tier, LabyrinthDay.Seed); }
+        (byte Row, uint ItemId, InventoryItem? Left)? spentOffering = null;
+        try
+        {
+            failure = LabyrinthAdmissionFailure(player, tier);
+            if (failure is null)
+            {
+                if (tier == 4)
+                {
+                    // Validate day layout before consuming the Offering so a missing day never eats the player's key.
+                    var (_, portal) = player.Layout.AreaTransitions.FirstOrDefault(t => t.Transition.SourceType == LabyrinthDay.Entrance);
+                    if (portal is null || LabyrinthDay.EntryFor(LabyrinthDay.Seed, tier) is null)
+                        failure = "the first room is unavailable";
+                    else if (player.LabyrinthEntry is not null || player.Closed || player.LeavingArea)
+                        failure = "the plaza entrance cannot be changed";
+                    else
+                    {
+                        spentOffering = ConsumeLabyrinthOffering(player);
+                        if (spentOffering is null)
+                            failure = "requires an Offering to the Goddess";
+                        else
+                        {
+                            var (id, p) = player.Layout.AreaTransitions.FirstOrDefault(t => t.Transition.SourceType == LabyrinthDay.Entrance);
+                            var entry = LabyrinthDay.EntryFor(LabyrinthDay.Seed, tier)!;
+                            player.ReplaceAreaTransition(id, p with { DestinationHash16 = entry.Destination });
+                            player.LabyrinthEntry = entry;
+                        }
+                    }
+                }
+                else
+                {
+                    failure = OpenLabyrinthEntrance(player, tier, LabyrinthDay.Seed);
+                }
+            }
+        }
         catch (Exception ex) when (ex is InvalidDataException or FileNotFoundException)
         { failure = ex.Message; }
         if (failure is not null)
         {
             Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0212 Labyrinth {tier} refused: {failure}");
             return;
+        }
+        if (spentOffering is var (row, itemId, left))
+        {
+            var items = ItemsOf(player);
+            uint invId = PlayerInventories.InventoryId(row);
+            await Send(player, InstanceItems.InventoryChange(invId, items.NextRevision(row), [itemId], left is not null ? [left] : []),
+                $"0x00bf inventory {invId}: Offering to the Goddess consumed for Eternal Labyrinth");
         }
         Console.WriteLine($"[gateway] {player.Connection.Remote} <= 0x0212 Labyrinth {tier} chosen");
         await UpdateQuestObjectStates(player, [LabyrinthDay.PlazaDoorOpen]);
@@ -215,6 +331,16 @@ public static partial class Game
     // QuestObjects). The area's layout is the same for every league, so what the tables add or change there is decided
     // here, per player (TransitionShown).
     public static Quests.RuleSet QuestsOf(Player player) => Quests.For(ModulesFor(player));
+
+    /// <summary>Quest flags granted when <paramref name="varietyId"/> dies in <paramref name="player"/>'s area,
+    /// excluding conflicting bandit kill flags when the player already allied with that bandit.</summary>
+    public static IReadOnlyList<string> QuestFlagsOnKill(Player player, string varietyId) =>
+        BanditChoices.FilterKillFlags(player, QuestsOf(player).OnMonsterKilled(player.Layout.Id, varietyId));
+
+    /// <summary>Quest item drops granted when <paramref name="varietyId"/> dies in <paramref name="player"/>'s area,
+    /// excluding an allied bandit's own amulet during a mixed-vote fight.</summary>
+    public static IReadOnlyList<string> QuestDropsOnKill(Player player, string varietyId) =>
+        BanditChoices.FilterKillDrops(player, varietyId, QuestsOf(player).DropsOnKill(player.Layout.Id, varietyId));
 
     // The flag a dialogue row sets when chosen: its QuestFlag4, unless the player's tables say only an event sets it.
     public static string? TalkStartFlag(Player player, NpcCatalog.Talk talk) => QuestsOf(player).TalkStartFlag(talk);
@@ -282,6 +408,7 @@ public static partial class Game
         if (Quests.IsInstanceFlag(flag))
             return flag == LabyrinthDay.PlazaDoorOpen ? player.LabyrinthEntry is not null : player.Instance.HasState(flag);
         if (player.Character.HasQuestFlag(flag)) return true;
+        if (GameEvents.HasAreaQuestFlag(player, flag)) return true;
         if (Quests.Rows([flag]) is not [int row]) return false;
         bool inHideout = HideoutCatalog.ByArea(player.Layout.Hash) is not null || player.Layout.Hash == StashCatalog.DelveHub;
         if (player.Character.UnearnedQuestFlags.Contains(flag) && Quests.EndgameOnly.Contains(flag)
@@ -360,6 +487,7 @@ public static partial class Game
                     player.LockstepBusyUntil = Math.Max(player.LockstepBusyUntil, frame.Start + (frames + 1) * (frame.End - frame.Start));
                 return InstanceProtocol.ActionStarted(player.Id, here.X, here.Y, x, y, TutorialObjects.WashedUpSkillId, sequence, flags);
             });
+        await CharacterVoiceLines.OnWakeUpOnBeach(player);
     }
 
     public static bool LyingOnBeach(Player player) => player.PeerTemplate is { WashedUp: true } && !player.TutorialGettingUp;

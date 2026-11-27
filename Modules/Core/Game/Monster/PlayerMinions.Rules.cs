@@ -16,7 +16,7 @@ public static partial class Game
         {
             player.Minions.Bodies.Remove(body);
             if (!player.Area.Monsters.TryGetValue(body.Id, out var dead) || !ReferenceEquals(dead, body.Monster) || !dead.Dead) continue;
-            player.Area.Monsters.Remove(body.Id);
+            player.Area.Monsters.Remove(body.Id); player.MinionOrigins.TryRemove(body.Id, out _);
             player.Minions.OutputQueue.Add(new(InstanceProtocol.RemoveObject(body.Id), "minion body removed", body.Id, dead, PlayerMinions.OutputKind.Remove, WorldId: body.Id, RemovesObject: true));
         }
     }
@@ -28,8 +28,13 @@ public static partial class Game
         SaveSummons(left);
         // The held-back ones too: they are the instance's, wherever the players went.
         if (left.MonstersPlaced)
-            left.Instance.Monsters = [.. SavedMonster.Save(InstanceMonsters(left),
-                AreaTime(left), MonsterEmerge.Unrisen(left)), .. HeldBackLocked(left)];
+        {
+            var monsters = InstanceMonsters(left);
+            double now = AreaTime(left);
+            left.Instance.Monsters = [.. SavedMonster.Save(monsters, now, MonsterEmerge.Unrisen(left),
+                    m => left.Instance.World.MonsterOrigins.TryGetValue(m.ObjectId, out var origin) ? origin.Object : null),
+                .. KeepItemisedCorpses(monsters, now), .. HeldBackLocked(left)];
+        }
         RemoveLeavingMinionsLocked(left);
     }
 }

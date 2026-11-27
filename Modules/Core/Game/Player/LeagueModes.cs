@@ -23,14 +23,14 @@ public static partial class Game
                 HardModeSkills = new("data", hardMode: true);
                 HardModePassives = new("data", hardMode: true);
                 HardModeAtlasPassives = new("data", hardMode: true);
-                LoadMapAreaStats();
                 HardModeRolls = new(HardModeItems);
                 HardModeUniques = new(HardModeItems);
                 HardModeEssences = new(HardModeItems, HardModeRolls);
                 HardModeAtlas = new(HardModeItems);
                 HardModeCrafting = new(HardModeItems, HardModeRolls);
                 RuthlessGrantedSkills = NewGrantedSkills(ruthless: true);
-                RuthlessWornGrantedSkillCatalog = new(HardModeSkills, HardModeItems.Mods, ruthless: true);
+                RuthlessWornGrantedSkillCatalog = new(HardModeSkills, HardModeItems.Mods, ruthless: true,
+                    legacyGrantMods: LegacyWornGrantMods);
                 VendorPrices.For(HardModeItems, hardMode: true);
                 foreach (bool supports in new[] { true, false })
                     GemVendorStock.For(HardModeItems, Npcs, HardModeSkills, hardMode: true, supportGems: supports);
@@ -39,7 +39,7 @@ public static partial class Game
             }
             // Drops read the league's gem rules, which exist once every module loaded, so each HardMode league has its own.
             if (league is not null && !HardModeDrops.ContainsKey(league.Id))
-                HardModeDrops[league.Id] = new(HardModeItems, HardModeRolls, hardMode: true, maps: HardModeAtlas, uniques: HardModeUniques, league: league.Rules);
+                HardModeDrops[league.Id] = new(HardModeItems, HardModeRolls, hardMode: true, maps: HardModeAtlas, uniques: HardModeUniques, league: league.Rules, leagueId: league.Id);
         }
     }
 
@@ -118,7 +118,7 @@ public static partial class Game
         }
         player.PlayerLife = initial.Life;
         player.PlayerMana = initial.Mana;
-        player.EnergyShield.SetMaximum(player.Pools.EnergyShield, refill: true);
+        InitializePlayerEnergyShield(player);
         player.AuraDeathHandled = false;
     }
 

@@ -96,20 +96,36 @@ public sealed class SupportHitDamageTests
         {
             var random = new Random(1);
             var hit = DamagePacket.Of(DamageType.Physical, 100, 100);
-            double Dealt(GamblerModifiers gambler) => gambler.RollOutgoingHit(hit, random).MinTotal;
+            double Dealt(HitRollModifiers hitRolls) => hitRolls.RollOutgoingHit(hit, random).MinTotal;
 
-            Assert.Equal(100, Dealt(GamblerModifiers.From(Get())));
-            Assert.Equal(200, Dealt(GamblerModifiers.From(Get((Stat.ChanceToDealDoubleDamagePct, 100)))));
-            Assert.Equal(300, Dealt(GamblerModifiers.From(
+            Assert.Equal(100, Dealt(HitRollModifiers.From(Get())));
+            Assert.Equal(200, Dealt(HitRollModifiers.From(Get((Stat.ChanceToDealDoubleDamagePct, 100)))));
+            Assert.Equal(300, Dealt(HitRollModifiers.From(
                 Get((Stat.ChanceToDealDoubleDamagePct, 100), (Stat.BaseChanceToDealTripleDamagePct, 100)))));
-            var spells = GamblerModifiers.From(Get((Stat.SpellChanceToDealDoubleDamagePct, 100)));
+            var spells = HitRollModifiers.From(Get((Stat.SpellChanceToDealDoubleDamagePct, 100)));
             Assert.Equal(100, Dealt(spells));
             Assert.Equal(100, Dealt(spells.ForSkill(Get(), spell: false)));
             Assert.Equal(200, Dealt(spells.ForSkill(Get(), spell: true)));
-            Assert.Equal(200, Dealt(GamblerModifiers.From(Get()).ForSkill(Get((Stat.ChanceToDealDoubleDamagePct, 100)), spell: false)));
+            Assert.Equal(200, Dealt(HitRollModifiers.From(Get()).ForSkill(Get((Stat.ChanceToDealDoubleDamagePct, 100)), spell: false)));
+
+            double AlreadyRolled(HitRollModifiers policy) => policy.ApplyDamageMultiplier(hit, random).MinTotal;
+            Assert.Equal(100, AlreadyRolled(new()));
+            Assert.Equal(200, AlreadyRolled(new(DoubleDamageChance: 100)));
+            Assert.Equal(300, AlreadyRolled(new(DoubleDamageChance: 100, TripleDamageChance: 100)));
+
+            long criticalOnly = HitRollModifiers.CriticalDoubleDamageOf(
+                With((Stat.CriticalStrikePctChanceToDealDoubleDamage, 60)),
+                With((Stat.CriticalStrikePctChanceToDealDoubleDamage, 40)));
+            double AfterCritical(HitRollModifiers policy, bool critical) =>
+                policy.CompleteCriticalMultiplier(policy.RollBeforeCritical(hit, random, criticalOnly),
+                    random, critical, criticalOnly).MinTotal;
+            Assert.Equal(100, AfterCritical(new(), critical: false));
+            Assert.Equal(200, AfterCritical(new(), critical: true));
+            Assert.Equal(200, AfterCritical(new(DoubleDamageChance: 100), critical: true));
+            Assert.Equal(300, AfterCritical(new(DoubleDamageChance: 100, TripleDamageChance: 100), critical: true));
 
             // Half triple and half double: a quarter of the hits are doubled, not half.
-            var both = GamblerModifiers.From(Get((Stat.ChanceToDealDoubleDamagePct, 50), (Stat.BaseChanceToDealTripleDamagePct, 50)));
+            var both = HitRollModifiers.From(Get((Stat.ChanceToDealDoubleDamagePct, 50), (Stat.BaseChanceToDealTripleDamagePct, 50)));
             var counts = Enumerable.Range(0, 20000).Select(_ => Dealt(both)).GroupBy(d => d).ToDictionary(g => g.Key, g => g.Count());
             Assert.InRange(counts[300], 9600, 10400);
             Assert.InRange(counts[200], 4700, 5300);
@@ -144,16 +160,16 @@ public sealed class SupportHitDamageTests
         }
 
         // Point Blank ramps from 30% more near to 30% less far.
-        Assert.Equal(1.3, AntiquarianEffects.PointBlank(0));
-        Assert.Equal(1.3, AntiquarianEffects.PointBlank(10));
-        Assert.Equal(1.15, AntiquarianEffects.PointBlank(22.5), 9);
-        Assert.Equal(1, AntiquarianEffects.PointBlank(35), 9);
-        Assert.Equal(.85, AntiquarianEffects.PointBlank(77.5), 9);
-        Assert.Equal(.7, AntiquarianEffects.PointBlank(120));
-        Assert.Equal(.7, AntiquarianEffects.PointBlank(150));
+        Assert.Equal(1.3, WardBreakEffects.PointBlank(0));
+        Assert.Equal(1.3, WardBreakEffects.PointBlank(10));
+        Assert.Equal(1.15, WardBreakEffects.PointBlank(22.5), 9);
+        Assert.Equal(1, WardBreakEffects.PointBlank(35), 9);
+        Assert.Equal(.85, WardBreakEffects.PointBlank(77.5), 9);
+        Assert.Equal(.7, WardBreakEffects.PointBlank(120));
+        Assert.Equal(.7, WardBreakEffects.PointBlank(150));
         // With Far Shot too, the two multiply: 1.3 × 0.8 at the muzzle, 0.7 × 1.6 at full range.
-        Assert.Equal(1.04, AntiquarianEffects.PointBlank(5) * AntiquarianEffects.FarShot(5), 9);
-        Assert.Equal(1.12, AntiquarianEffects.PointBlank(150) * AntiquarianEffects.FarShot(150), 9);
+        Assert.Equal(1.04, WardBreakEffects.PointBlank(5) * WardBreakEffects.FarShot(5), 9);
+        Assert.Equal(1.12, WardBreakEffects.PointBlank(150) * WardBreakEffects.FarShot(150), 9);
 
         // Impact, Close Combat and Shield Crush: "up to X% more Melee Damage, based on proximity", whole up to 15 units,
         // linear to none at 40 (PoB MeleeProximity), each its own multiplier.
@@ -198,15 +214,15 @@ public sealed class SupportHitDamageTests
             Assert.Equal(1, Use(3, Plain));
             Assert.False(counts.ContainsKey(3));
         }
-        // Trap and mine throwing: 0.6 s and 0.3 s over the summed throwing speed and each support's more.
-        Assert.Equal(.6, Game.PlacedThrowSeconds(Get(), mine: false), 9);
-        Assert.Equal(.5, Game.PlacedThrowSeconds(Get((Stat.TrapThrowingSpeedPlusPct, 19), (Stat.TrapAndMineThrowingSpeedPlusPct, 1)), mine: false), 9);
-        Assert.Equal(.6 / (1.2 * .9), Game.PlacedThrowSeconds(Get((Stat.TrapThrowingSpeedPlusPct, 20),
+        // Trap and mine throwing: 0.5 s and 0.3 s over the summed throwing speed and each support's more.
+        Assert.Equal(.5, Game.PlacedThrowSeconds(Get(), mine: false), 9);
+        Assert.Equal(.5 / 1.2, Game.PlacedThrowSeconds(Get((Stat.TrapThrowingSpeedPlusPct, 19), (Stat.TrapAndMineThrowingSpeedPlusPct, 1)), mine: false), 9);
+        Assert.Equal(.5 / (1.2 * .9), Game.PlacedThrowSeconds(Get((Stat.TrapThrowingSpeedPlusPct, 20),
             (Stat.SupportTrapAndMineDamageTrapThrowingSpeedPlusPctFinal, -10)), mine: false), 9);
         Assert.Equal(.3 / (1.5 * .45), Game.PlacedThrowSeconds(Get((Stat.MineLayingSpeedPlusPct, 50),
             (Stat.SupportMinefieldMineThrowingSpeedPlusPctFinal, -55)), mine: true), 9);
         Assert.Equal(15, Game.TrapTriggerRadius(Get((Stat.TrapTriggerRadiusPlusPct, 50))), 9);
-        Assert.Equal(.6 / 1.5, Game.PlacedThrowSeconds(Get((Stat.TrapThrowingSpeedPlusPct, 20),
+        Assert.Equal(.5 / 1.5, Game.PlacedThrowSeconds(Get((Stat.TrapThrowingSpeedPlusPct, 20),
             (Stat.TrapThrowingSpeedPlusPctPerFrenzyCharge, 10)), mine: false, frenzyCharges: 3), 9);
         // Swift Assembly's three chances are rolled separately and their extra throws add up.
         static uint Swift(int extra) => extra switch
@@ -243,6 +259,8 @@ public sealed class SupportHitDamageTests
         Assert.Equal((120, 100), Game.PlacedProjectileAim((100, 100), (90, 100), [(300, 100)]));
         Assert.Equal((100, 80), Game.PlacedProjectileAim((100, 100), (100, 130), []));
         Assert.Equal((120, 100), Game.PlacedProjectileAim((100, 100), (100, 100), []));
+        // With a random source and no enemy it fires any way, 20 cells out.
+        Assert.InRange(Game.Dist(Game.PlacedProjectileAim((100, 100), (90, 100), [(300, 100)], new Random(3)), (100, 100)), 19, 21);
         // The trap, mine and totem supports' own more/less damage multiplies the supported hit (level 1 values).
         foreach (var (stat, value) in new[] { (Stat.SupportTrapDamagePlusPctFinal, -20),
             (Stat.SupportTrapAndMineDamagePlusPctFinal, 30), (Stat.SupportClustertrapDamagePlusPctFinal, -61),

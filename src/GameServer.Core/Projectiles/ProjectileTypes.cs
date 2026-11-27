@@ -21,7 +21,11 @@ public sealed record ProjectileActor(ProjectileActorKey Key, int Team, Func<long
     /// −1 is no footprint, which the client never contacts.</summary>
     public int Size { get; init; }
 }
-public readonly record struct TerrainContact(double Fraction, ProjectileVector Normal);
+public readonly record struct TerrainContact(double Fraction, ProjectileVector Normal)
+{
+    // Grid-step movement rejects the attempted cell and leaves the projectile on its previous cell.
+    public ProjectileVector? StopPosition { get; init; }
+}
 public enum ProjectileHitResult { Miss, Blocked, Hit }
 public enum ProjectileHitScope { Emission, Projectile }
 public enum ProjectileRepeat { Once, Interval, Window }
@@ -33,6 +37,20 @@ public sealed record ProjectileAreaRecipe(string Stage, double Radius, int Count
     double Multiplier = 1, ProjectileHitScope Scope = ProjectileHitScope.Projectile)
 {
     public bool ExcludeContactTarget { get; init; }
+    /// <summary>A contact area that needs a successful enemy hit and never triggers on terrain.</summary>
+    public bool RequiresEnemyHit { get; init; }
+    /// <summary>Radius sampled with the number of completed ground bounces at the impact.</summary>
+    public Func<int, double>? RadiusForGroundBounce { get; init; }
+    /// <summary>Radius sampled with the projectile's total travelled distance in cells at the impact.</summary>
+    public Func<double, double>? RadiusForTravel { get; init; }
+    /// <summary>Angular limit from the cone axis. Zero keeps radial coverage.</summary>
+    public double ConeHalfAngle { get; init; }
+    public double ConeAxisRotation { get; init; }
+    public double ConeAxisStep { get; init; }
+    /// <summary>Start at the actor's centre on enemy contacts, or at the impact point on terrain.</summary>
+    public bool CentreOnContactTarget { get; init; }
+    /// <summary>The terminal impact supplies the direct victim's damage profile.</summary>
+    public bool ReplacesDirectContact { get; init; } = true;
     /// <summary>Lower placement radius; offset is the upper radius.</summary>
     public double MinimumOffset { get; init; }
     /// <summary>Place one independently sampled centre in each angular sector.</summary>
@@ -52,16 +70,39 @@ public sealed record ProjectileAreaRecipe(string Stage, double Radius, int Count
     /// overdue time without catching up (the client's cluster timer).</summary>
     public bool UpdateTimer { get; init; }
 }
-public sealed record ProjectilePulseRecipe(string Stage, double Radius, long Interval);
+public sealed record ProjectilePulseRecipe(string Stage, double Radius, long Interval)
+{
+    /// <summary>Whether each selected hit uses area damage modifiers.</summary>
+    public bool AreaDamage { get; init; } = true;
+    public ProjectileHitRule? HitRule { get; init; }
+}
+public sealed record ProjectileSteeringRecipe(long TargetInterval, long TurnInterval, double MaximumTurn,
+    Func<ProjectileEntity, long, ProjectileVector?> Direction);
 public sealed record ProjectileEmissionRecipe(ProjectileProfile Child, bool Radial = false, long Interval = 0,
     bool RandomDirections = false, Func<ProjectileEntity, ProjectileVector>? BaseDirection = null)
 {
     /// <summary>Wait this long after the parent's end before emitting (Arrow Nova's rain delay).</summary>
     public long Delay { get; init; }
+    /// <summary>Adapts the parent's release data once for each group of child projectiles.</summary>
+    public Func<object?, object?>? ChildPayload { get; init; }
+    public bool ExcludeImpactTarget { get; init; }
+    /// <summary>Stop a travel recipe after this many emitted groups. Null keeps emitting until the flight ends.</summary>
+    public int? TravelGroups { get; init; }
+    /// <summary>Emit children on continuing enemy contacts (chain, fork, split, pierce) as well as terminal stops.</summary>
+    public bool EmitOnContinueContact { get; init; }
+    public IReadOnlySet<ProjectileEndReason>? EndReasons { get; init; }
+    /// <summary>Optional individually timed groups emitted after the parent stops.</summary>
+    public IReadOnlyList<(long Delay, int Count)>? Waves { get; init; }
 }
 public sealed record ProjectileFormRecipe(double Distance, double SpeedMultiplier, int Pierce,
     double DamageMultiplier = 1);
-public sealed record ProjectileSplitFormRecipe(double SpeedMultiplier, int Pierce);
+public sealed record ProjectileSplitFormRecipe(double SpeedMultiplier, int Pierce)
+{
+    public string? Metadata { get; init; }
+    public bool PreservePierce { get; init; }
+    public int? ContactCells { get; init; }
+    public ProjectileAreaRecipe? EndArea { get; init; }
+}
 public sealed record ProjectileTargetedRecipe(string Stage, int Count, double Radius);
 
 /// <summary>The client's volley (0x141bb3e30 with 0x141bb39b0's stats). A nova (0x141bbbf90) puts projectile i at
@@ -97,13 +138,39 @@ public sealed record ProjectileNativeVolley
     }
 }
 
+/// <summary>Initial launch points on either side of the emitter, measured in cells.</summary>
+public sealed record ProjectileParallelOrigins(int PointsPerSide, double Lateral, double Forward)
+{
+    internal (int Point, int Index, int Count)[] Distribution(int count)
+    {
+        int points = Math.Clamp(PointsPerSide, 0, count);
+        int each = count / (2 * points + 1), extras = count % (2 * points + 1);
+        var layout = new (int Point, int Index, int Count)[count];
+        int next = 0;
+        void Add(int point, int group)
+        {
+            for (int i = 0; i < group; i++) layout[next++] = (point, i, group);
+        }
+        Add(0, each + extras % 2);
+        for (int k = 1; k <= points && next < count; k++)
+        {
+            int group = each + (k <= extras / 2 ? 1 : 0);
+            Add(k, group);
+            Add(-k, group);
+        }
+        return layout;
+    }
+}
+
 /// <summary>A self-steering flight (Spark's wander): the host's source picks every leg, as the client does for the
 /// projectiles it draws itself, so the server's flight is the one on screen.</summary>
 public interface IProjectileLegs
 {
-    /// <summary>Seconds this flight lives, decided before its first leg.</summary>
+    /// <summary>Seconds this flight can live, read when the first leg is ready.</summary>
     double Lifetime { get; }
     ProjectileLeg First(ProjectileVector from, ProjectileVector aim);
+    /// <summary>Use the launch speed selected for this projectile when the path needs it.</summary>
+    ProjectileLeg First(ProjectileVector from, ProjectileVector aim, double launchSpeed) => First(from, aim);
     /// <summary>The leg after the last one ended (<paramref name="blocked"/> false) or terrain stopped it.</summary>
     ProjectileLeg Next(ProjectileVector from, bool blocked);
     /// <summary>Whether an enemy hit triggers the next leg before Pierce/Fork/Chain/Return.</summary>
@@ -119,6 +186,9 @@ public readonly record struct ProjectileLeg(ProjectileVector Target, double Spee
 public readonly record struct ProjectileLegTurn(ProjectileLeg Leg, ProjectileProfile? SecondaryProfile = null,
     ProjectileVector SecondaryDirection = default);
 
+/// <summary>Terrain clearance and launch height for flights that move in discrete grid steps at a fixed height.</summary>
+public readonly record struct ProjectileTerrainSteps(int Clearance, int LaunchHeight);
+
 /// <summary>Resolved stage parameters. Counts and restrictions are resolved before a use is released.</summary>
 public sealed record ProjectileProfile(string Id)
 {
@@ -130,6 +200,7 @@ public sealed record ProjectileProfile(string Id)
     public bool RandomSpread { get; init; }
     /// <summary>The client's own volley, for projectiles the client draws itself. Overrides <see cref="SpreadRadians"/>.</summary>
     public ProjectileNativeVolley? NativeVolley { get; init; }
+    public ProjectileParallelOrigins? ParallelOrigins { get; init; }
     /// <summary>Zero keeps a fixed fan; positive values widen it as aim approaches the emitter.
     /// The host adopts/calibrates the reference distance, independently of projectile count.</summary>
     public double AimSpreadDistance { get; init; }
@@ -143,18 +214,25 @@ public sealed record ProjectileProfile(string Id)
     /// max(CollisionRadius, CollisionCandidateRadius). Set, a flight cell contacts an actor whose Chebyshev cell distance
     /// is at most this plus the actor's <see cref="ProjectileActor.Size"/>, and <see cref="Radius"/> is not used for actors.</summary>
     public int? ContactCells { get; init; }
+    public ProjectileTerrainSteps? TerrainSteps { get; init; }
+    /// <summary>Symmetric speed variation sampled for each initial launch with no explicit speed.</summary>
+    public int SpeedVariationPercent { get; init; }
     public long Lifetime { get; init; } = 1200000;
     public long SequentialDelay { get; init; }
     public bool ShareSequentialHits { get; init; }
     public bool DirectDamage { get; init; } = true;
     public int Pierce { get; init; }
     public int Fork { get; init; }
+    public double ForkAngleRadians { get; init; } = Math.PI / 6;
+    public bool PierceAllAfterFork { get; init; }
     /// <summary>"X% chance for an additional Projectile when Forking" (Greater Fork): the extra child flies straight
     /// ahead between the fork's two.</summary>
     public int ForkExtraProjectileChancePercent { get; init; }
     public int Chain { get; init; }
     public int Split { get; init; }
     public double ChainRange { get; init; } = 60;
+    /// <summary>When provided, keeps split targeting independent of modifiers to chain range.</summary>
+    public double? SplitRange { get; init; }
     public bool Returns { get; init; }
     public int ReturnChancePercent { get; init; }
     /// <summary>The host's 0–99 return roll of each initial projectile, for projectiles the client rolls itself; null
@@ -180,6 +258,7 @@ public sealed record ProjectileProfile(string Id)
     public bool CannotChain { get; init; }
     public bool CannotSplit { get; init; }
     public bool CannotReturn { get; init; }
+    public bool StopOnEnemy { get; init; }
     public int TerrainBounces { get; init; }
     /// <summary>Chance (0-100) that a terrain collision redirects the projectile to a nearby enemy instead of ending,
     /// from "Projectiles have X% chance to be able to Chain when colliding with terrain"; one terrain chain per
@@ -188,30 +267,42 @@ public sealed record ProjectileProfile(string Id)
     public ProjectileHitRule HitRule { get; init; } = new();
     /// <summary>Optional direct-hit admission during return. Null inherits HitRule.</summary>
     public ProjectileHitRule? ReturnHitRule { get; init; }
+    public ProjectileAreaRecipe? LaunchArea { get; init; }
     public ProjectileAreaRecipe? EndArea { get; init; }
     public IReadOnlySet<ProjectileEndReason>? EndAreaReasons { get; init; }
     /// <summary>Emit an allowed end area before a successful return turnaround; end emissions stay deferred.</summary>
     public bool EndAreaOnReturnTurnaround { get; init; }
     public ProjectileAreaRecipe? ContactArea { get; init; }
+    /// <summary>The contact area supplies the direct victim's damage profile.</summary>
+    public bool ContactAreaReplacesDirectContact { get; init; }
     public bool ContactAreaOnReturn { get; init; } = true;
     /// <summary>Suppress outbound terminal areas after actor contacts, including terrain contact areas.</summary>
     public bool TerminalAreaRequiresNoContact { get; init; }
     public ProjectileEmissionRecipe? EndEmission { get; init; }
     public ProjectileEmissionRecipe? TravelEmission { get; init; }
     public ProjectilePulseRecipe? Pulse { get; init; }
+    public ProjectileSteeringRecipe? Steering { get; init; }
+    /// <summary>Linear increase to the contact multiplier over this flight's lifetime, as a percentage.</summary>
+    public int LifetimeDamageGainPercent { get; init; }
     public bool Lobbed { get; init; }
+    /// <summary>A lobbed flight may resolve an enemy impact before its intended landing.</summary>
+    public bool LobbedEnemyContacts { get; init; }
     /// <summary>A lobbed arc's apex in Positioned marker steps above the straight start-to-end line; the client's
     /// mortar template is 40. Arrow Nova's payload is fired high into the air, so it uses a much larger apex.</summary>
     public double ArcHeight { get; init; } = 40;
     public int GroundChains { get; init; }
     public double GroundBounceDistance { get; init; } = 20;
+    public bool RandomGroundBounceDirection { get; init; }
     /// <summary>Reuse each projectile's resolved <see cref="Range"/> for ground-chain bounces instead of
     /// <see cref="GroundBounceDistance"/>.</summary>
     public bool GroundBounceKeepsRange { get; init; }
     public ProjectileCountConsumer CountConsumer { get; init; }
     public ProjectileFormRecipe? FormChange { get; init; }
     public ProjectileSplitFormRecipe? SplitForm { get; init; }
+    /// <summary>End the initial flight at its aim when within range. Split and fork children get their own range.</summary>
+    public bool EndsAtAim { get; init; }
     public bool SplitOnTerrain { get; init; }
+    public bool SplitAtEndOfRange { get; init; }
     /// <summary>Fill this skill's split count even when there are fewer available target actors.</summary>
     public bool SplitWithoutTargets { get; init; }
     public ProjectileTargetedRecipe? ContactTargets { get; init; }
@@ -235,12 +326,24 @@ public sealed record ProjectileUse(ProjectileProfile Profile, ProjectileActorKey
 {
     public Func<bool>? CanEmit { get; init; }
     public ProjectileActorKey? ReturnAnchor { get; init; }
+    /// <summary>A fixed return location that stays valid after the emitting object is removed.</summary>
+    public ProjectileVector? ReturnPoint { get; init; }
+    public ProjectileVector? ReturnPosition(IProjectileWorld world, long at) => ReturnPoint
+        ?? (ReturnAnchor is { } key ? world.Actor(key, at)?.Position(at) : null);
+    /// <summary>Extra split children granted by the current direct-hit recipient.</summary>
+    public Func<ProjectileActorKey, long, int>? TargetSplit { get; init; }
+    /// <summary>The current recipient grants a pierce without using a point of the projectile's own pierce budget.</summary>
+    public Func<ProjectileActorKey, bool>? TargetPierce { get; init; }
     public object? Payload { get; init; }
     /// <summary>Optional initial-projectile snapshots; continuation children inherit their parent's selected payload.</summary>
     public IReadOnlyList<object?>? ProjectilePayloads { get; init; }
     /// <summary>Optional per-projectile destinations. Each initial flight ends at its destination; children retain
     /// their own continuation geometry. Used when the native action scatters target cells instead of directions.</summary>
     public IReadOnlyList<ProjectileVector>? ProjectileTargets { get; init; }
+    /// <summary>Optional aim chosen at each initial emission. The selected direction keeps the projectile's flight range.</summary>
+    public Func<ProjectileVector, ProjectileVector?>? InitialAim { get; init; }
+    /// <summary>Offset each initial projectile from the origin along its own launch direction.</summary>
+    public double RadialLaunchOffset { get; init; }
     /// <summary>Optional per-projectile speeds in cells per second. Each initial flight uses its entry instead of
     /// <see cref="ProjectileProfile.Speed"/>.</summary>
     public IReadOnlyList<double>? ProjectileSpeeds { get; init; }
@@ -289,8 +392,12 @@ public sealed class ProjectileEntity
     public double Speed { get; internal set; }
     public int Form { get; internal set; }
     public int GroundBounces { get; internal set; }
+    public int ChainsRemaining => Chain;
+    public int CompletedChains { get; internal set; }
+    public int EnemiesPierced { get; internal set; }
     public double DamageMultiplier { get; internal set; } = 1;
     internal int Pierce, Fork, Chain, Split, TerrainBounces;
+    internal bool HasSplit;
     internal int TerrainChainChance;
     internal int GroundChains;
     internal int ReturnContacts = 0;
@@ -299,6 +406,7 @@ public sealed class ProjectileEntity
     internal long ChildEmission;
     internal int EmissionNumber;
     internal IProjectileLegs? Legs;
+    public (ProjectileVector Start, ProjectileVector Target)? TerrainLeg { get; internal set; }
     internal ProjectileVector LegStart;
     internal bool LegLeashed;
     /// <summary>A legged flight stopped by terrain picks its next leg at once but moves from the next tick, as the
@@ -315,6 +423,12 @@ public sealed class ProjectileEntity
     internal long ContactEpoch = -1, ContactAt, ContactEnd;
     internal int ContactIndex = -1;
     internal ProjectileVector ContactFrom, ContactTo;
+    // Clear straight terrain segment already traced in this terrainEpoch (no wall between TerrainOrigin and
+    // TerrainOrigin + TerrainDirection * TerrainClearLength).
+    internal long TerrainEpoch = -1;
+    internal int TerrainPhase;
+    internal ProjectileVector TerrainOrigin, TerrainDirection;
+    internal double TerrainClearLength;
 
     // Freeze trigger-time flight state while sharing the use's chronological combat RNG streams.
     internal ProjectileEntity AreaSnapshot() => (ProjectileEntity)MemberwiseClone();
@@ -329,13 +443,19 @@ public sealed record ProjectileDamage(ProjectileEntity Projectile, ProjectileAct
 }
 
 public sealed record ProjectileEvent(ProjectileEventKind Kind, ProjectileEntity Projectile, long At,
-    ProjectileVector Position, ProjectileEndReason? Reason = null, double Radius = 0, string? Stage = null);
+    ProjectileVector Position, ProjectileEndReason? Reason = null, double Radius = 0, string? Stage = null)
+{
+    /// <summary>The enemy damaged by the final contact, when the projectile did not continue or return.</summary>
+    public ProjectileActorKey? HitTarget { get; init; }
+}
 
 /// <summary>All methods run synchronously under the host's combat lock. Hit commits gameplay before returning.
 /// Publish records presentation intents; it must not perform network IO or delay simulation.</summary>
 public interface IProjectileWorld
 {
     IReadOnlyList<ProjectileActor> Actors(long from, long until);
+    /// <summary>Looks up a single actor by key (e.g. a returning projectile's anchor) without scanning the area.</summary>
+    ProjectileActor? Actor(ProjectileActorKey key, long at) => Actors(at, at).FirstOrDefault(a => a.Key == key);
     /// <summary>Actors that may come within <paramref name="radius"/> of <paramref name="centre"/> at <paramref name="at"/>.
     /// A host with a spatial grid overrides this so area explosions avoid scanning every actor in the instance.</summary>
     IReadOnlyList<ProjectileActor> ActorsNear(ProjectileVector centre, double radius, long at) => Actors(at, at);

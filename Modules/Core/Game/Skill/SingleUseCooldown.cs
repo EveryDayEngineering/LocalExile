@@ -7,15 +7,24 @@ public sealed record CooldownUseTicket(int Effect, int ActionToken, int Projecti
 {
     bool consumed;
     public IReadOnlyList<(SingleUseCooldownState State, int Version, ushort Skill)> SharedUses { get; init; } = [];
+    // True when an instant cooldown reset/prevention roll (0x50cd/0x52e2) kept the use unspent and needs a
+    // PlayerSingleUseCooldowns sync after action acknowledgement to clear client cooldown prediction.
+    public bool CooldownReset { get; init; }
+    public int ResetBaseMilliseconds { get; init; }
     // The cost paid when the use was accepted (mana, life), as the client pays it at the start of the use; null when the
     // admission paid nothing and the cast pays when its effect starts.
     public (uint Mana, uint Life)? Paid { get; init; }
+    internal int? TotemPlacements { get; init; }
+    internal int FrozenLegionUses { get; init; }
     /// <summary>The attack window reserved with this use, before movement or the native action echo.</summary>
     public (ushort Skill, double At, double Seconds)? Attack { get; init; }
-    public bool Current(Player player)
+    internal int? EnduranceChargesAfterCost { get; set; }
+    /// <param name="ignoreAction">A totem placement outlives the player's next action (the client's own Move taken
+    /// inside its hold): the use stays current without the action token, every other check still applies.</param>
+    public bool Current(Player player, bool ignoreAction = false)
     {
         return player.ProjectileActive(ProjectileEpoch) && player.PlayerLife > 0
-            && (Instant || player.ActionCount == ActionToken && player.ElementalAilments.ActionFactor(Game.AreaTime(player)) > 0 && !player.HitRecovery.Active(Game.AreaTime(player)))
+            && (Instant || (ignoreAction || player.ActionCount == ActionToken) && player.ElementalAilments.ActionFactor(Game.AreaTime(player)) > 0 && !player.HitRecovery.Active(Game.AreaTime(player)))
             && (State is null || !Reserved || State.Uses > 1 || State.UseVersion == UseVersion)
             && (Stance is null || Stance.CurrentLocked(player));
     }
@@ -24,7 +33,10 @@ public sealed record CooldownUseTicket(int Effect, int ActionToken, int Projecti
         if (!Current(player)) return false;
         if (Reserved)
         {
-            State?.ConfirmNativeUse(UseVersion, skillId, synchronizeProgress: Instant && !player.Connection.LockstepClient);
+            if (CooldownReset)
+                State?.SynchronizeNativeReset(skillId, ResetBaseMilliseconds);
+            else
+                State?.ConfirmNativeUse(UseVersion, skillId, synchronizeProgress: Instant && !player.Connection.LockstepClient);
             foreach (var (state, version, skill) in SharedUses)
                 state.ConfirmNativeUse(version, skill, synchronizeProgress: true);
         }

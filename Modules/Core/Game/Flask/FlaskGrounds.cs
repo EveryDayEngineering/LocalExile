@@ -26,12 +26,13 @@ public static partial class Game
                 TauntLocked(player, at, radius, now, duration);
                 continue;
             }
-            int taken = kind == FlaskGrounds.Kind.ConsecratedGround ? ConsecratedEnemyDamageTakenNow(player) : 0;
-            player.FlaskGrounds.Add(new(kind, at.X, at.Y, radius, now + seconds,
-                QueueGroundArtLocked(player, kind, at, radius), taken));
+            var ground = kind == FlaskGrounds.Kind.ConsecratedGround
+                ? CreateOwnConsecratedGroundLocked(player, at, radius, now + seconds, playerStats)
+                : new(kind, at.X, at.Y, radius, now + seconds, QueueGroundArtLocked(player, kind, at, radius));
+            player.FlaskGrounds.Add(ground);
             PresentNearby(player);
             Console.WriteLine($"[gateway] flask ground {kind} at ({at.X}, {at.Y}) radius {radius} for {seconds:0.##} s" +
-                (taken > 0 ? $", enemies on it take {taken}% increased damage" : ""));
+                (ground.EnemyDamageTakenPct > 0 ? $", enemies on it take {ground.EnemyDamageTakenPct}% increased damage" : ""));
         }
     }
 
@@ -39,6 +40,26 @@ public static partial class Game
     /// (the running flask effects' strongest).</summary>
     static int ConsecratedEnemyDamageTakenNow(Player player) =>
         UtilityFlaskStat(player, FlaskGrounds.EnemyDamageTakenStat);
+
+    // The modifier belongs to this ground's creator and is captured once at creation.
+    static FlaskGrounds.Ground CreateOwnConsecratedGroundLocked(Player player, (int X, int Y) at, int radius,
+        double ends, IReadOnlyDictionary<uint, int> playerStats)
+    {
+        if (playerStats.GetValueOrDefault(Stat.GainArcaneSurgeFor4SecondsWhenYouCreateConsecratedGroundWhileAffectedByZealotry) != 0)
+            GainArcaneSurgeLocked(player, AreaTime(player));
+        int enemyTaken = ActorScale.Saturate((long)ConsecratedEnemyDamageTakenNow(player)
+            + playerStats.GetValueOrDefault(Stat.ConsecratedGroundEnemyDamageTakenPlusPctWhileAffectedByZealotry));
+        // A flask may have waited for payment since capturing its use stats. Resolve the jewel at ground creation.
+        int lingerMs = AffectingAuras(player).Any(aura => aura.EffectId == "Zealotry")
+            ? StatSourceValues(player).GetValueOrDefault(
+                Stat.ConsecratedGroundEffectLingersForMsAfterLeavingTheAreaWhileAffectedByZealotry)
+            : 0;
+        return new(FlaskGrounds.Kind.ConsecratedGround, at.X, at.Y, radius, ends,
+            QueueGroundArtLocked(player, FlaskGrounds.Kind.ConsecratedGround, at, radius), enemyTaken)
+        {
+            AdditionalLingerMs = lingerMs,
+        };
+    }
 
     /// <summary>The strongest value of a stat the running utility flasks grant (their "during effect" mods).</summary>
     public static int UtilityFlaskStat(Player player, uint stat) =>
@@ -91,10 +112,74 @@ public static partial class Game
     static bool InFlaskGround(Player player, FlaskGrounds.Kind kind, uint id) =>
         player.FlaskGrounds.Grounds.Any(g => g.Kind == kind && InZone(player, player.Id, FlaskGroundZones, g.Id, id));
 
+    // Bottled Faith checks the target's ground independently of who created it.
+    static bool EnemyOnConsecratedGround(Player player, uint id)
+    {
+        if (!player.Area.Monsters.ContainsKey(id)) return false;
+        foreach (var owner in AreaPlayers(player))
+        {
+            if (owner.Closed || owner.LeavingArea || !owner.FlaskGrounds.Any) continue;
+            double now = AreaTime(owner);
+            foreach (var ground in owner.FlaskGrounds.Grounds)
+                if (ground.Kind == FlaskGrounds.Kind.ConsecratedGround && now < ground.Ends
+                    && (ground.SourceAlive?.Invoke(now) ?? true) && InZone(owner, owner.Id, FlaskGroundZones, ground.Id, id))
+                    return true;
+        }
+        return false;
+    }
+
     // The increased damage taken a monster gets from the consecrated grounds covering it: the strongest one.
     static int ConsecratedEnemyDamageTaken(Player player, uint id) => player.FlaskGrounds.Grounds
         .Where(g => g is { Kind: FlaskGrounds.Kind.ConsecratedGround, EnemyDamageTakenPct: > 0 } && InZone(player, player.Id, FlaskGroundZones, g.Id, id))
         .Select(g => g.EnemyDamageTakenPct).DefaultIfEmpty(0).Max();
+
+    internal static bool OnConsecratedGround(FlaskGrounds.State state, bool alive, IEnumerable<FlaskGrounds.Ground> covering, double now)
+    {
+        FlaskGrounds.Coverage coverage = default, curseCoverage = default;
+        foreach (var ground in covering)
+        {
+            if (ground.Kind != FlaskGrounds.Kind.ConsecratedGround) continue;
+            coverage = CoverWithGround(coverage, ground);
+            if (ground.GrantsCurseImmunity) curseCoverage = CoverWithGround(curseCoverage, ground);
+        }
+        return state.OnConsecrated(alive, now, coverage, curseCoverage, ResolveGroundLinger);
+    }
+
+    static FlaskGrounds.Coverage CoverWithGround(FlaskGrounds.Coverage coverage, FlaskGrounds.Ground ground)
+    {
+        if (ground.AdditionalLingerMs > 0 && (ground.AdditionalLingerMs > coverage.LingerMs
+            || ground.AdditionalLingerMs == coverage.LingerMs && ground.Ends > coverage.SourceEnds))
+            return new(true, ground.AdditionalLingerMs, ground.Ends);
+        return coverage with { Inside = true };
+    }
+
+    static FlaskGrounds.Coverage ResolveGroundLinger(FlaskGrounds.Coverage previous, FlaskGrounds.Coverage current, double now)
+    {
+        double? until = previous.LingersUntil;
+        // A naturally expired ground stopped covering the player at its deadline even if processed later.
+        if (current.LingerMs < previous.LingerMs)
+            until = Math.Max(until ?? double.NegativeInfinity, Math.Min(now, previous.SourceEnds) + previous.LingerMs / 1000.0);
+        return current with { LingersUntil = until };
+    }
+
+    static bool SetConsecratedGroundBuff(Player player, bool on)
+    {
+        if (player.FlaskGrounds.SetConsecrated(on, () => 1) is not { } change) return false;
+        if (change.Added) player.Area.Buffs.Set(player.Id, new(FlaskGrounds.ConsecratedBuffRow, player.Id));
+        else player.Area.Buffs.Clear(player.Id, FlaskGrounds.ConsecratedBuffRow, player.Id);
+        return true;
+    }
+
+    static void ClearConsecratedGroundOnResurrect(Player player)
+    {
+        var state = player.FlaskGrounds;
+        bool wasCurseImmune = state.CurseImmune;
+        state.OnConsecrated(alive: false, covered: false, now: AreaTime(player));
+        if (!SetConsecratedGroundBuff(player, on: false) && !wasCurseImmune) return;
+        Automation(player).StatRevision++;
+        MarkPlayerStats(player, PlayerStatStep.UtilityFlasks);
+        MarkPlayerStats(player, PlayerStatStep.SelfVulnerability);
+    }
 
     public static void AdvanceFlaskGrounds(Player player, PlayerUpdatesState updates)
     {
@@ -110,6 +195,7 @@ public static partial class Game
         foreach (uint gone in state.ProfaneMonsters().Except(player.Area.Monsters.Keys))
             state.SetProfane(gone, false, false, now, () => 0);
         SyncFlaskGroundZones(player);
+        bool chilledAny = false;
         foreach (var (id, monster) in player.Area.Monsters)
         {
             bool inside = monster.Hostile && !monster.Dead && monster.Life > 0 && monster.Mods.Effects[Stat.CannotBeBlinded] == 0
@@ -121,12 +207,22 @@ public static partial class Game
             }
             bool aliveMonster = monster.Hostile && !monster.Dead && monster.Life > 0;
             bool inProfane = aliveMonster && InFlaskGround(player, FlaskGrounds.Kind.ProfaneGround, id);
+            // Aquamarine Flask's chilled ground: the same chill Arctic Armour's trail applies
+            // (ReservationSkills): 0.3 s at the stated 10% action-speed slow, refreshed every 0.2 s while
+            // a monster remains in the ground.
+            if (aliveMonster && InFlaskGround(player, FlaskGrounds.Kind.ChilledGround, id))
+            {
+                chilledAny = true;
+                InflictedLocked(player, monster, monster.Ailments.WithoutDamage(MonsterElementalAilments.Kind.Chill,
+                    .3, now, _ => 0, n => monster.Mods.Effects[n], stated: 10));
+            }
             if (state.SetProfane(id, inProfane, aliveMonster, now, () => 1) is { } profane)
             {
                 if (profane.Added) player.Area.Buffs.Set(id, new(FlaskGrounds.ProfaneBuffRow, player.Id));
                 else player.Area.Buffs.Clear(id, FlaskGrounds.ProfaneBuffRow, player.Id);
             }
         }
+        if (chilledAny) PresentIn(player, .2);
         bool alive = player.PlayerLife > 0;
         var here = player.Walk.Position(now);
         var (stale, make) = state.Stationary(alive && !player.Walk.Moving(now) && !InTown(player), here);
@@ -134,24 +230,20 @@ public static partial class Game
             $"0x02bd remove effect 0x{old:x} (stationary consecrated ground)", WorldId: old, RemovesObject: true));
         if (make > 0)
         {
-            state.PlaceStationary(new(FlaskGrounds.Kind.ConsecratedGround, here.X, here.Y, make,
-                double.PositiveInfinity, QueueGroundArtLocked(player, FlaskGrounds.Kind.ConsecratedGround, here, make),
-                ConsecratedEnemyDamageTakenNow(player)));
+            state.PlaceStationary(CreateOwnConsecratedGroundLocked(player, here, make,
+                double.PositiveInfinity, StatSourceValues(player)));
             SyncFlaskGroundZones(player);
         }
         // A ground placed this step has its members from the next movement update; until then its cells decide.
-        bool covered = state.Grounds.Any(g => g.Kind == FlaskGrounds.Kind.ConsecratedGround
-            && (InZone(player, player.Id, FlaskGroundZones, g.Id, player.Id) || g.Covers(here)));
-        bool curseImmune = covered && state.Grounds.Any(g => g.GrantsCurseImmunity
+        var covering = state.Grounds.Where(g => g.Kind == FlaskGrounds.Kind.ConsecratedGround
             && (InZone(player, player.Id, FlaskGroundZones, g.Id, player.Id) || g.Covers(here)));
         bool wasCurseImmune = state.CurseImmune;
-        if (state.SetConsecrated(state.OnConsecrated(alive, covered, now, curseImmune), () => 1) is { } consecrated)
+        bool consecratedChanged = SetConsecratedGroundBuff(player, OnConsecratedGround(state, alive, covering, now));
+        if (consecratedChanged || wasCurseImmune != state.CurseImmune)
         {
-            if (consecrated.Added) player.Area.Buffs.Set(player.Id, new(FlaskGrounds.ConsecratedBuffRow, player.Id));
-            else player.Area.Buffs.Clear(player.Id, FlaskGrounds.ConsecratedBuffRow, player.Id);
             pending.StatRevision++;
+            if (HasMapHexes(MapModsOf(player))) RecomputePoolsAndSpeed(player);
         }
-        else if (wasCurseImmune != state.CurseImmune) pending.StatRevision++;
         state.StopTickerIfIdle();
     }
 

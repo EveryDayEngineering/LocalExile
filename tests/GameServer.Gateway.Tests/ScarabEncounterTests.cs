@@ -99,6 +99,7 @@ public sealed class ScarabEncounterTests
         var packNotes = new List<string>();
         var cloisterRequest = Assert.Single(MapScarabPacks.Requests(Open(5, cloister).Opening!.Mods));
         var ordinary = Game.Packs.For(area.Id)!;
+        var instancePacks = AreaPopulation.ForInstance(ordinary, 0x505);
         var extra = AreaPopulation.Plan(ordinary, generated.Width, generated.Height, layout.Walkable!,
             (layout.SpawnX, layout.SpawnY), [], [], 0x505, _ => true, packNotes, additionalPacks: [cloisterRequest]);
         var packIds = MapScarabPacks.Packs.Select(p => p.Id).ToHashSet();
@@ -112,7 +113,7 @@ public sealed class ScarabEncounterTests
             (layout.SpawnX, layout.SpawnY), [], [], 0x505, _ => true, [], additionalPacks: [cloisterRequest], ordinaryPacks: false);
         Assert.Contains(noOrdinary, s => packIds.Contains(s.Pack));
         Assert.DoesNotContain(noOrdinary, s => s.Rarity != GameServer.Core.Protocol.Instance.MonsterRarity.Unique
-            && ordinary.Scattered.Any(p => p.Pack.Id == s.Pack) && !packIds.Contains(s.Pack));
+            && instancePacks.Scattered.Any(p => p.Pack.Id == s.Pack) && !packIds.Contains(s.Pack));
         Assert.Same(kept, instance.AreaStats(() => throw new InvalidOperationException("recomposed the map")));
 
         TestEnvironment.OpenOwnSaves("scarab-shrines");
@@ -124,10 +125,12 @@ public sealed class ScarabEncounterTests
         ShrineRegistry.RegisterDefaults();
         await using var owner = await Wire.Open(instance, layout, seed);
         await using var peer = await Wire.Open(instance, layout, seed);
-        using var sources = GameEvents.PlayerStatSources.Add("scarab-regression", ShrineManager.AddStats);
+        var shrineLifetime = new ModuleLifetime("scarab-regression");
+        var shrineContext = new ShrineContext(shrineLifetime);
+        new ShrinesModule().Load(shrineContext);
         try
         {
-            await ShrineManager.SpawnArea(owner.Player);
+            await GameEvents.RunPlayerEntered(owner.Player);
             string[] Ids() => instance.ContentState.Where(p => p.Key.StartsWith("Shrines/id/"))
                 .Select(p => p.Value).Order().ToArray();
             var ids = Ids();
@@ -142,10 +145,13 @@ public sealed class ScarabEncounterTests
             Assert.True(instance.HasState(claimed));
             await ShrineManager.LeaveArea(owner.Player);
             await ShrineManager.LeaveArea(peer.Player);
-            await ShrineManager.SpawnArea(owner.Player);
+            // A retained area's AreaGenerated event does not run again. A new connection only gets PlayerEntered.
+            await GameEvents.RunPlayerEntered(owner.Player);
             Assert.Equal(ids, Ids());
             Assert.True(instance.HasState(claimed));
             Assert.Empty(ShrineManager.AddStats(owner.Player, []));
+            Assert.True(await ShrineManager.Use(owner.Player, new(id, 0, 3, 0), 0));
+            Assert.Empty(ShrineManager.AddStats(owner.Player, [])); // The spent shrine remains registered without regranting.
             var ambushSlot = Slot("ScarabStrongboxNew1");
             var ambushMods = catalog.Of([ambushSlot], Program.Items.Mods);
             Assert.Equal(4, ambushMods.Get(MapStrongboxes.CountStat));
@@ -167,12 +173,29 @@ public sealed class ScarabEncounterTests
             Assert.True(await MapStrongboxes.Use(boxOwner.Player, new(firstBox.Id, 0, 1, 0), 0));
             var active = Boxes()[0];
             Assert.Equal(1, active.Phase);
+            // The guards wait for the box's opening clip, a real-time wait tests never take: release the wave now.
+            Assert.Empty(active.Guards);
+            Assert.Contains(active.Waves, w => w.Spawns.Count > 0);
+            await MapStrongboxes.SpawnWavesNow(boxOwner.Player);
+            active = Boxes()[0];
             Assert.NotEmpty(active.Guards);
             Assert.Empty(active.Pending);
             int guardCount = boxOwner.Player.Area.Monsters.Count;
             Assert.True(await MapStrongboxes.Use(boxPeer.Player, new(firstBox.Id, 0, 1, 0), 0));
             Assert.Equal(guardCount, boxOwner.Player.Area.Monsters.Count);
-            foreach (uint guard in active.Guards) { boxOwner.Player.Area.Monsters[guard].Dead = true; boxOwner.Player.Area.Monsters[guard].Life = 0; }
+            // The items drop only once every guard is dead; the daemons run in real time, so the drop time is
+            // fast-forwarded instead. With the guards still alive, no drop happens.
+            Assert.True(active.DropAtTicks > 0);
+            await MapStrongboxes.DropNow(boxOwner.Player);
+            await MapStrongboxes.Tick(boxOwner.Player);
+            Assert.Equal(1, Boxes()[0].Phase);
+            Assert.Empty(boxInstance.Ground.All());
+            foreach (uint guard in Boxes()[0].Guards)
+            {
+                var guardMonster = boxOwner.Player.Area.Monsters[guard];
+                guardMonster.Dead = true;
+                guardMonster.Life = 0;
+            }
             await MapStrongboxes.Tick(boxOwner.Player);
             Assert.Equal(2, Boxes()[0].Phase);
             int rewardCount = boxInstance.Ground.All().Count();
@@ -202,12 +225,13 @@ public sealed class ScarabEncounterTests
             Assert.Equal(sealedMonoliths.Select(m => m.Id), Monoliths().Select(m => m.Id));
             var firstMonolith = sealedMonoliths[0];
             var naturalRare = extra.First(s => s.Rarity == GameServer.Core.Protocol.Instance.MonsterRarity.Rare
-                && ordinary.Scattered.Any(p => p.Pack.Id == s.Pack));
+                && instancePacks.Scattered.Any(p => p.Pack.Id == s.Pack));
             Assert.True(await MapEssences.Imprison(essenceOwner.Player, naturalRare));
             Assert.Equal(sealedMonoliths.Length + 1, Monoliths().Length);
             var converted = Monoliths()[^1];
             Assert.Equal(Game.Monsters.Find(naturalRare.Variety.ToString())!.Id, converted.Variety);
-            Assert.Empty(essenceOwner.Player.Area.Monsters);
+            // The encased previews are instance monsters too (NoRewards, invulnerable); only a released monster counts.
+            Assert.DoesNotContain(essenceOwner.Player.Area.Monsters, m => !m.Value.NoRewards);
             Assert.True(await MapEssences.Imprison(essencePeer.Player, naturalRare));
             Assert.Equal(sealedMonoliths.Length + 1, Monoliths().Length);
             Assert.False(await MapEssences.Imprison(essenceOwner.Player, naturalRare with { Rarity = GameServer.Core.Protocol.Instance.MonsterRarity.Unique }));
@@ -217,7 +241,8 @@ public sealed class ScarabEncounterTests
             {
                 Assert.True(await MapEssences.Use(essenceOwner.Player, new(firstMonolith.Id, 0, stage, 0), 0));
                 Assert.Equal(stage, Monoliths()[0].Stage);
-                Assert.Equal(stage == 4 ? 1 : 0, essenceOwner.Player.Area.Monsters.Count);
+                // The rare and its pack's magic monsters release together (the essence daemons are friendly casters).
+                Assert.Equal(stage == 4 ? 1 + firstMonolith.Minis.Count : 0, essenceOwner.Player.Area.Monsters.Count(m => m.Value.Hostile && !m.Value.NoRewards));
             }
             var released = Monoliths()[0];
             Assert.True(released.Monster > 0);
@@ -237,7 +262,7 @@ public sealed class ScarabEncounterTests
             MapEssences.Drops(duplicate);
             Assert.Empty(duplicate.Items);
             await MapEssences.Use(essencePeer.Player, new(firstMonolith.Id, 0, 5, 0), 0);
-            Assert.Single(essenceOwner.Player.Area.Monsters);
+            Assert.Equal(1 + released.Minis.Count, essenceOwner.Player.Area.Monsters.Count(m => m.Value.Hostile && !m.Value.NoRewards));
             MapEssences.Leave(essenceOwner.Player);
             await MapEssences.Enter(essenceOwner.Player);
             Assert.Equal((released.Id, released.Stage, released.Monster), (Monoliths()[0].Id, Monoliths()[0].Stage, Monoliths()[0].Monster));
@@ -277,6 +302,8 @@ public sealed class ScarabEncounterTests
         }
         finally
         {
+            GameEventOwners.Release("scarab-regression", GameEventOwners.ModuleRank);
+            shrineLifetime.Stop(ex => throw ex);
             await ShrineManager.LeaveArea(owner.Player);
             await ShrineManager.LeaveArea(peer.Player);
             PlayerInventories.Forget(owner.Player.Character.Name!);
@@ -314,15 +341,15 @@ public sealed class ScarabEncounterTests
         var evolving = Request("ScarabDomination3");
         MapScarabContent.Describe(evolving);
         ShrineMapAdmission.Check(evolving);
-        Assert.Contains("Shrines.Evolving", Assert.Single(evolving.UnhandledContent));
+        Assert.Empty(evolving.UnhandledContent);
         var numeric = Request("ScarabMapsNew1", "ScarabDivinationCardsNew2");
         MapScarabContent.Describe(numeric);
         Assert.Empty(numeric.UnhandledContent);
         var rejected = Request("ScarabDomination2");
         rejected.Opening = opening with { Mods = MapRunCatalog.Load("data").Of(rejected.Slots, Program.Items.Mods) };
         ShrineMapAdmission.Check(rejected);
-        Assert.Null(rejected.Opening);
-        Assert.Contains("not been consumed", rejected.Reason);
+        Assert.NotNull(rejected.Opening);
+        Assert.Contains("Shrines.Apparitions", rejected.HandledContent);
         var arcanist = Assert.IsType<StrongboxCatalog.Definition>(StrongboxCatalog.Find("Metadata/Chests/StrongBoxes/Arcanist"));
         Assert.Equal(81, StrongboxCatalog.Weight(arcanist, 70, false, MapMods.None));
         Assert.Equal(0, StrongboxCatalog.Weight(arcanist, 25, false, MapMods.None));
@@ -354,6 +381,17 @@ public sealed class ScarabEncounterTests
         MapScarabContent.Describe(terrors);
         MapScarabBosses.Opening(terrors);
         Assert.Empty(terrors.UnhandledContent);
+    }
+
+    sealed class ShrineContext(ModuleLifetime lifetime) : IModuleContext
+    {
+        public ModManifest Manifest => new(lifetime.Id, "0", ModKind.Feature, [], "shrines.dll");
+        public IModuleLifetime Lifetime => lifetime;
+        public string Folder => "";
+        public T Settings<T>() => System.Text.Json.JsonSerializer.Deserialize<T>("{}")!;
+        public void SaveSettings<T>(T settings) => throw new NotSupportedException();
+        public void ProvideLeagueRules(Func<LeagueRules> rules) { }
+        public void Log(string message) { }
     }
 
     internal sealed class Wire(TcpClient writer, TcpClient reader, Player player, Task drain) : IAsyncDisposable

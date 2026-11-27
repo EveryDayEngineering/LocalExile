@@ -616,7 +616,7 @@ public static partial class Game
                     changed.Add(done);
             }
             return changed.Count == 0 ? null : ([.. changed.Select(c => c.Id)], changed);
-        }, changed => $"0x00bf adjacent tincture flask charges: {string.Join(", ", changed.Select(c => $"{c.X}: {c.Item.Charges}"))}",
+        }, changed => $"0x00c6 adjacent tincture flask charges: {string.Join(", ", changed.Select(c => $"{c.X}: {c.Item.Charges}"))}",
             retainOutput: true);
     }
 
@@ -647,7 +647,8 @@ public static partial class Game
         {
             int witherStacks = Get("apply_X_wither_stacks_for_2_seconds_with_tinctured_weapons");
             if (witherStacks > 0)
-                ApplyWitherStacksLocked(target, witherStacks, WitherDurationSeconds(2.0, k => playerStats.GetValueOrDefault(k)), k => playerStats.GetValueOrDefault(k), now);
+                ApplyWitherStacksLocked(target, witherStacks, WitherDurationSeconds(2.0, k => playerStats.GetValueOrDefault(k)),
+                    k => playerStats.GetValueOrDefault(k), now, player.Id);
             int refreshChance = Get("refresh_ignite_duration_on_tinctured_weapon_hit_%_chance");
             if (refreshChance > 0 && target.Ignites.IgnitedAt(now) && RandomRolls.Chance(refreshChance, 100, random))
                 target.Ignites.Refresh(now);

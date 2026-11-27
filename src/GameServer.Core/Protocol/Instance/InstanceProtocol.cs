@@ -54,12 +54,17 @@ public static class InstanceProtocol
     /// (0x22 + 0x2bb) to exist already.
     /// </summary>
     /// <remarks>Flag bit 0 (+0x78) is the active weapon set: set = the second (Weapon2 / Offhand2). The handler copies it
-    /// to the session's +0xcd31 (the dispatcher's r13 is the session + 8, so its "[r13+0xcd29]"), as S→C 0xde does.</remarks>
-    public static byte[] EnterArea(IReadOnlyList<InstanceStash.Tab>? stash = null, bool secondWeaponSet = false, byte frameMs = 0)
+    /// to the session's +0xcd31 (the dispatcher's r13 is the session + 8, so its "[r13+0xcd29]"), as S→C 0xde does.
+    /// Flag bit 2 is "this is my own hideout" (→ session +0xcd36); without it the Decorations panel never leaves
+    /// "Loading…" (03-area-and-world.md §5).</remarks>
+    public static byte[] EnterArea(IReadOnlyList<InstanceStash.Tab>? stash = null, bool secondWeaponSet = false,
+        byte frameMs = 0, IReadOnlyList<InstanceStash.Tab>? tradeStash = null, bool ownHideout = false)
     {
         var w = new LoginWriter().U16(EnterAreaId);
         InstanceStash.WriteTabs(w, stash ?? []);
-        return w.U16(0).U16(0).WStr("").Bytes([(byte)(secondWeaponSet ? 0x01 : 0), 0, 0]).U8(frameMs).U8(0).ToArray();
+        InstanceStash.WriteTabs(w, tradeStash ?? []);
+        byte flags = (byte)((secondWeaponSet ? 0x01 : 0) | (ownHideout ? 0x04 : 0));
+        return w.U16(0).WStr("").Bytes([flags, 0, 0]).U8(frameMs).U8(0).ToArray();
     }
 
     /// <summary>C→S 0xdd (3 bytes, built by 0x14216faa0): swap the weapon set. u8: the set wanted (1 the second, 0 the
@@ -94,6 +99,12 @@ public static class InstanceProtocol
     public static byte[] WeaponSet(bool second) => new LoginWriter().U16(WeaponSetId).U8((byte)(second ? 1 : 0)).ToArray();
 
     public const ushort TickId = 0x1b, PongId = 0x1c, AreaGeneratedId = 0x7d;
+
+    /// <summary>C→S 0x7d (10 bytes, class 0x1435ca2c0, sent by tick 0x14214f1d0 when generation finishes): u32 BE
+    /// tile hash (<c>0x142054070</c>) and u32 BE doodad hash (<c>0x142048e20</c>) from world <c>+0x114</c>. Live
+    /// capture (1_1_town seed 1): <c>007D 43E6886D 8EA8DD43</c> (TileHash 1139181677, DoodadHash 2393431363).</summary>
+    public static (uint TileHash, uint DoodadHash) ReadAreaGenerated(ReadOnlySpan<byte> m) =>
+        (BinaryPrimitives.ReadUInt32BigEndian(m[2..]), BinaryPrimitives.ReadUInt32BigEndian(m[6..]));
 
     /// <summary>
     /// S→C 0x1c (class 0x1435e77a0, read 0x141fa7150; dispatcher case 5 → 0x14215c280): acknowledges the client's 0x1b
@@ -331,6 +342,58 @@ public static class InstanceProtocol
         return w.ToArray();
     }
 
+    public const ushort FreezeActionsId = 0x00bb, ActionLockoutId = 0x00bc, PlaySoundEffectId = 0x01c9;
+
+    /// <summary>
+    /// S→C 0x00bb <c>FreezeActions</c> (class <c>0x1435e6868</c>, reader <c>0x1421a9480</c>, dispatcher case 0x31
+    /// <c>0x142153e58..0x142153f1e</c>): 1-byte bitfield (bit 0 = frozen → world +0x110, bit 1 = notify).
+    /// </summary>
+    public static byte[] FreezeActions(bool frozen, bool notify = false) =>
+        new LoginWriter().U16(FreezeActionsId).U8((byte)((frozen ? 1 : 0) | (notify ? 2 : 0))).ToArray();
+
+    /// <summary>
+    /// S→C 0x00bc <c>ActionLockout</c> (class <c>0x1435e7380</c>, reader <c>0x1421a95d0</c>, dispatcher case 0x32
+    /// <c>0x142153f23..0x142153f7f</c>): u8 active; when non-zero, followed by u8 lockout duration in seconds.
+    /// </summary>
+    public static byte[] ActionLockout(bool active, byte durationSeconds = 0)
+    {
+        var w = new LoginWriter().U16(ActionLockoutId).U8(active ? (byte)1 : (byte)0);
+        if (active) w.U8(durationSeconds);
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// S→C 0x01c9 <c>PlaySoundEffect</c> (class <c>0x1435e6788</c>, reader <c>0x1421afa00</c>, dispatcher case 0x82
+    /// <c>0x142152628..0x1421527e6</c>): u32 BE entityId (0 for 2D / non-positional), u16 BE SoundEffects row,
+    /// u16 BE param (10 bytes total).
+    /// </summary>
+    public static byte[] PlaySoundEffect(uint entityId, ushort soundEffectRow, ushort param = 0) =>
+        new LoginWriter().U16(PlaySoundEffectId).U32(entityId).U16(soundEffectRow).U16(param).ToArray();
+
+    public const ushort ActionResultFlagId = 0x1b0, ActionUpdateId = 0x2c8;
+
+    /// <summary>
+    /// S→C 0x2c8 <c>InstanceClientActionUpdate</c> (world group, class <c>0x1435ccb78</c>, reader <c>0x141fe54d0</c>,
+    /// Actor dispatch <c>0x14219be04</c>): 10-byte world header, u16 BE <paramref name="actionTypeHash"/> (+0x38 →
+    /// action +0x118 <c>ActionTypes.HASH16</c>), u16 BE <paramref name="skillId"/> (+0x3a → skill +0x40), u16 BE
+    /// <paramref name="actionSequence"/> (+0x3c → action +0x11a), u8 <paramref name="detachId"/> (+0x3e → action
+    /// +0x11c), then blob16 class-specific little-endian payload passed to the action's virtual slot +0x300 reader.
+    /// </summary>
+    public static byte[] ActionUpdate(uint entityId, ushort actionTypeHash, ushort skillId, ushort actionSequence,
+        byte[] data, byte detachId = 0, uint orderKey = 0, ushort checkpoint = 0) =>
+        new LoginWriter().U16(ActionUpdateId).U32(entityId).U32(orderKey).U16(checkpoint)
+            .U16(actionTypeHash).U16(skillId).U16(actionSequence).U8(detachId).Blob(data).ToArray();
+
+    /// <summary>
+    /// S→C 0x1b0 (world group, reader 0x141fe4440, writer 0x141fe43f0; Actor handler 0x14219bc1a → 0x141e974d0):
+    /// resolves a queued <see cref="ActionHit"/> package matching the 8-byte key (sequence, actionByte, skillIndex,
+    /// targetObjectId) and, when <paramref name="flag"/> is true, runs ProcessDamagePackageInternal (0x141e97e20).
+    /// </summary>
+    public static byte[] ActionResultFlag(uint objectId, ushort sequence, uint targetObjectId, bool flag,
+        byte actionByte = 0, byte skillIndex = 0, uint orderKey = 0, ushort checkpoint = 0) =>
+        new LoginWriter().U16(ActionResultFlagId).U32(objectId).U32(orderKey).U16(checkpoint)
+            .U16(sequence).U8(actionByte).U8(skillIndex).U32(targetObjectId).U8(flag ? (byte)1 : (byte)0).ToArray();
+
     public const ushort InstantActionId = 0x1ce;
 
     /// <summary>
@@ -342,11 +405,22 @@ public static class InstanceProtocol
     /// animation and consumes a use of the skill: that starts its cooldown on the skill bar (live 2026-10-21).
     /// </summary>
     public static byte[] InstantAction(uint objectId, ushort skillId, int targetX, int targetY, uint? targetObjectId = null,
-        ushort sequence = 0xffff, ushort flags = 0, bool triggered = false)
+        ushort sequence = 0xffff, ushort flags = 0, bool triggered = false) =>
+        InstantAction(objectId, skillId, targetX, targetY, origin: null, targetObjectId, sequence, flags, triggered);
+
+    /// <summary>
+    /// Overload of <see cref="InstantAction(uint, ushort, int, int, uint?, ushort, ushort, bool)"/> that also encodes an
+    /// explicit custom origin (<c>flags |= 0x2000</c>, two compact ints read at <c>0x141fe4a2e..0x141fe4a48</c> before
+    /// <c>targetX/targetY</c>), used by S3 triggered combo children whose clip event carries a local 3D offset.
+    /// </summary>
+    public static byte[] InstantAction(uint objectId, ushort skillId, int targetX, int targetY, (int X, int Y)? origin,
+        uint? targetObjectId = null, ushort sequence = 0xffff, ushort flags = 0, bool triggered = false)
     {
+        ushort wireFlags = (ushort)(flags | (triggered ? 0x80 : 0) | (targetObjectId is null ? 0 : 0x20) | (origin is null ? 0 : 0x2000));
         var w = new LoginWriter().U16(InstantActionId).U32(objectId).U32(0).U16(0)
-            .U16(skillId).U16(sequence).U16((ushort)(flags | (triggered ? 0x80 : 0) | (targetObjectId is null ? 0 : 0x20)));
+            .U16(skillId).U16(sequence).U16(wireFlags);
         if (targetObjectId is { } t) w.U32(t);
+        if (origin is { } o) { CompactInt(w, o.X); CompactInt(w, o.Y); }
         CompactInt(w, targetX); CompactInt(w, targetY);
         return w.ToArray();
     }
@@ -399,6 +473,19 @@ public static class InstanceProtocol
         else w.U32(BitConverter.SingleToUInt32Bits(speed));
         return w.ToArray();
     }
+
+    public const ushort ActionDataId = 0x2c8;
+
+    /// <summary>
+    /// S→C 0x2c8 (world group, read <c>0x141fe54d0</c>; the Actor handler <c>0x14219aa10</c>): data for an action an object
+    /// runs, handed to the action class's vtable slot 96 (+0x300). Object header (12 B), then big-endian u16 action type
+    /// (ActionTypes HASH16, action +0x118), u16 skill id (the skill's +0x40), u16 sequence (+0x11a), u8 sub-id (+0x11c),
+    /// u16 length and the payload as is (its meaning is the class's). The client looks for the action among the actor's
+    /// current one, then its detached ones; all four keys must match.
+    /// </summary>
+    public static byte[] ActionData(uint objectId, ushort actionType, ushort skillId, ushort sequence, byte subId, ReadOnlySpan<byte> payload) =>
+        new LoginWriter().U16(ActionDataId).U32(objectId).U32(0).U16(0)
+            .U16(actionType).U16(skillId).U16(sequence).U8(subId).U16(checked((ushort)payload.Length)).Bytes(payload).ToArray();
 
     /// <summary>The fixed-height marker of 0x1b7 and 0x1ba that means none: the object follows the terrain.</summary>
     public const uint FollowTerrain = 0x7fffffff;
@@ -462,7 +549,16 @@ public static class InstanceProtocol
         new LoginWriter().U16(0x1b9).U32(objectId).U32(0).U16(0)
             .U32(BitConverter.SingleToUInt32Bits(radians)).U8(locked ? (byte)1 : (byte)0).ToArray();
 
+    public const ushort SetTeamId = 0x1be;
+
+    /// <summary>S→C 0x1be (Positioned, read 0x141fe65f0): object header, u16 team (0 = player, 1 = hostile).</summary>
+    public static byte[] SetTeam(uint objectId, ushort team) =>
+        new LoginWriter().U16(SetTeamId).U32(objectId).U32(0).U16(0).U16(team).ToArray();
+
     public const ushort DeathScreenId = 0x55, ResurrectId = 0x54;
+
+    // Mods compiled against 0.6.0-beta bind to this one-argument signature.
+    public static byte[] DeathScreen(byte flags) => DeathScreen(flags, 0);
 
     /// <summary>
     /// S→C 0x55 (instance group, class 0x1435e68a8, read 0x1421a6190, dispatcher case 0x14 → listeners at +0xf78): the
@@ -473,12 +569,122 @@ public static class InstanceProtocol
     /// flag is set); its right button "Resurrect at Checkpoint" with bit2 (without bit0); a third "Spectate" (PvP).
     /// Live 2026-10-17: 0x04 showed only "Resurrect at Checkpoint".
     /// </summary>
-    public static byte[] DeathScreen(byte flags)
+    public static byte[] DeathScreen(byte flags, ushort deaths)
     {
         var w = new LoginWriter().U16(DeathScreenId).U8(flags);
-        if ((flags & 2) == 0) w.U32(0).U16(0);
+        if ((flags & 2) == 0) w.U32(0).U16(deaths);
         return w.ToArray();
     }
+
+    public const ushort GameMessageId = 0x18;
+
+    /// <summary>Highest 1-based <c>BackendErrors.dat</c> id carried unshifted in S→C 0x18 (reader <c>0x1421a3b07</c>:
+    /// values &lt;= 0x2d2 select <c>BackendErrors</c>, values &gt; 0x2d2 subtract 0x2d3 for <c>ClientStrings2</c>,
+    /// and bit 15 (<c>0x8000</c>) selects <c>ClientStrings</c>).</summary>
+    public const ushort BackendErrorMaxId = 0x02d2;
+
+    /// <summary>Text table selected by the encoded id word in S→C 0x18 (<c>0x1421a3ab0</c>).</summary>
+    public enum GameMessageSource : byte { BackendError = 0, ClientString = 1, ClientString2 = 2 }
+
+    /// <summary>Common 1-based <c>BackendErrors.dat</c> ids used with <see cref="GameMessage"/>.</summary>
+    public static class BackendErrorId
+    {
+        public const ushort PlayerSlain = 198;
+        public const ushort FullAtlasPassiveSkillRefund = 236;
+        public const ushort ReceivedAtlasRespecPoint1 = 549;
+        public const ushort ReceivedAtlasRespecPointN = 550;
+        public const ushort ReceivedAtlasPassivePoint1 = 551;
+        public const ushort ReceivedAtlasPassivePointN = 552;
+    }
+
+    /// <summary>
+    /// S→C 0x18 (read <c>0x1421a3ab0</c> -> <c>0x1429a60d0</c>, write <c>0x1421a3980</c> ->
+    /// <c>0x1429a5f50</c>, dispatcher case 3): localized system/error chat message by text table id.
+    /// Wire: <c>u16 BE encodedId</c>, <c>u16 BE npcRow</c> (<c>0xffff</c> = none), <c>u16 LE flags</c> (raw),
+    /// <c>u32 BE holdTimeMs</c>, <c>u32 LE chatColour</c> (raw <c>ChatColours.dat</c> row), <c>u8 numArgCount</c>,
+    /// <c>u8 strArgCount</c>, <c>numArgCount × (u8 slot, CompactInt value)</c>, <c>strArgCount × WStr</c>.
+    /// </summary>
+    public static byte[] GameMessage(
+        GameMessageSource source,
+        ushort id,
+        ushort npcRow = 0xffff,
+        ushort flags = 0,
+        uint holdTimeMs = 0,
+        uint chatColour = 0,
+        IReadOnlyList<(byte Slot, int Value)>? numericArgs = null,
+        IReadOnlyList<string>? stringArgs = null)
+    {
+        ushort encodedId = source switch
+        {
+            GameMessageSource.ClientString => (ushort)(0x8000 | (id & 0x7fff)),
+            GameMessageSource.ClientString2 => checked((ushort)(BackendErrorMaxId + 1 + id)),
+            _ => id,
+        };
+        int numCount = Math.Min(numericArgs?.Count ?? 0, byte.MaxValue);
+        int strCount = Math.Min(stringArgs?.Count ?? 0, byte.MaxValue);
+        var w = new LoginWriter()
+            .U16(GameMessageId)
+            .U16(encodedId)
+            .U16(npcRow)
+            .U8((byte)flags).U8((byte)(flags >> 8))
+            .U32(holdTimeMs)
+            .RawU32(chatColour)
+            .U8((byte)numCount)
+            .U8((byte)strCount);
+        for (int i = 0; i < numCount; i++)
+        {
+            var (slot, value) = numericArgs![i];
+            w.U8(slot);
+            CompactInt(w, value);
+        }
+        for (int i = 0; i < strCount; i++) w.WStr(stringArgs![i]);
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// S→C 0x18 death announcement (<see cref="BackendErrorId.PlayerSlain"/> = 198, <c>"{0} has been slain."</c>).
+    /// Measured on official 3.29.3 captures.
+    /// </summary>
+    public static byte[] DeathMessage(string characterName) =>
+        GameMessage(GameMessageSource.BackendError, BackendErrorId.PlayerSlain, stringArgs: [characterName]);
+
+    public const ushort AwardDisplayId = 0x01d5, CraftAwardId = 0x01d6, ClientStringNoticeId = 0x02cc;
+
+    /// <summary>0-based <c>AwardDisplay.dat</c> rows for <see cref="AwardDisplay"/> (S→C 0x01d5).</summary>
+    public static class AwardDisplayRow
+    {
+        public const byte LegionMapDeviceAward = 0;
+        public const byte AtlasMissionKirac = 1;
+        public const byte FavouredMapSlotUnlocked = 6;
+        public const byte HarvestCraftingBenchUnlocked = 7;
+        public const byte HeistStashUnlocked = 9;
+        public const byte AtlasPassiveAllocationSetUnlock1 = 37;
+        public const byte AtlasPassiveAllocationSetUnlock2 = 38;
+        public const byte SixthMapDeviceSlotUnlocked = 40;
+    }
+
+    /// <summary>S→C 0x01d5 (3 bytes, read 0x140e27980, dispatcher case 0x86 at 0x142157206):
+    /// displays an <c>AwardDisplay.dat</c> toast (0-based <paramref name="awardRow"/>).</summary>
+    public static byte[] AwardDisplay(byte awardRow) => [0x01, 0xd5, awardRow];
+
+    /// <summary>S→C 0x01d6 (6 bytes, read 0x140911270, dispatcher case 0x87 at 0x142157278):
+    /// displays a Craft Received toast resolving <c>Mods.HASH32</c> (<paramref name="modHash32"/>) via
+    /// <c>CraftingBenchOptions.Name</c> with <c>AwardDisplay</c> row 12 (<c>AtlasMissionGeneric</c>).</summary>
+    public static byte[] CraftAward(uint modHash32) => new LoginWriter().U16(CraftAwardId).U32(modHash32).ToArray();
+
+    /// <summary>S→C 0x02cc (4 bytes, write 0x1421b74f0 / read 0x1421b7550, dispatcher case 0xea):
+    /// displays a <c>ClientStrings</c> notice (<c>u16 LE clientStringId</c>, raw unswapped).</summary>
+    public static byte[] ClientStringNotice(ushort clientStringId) =>
+        [0x02, 0xcc, (byte)clientStringId, (byte)(clientStringId >> 8)];
+
+    public const ushort AliveStateId = 0x1f1;
+
+    /// <summary>
+    /// S→C 0x1f1 (world group): object header, u8, u8; the second u8 is 1 when the object is dead and 0 when it
+    /// lives. The official death sends it with the dead flag set, the checkpoint resurrect with it clear.
+    /// </summary>
+    public static byte[] AliveState(uint objectId, uint chain, bool dead) =>
+        new LoginWriter().U16(AliveStateId).U32(objectId).U32(chain).U16(0).U8(1).U8((byte)(dead ? 1 : 0)).ToArray();
 
     /// <summary>C→S 0x153 (id only): Esc → "Exit to Character Selection" (0x140cf1a20) and the hardcore death screen's
     /// Exit (0x140291180); the client skips it while its instance connection is already down (state +0xc3a0 = 1). The
@@ -605,6 +811,17 @@ public static class InstanceProtocol
         return result;
     }
 
+    /// <summary>Custom mod message envelope (non-retail extension): u16 BE 0xF7E0, u32 BE payload length
+    /// (≤ <see cref="ModEnvelopeMaxPayload"/>), followed by <c>payloadLen</c> bytes. Framed cleanly so subsequent
+    /// retail messages in the same TCP read continue decoding and split envelopes reassemble across reads.</summary>
+    public const ushort ModEnvelopeId = 0xF7E0;
+
+    /// <summary>Maximum payload length accepted in a <see cref="ModEnvelopeId"/> frame (64 KiB).</summary>
+    public const int ModEnvelopeMaxPayload = 64 * 1024;
+
+    /// <summary>Upper bound on unframed trailing bytes retained across TCP reads per connection.</summary>
+    public const int MaxClientCarryBytes = ModEnvelopeMaxPayload + 64;
+
     static WireMeasure TryClientMessageLength(ushort id, ReadOnlySpan<byte> data, out int length)
     {
         switch (id)
@@ -616,6 +833,8 @@ public static class InstanceProtocol
             case InstanceNpcs.CtrlBuyId: return FromNullableLength(InstanceNpcs.CtrlBuyLength(data), out length);
             case InstanceStash.ReorderTabsId: return FromNullableLength(InstanceStash.ReorderTabsLength(data), out length);
             case InstanceStash.RenameTabId: return InstanceStash.MeasureRenameTabLength(data, out length);
+            case InstanceItems.SetItemNoteId: return InstanceItems.MeasureSetItemNoteLength(data, out length);
+            case InstanceItems.ListWithPriceId: return InstanceItems.MeasureListWithPriceLength(data, out length);
             case InstanceStash.MoveToAffinityTabId: return FromNullableLength(InstanceStash.MoveToAffinityTabLength(data), out length);
             case InstanceStash.SetAffinitiesId: return FromNullableLength(InstanceStash.SetAffinitiesLength(data), out length);
             case InstanceWaypoints.VisitHideoutId or InstanceWaypoints.VisitMenagerieId:
@@ -623,20 +842,26 @@ public static class InstanceProtocol
             case InstanceSocial.FriendAddId: return InstanceSocial.MeasureFriendAddLength(data, out length);
             // 2 + WStr (writer 0x141f98140).
             case InstanceSocial.PartyInviteId or InstanceSocial.PartyKickId or InstanceSocial.PartyTravelId
-                or 0x0097 or 0x00ca or 0x0140 or 0x0141 or 0x0145 or 0x014d or 0x014e or 0x014f or 0x0155:
+                or 0x0097 or InstanceSocial.SocialStatusId
+                or InstanceGuilds.CreateId or InstanceGuilds.InviteId or InstanceGuilds.RemoveMemberId
+                or InstanceGuilds.SetStatusId or InstanceGuilds.RenameId or InstanceGuilds.SetTagId
+                or InstanceSocial.DuelChallengeId:
                 return MeasureWStrMessage(data, prefixBytes: 2, suffixBytes: 0, out length);
             // 2 + WStr + u8 (writer 0x141f9baf0).
-            case 0x0098 or 0x0144 or 0x0179:
+            case InstanceSocial.PublicPartyId or InstanceGuilds.SetMemberRankId or InstanceSocial.HideoutInviteId:
                 return MeasureWStrMessage(data, prefixBytes: 2, suffixBytes: 1, out length);
             // 2 + u8 + WStr (Atlas tree rename, writer 0x141fa5e60).
-            case 0x02a7:
+            case InstanceEntities.AtlasTreeRenameId:
                 return MeasureWStrMessage(data, prefixBytes: 3, suffixBytes: 0, out length);
             // 2 + WStr + WStr (writer 0x141f9b950; 0x0280 sent on area entry by 0x140d59480).
             case 0x0081 or 0x0280:
                 return MeasureTwoWStrMessage(data, suffixBytes: 0, out length);
             // 2 + WStr + WStr + u32 + u8 (shop buy, writer 0x141fa1160).
-            case 0x012c:
+            case InstanceShop.BuyId:
                 return MeasureTwoWStrMessage(data, suffixBytes: 5, out length);
+            // u16 id + 4 narrow UTF-8 strings (each u16 BE len + bytes; shop delivery quote/order, writer 0x141fa1600).
+            case InstanceShop.ShippingQuoteRequestId or InstanceShop.PlaceOrderId:
+                return MeasureFourNarrowStrMessage(data, out length);
             // u16 id, u8 flags, optional u32 when bit 0 is clear (writer 0x141fa1b30, main frame loop 0x140d551f0).
             case 0x0158:
                 return Measure0158(data, out length);
@@ -647,20 +872,82 @@ public static class InstanceProtocol
             case 0x0281:
                 return MeasureTwoBlob16(data, out length);
             // u16 id, u32 BE, u16 BE n, n * u32 BE (salvage box open, writer 0x141fa3bf0 → 0x141faa4a0).
-            case 0x026e:
+            case InstanceShop.OpenSalvageBoxId:
                 return MeasureSalvageBox(data, out length);
+            // u16 id, u8 count, count * u8 (Heist sign contract, writer 0x141fa3d30 → 0x141fab790).
+            case 0x0279:
+                return MeasureU8ListMessage(data, prefixBytes: 2, out length);
+            // u16 id, u8 wing, u8 count, count * u8 (Heist blueprint crew, writer 0x141fa3fc0 → 0x141fab790).
+            case 0x027f:
+                return MeasureU8ListMessage(data, prefixBytes: 3, out length);
             // u16 id, u8, u8 n1, n1 bytes, u8 n2, n2 bytes, u8, u8 (recombine, writer 0x141fa49e0).
             case 0x028f:
                 return MeasureRecombine(data, out length);
+            // u16 id, u32 BE netId, u8 count, count * (u8 + u32 BE + u32 BE) (Necropolis Lantern enter, writer 0x141fa5c10).
+            case 0x02a5:
+                return MeasureNecropolisLantern(data, out length);
             // u16 id, u8 ruleset, CompactUInt(len), len bytes (ruleset message, writer 0x141fa7c10 / reader 0x141fa7ca0).
             case InstanceRulesets.ActionId:
                 return InstanceRulesets.MeasureActionLength(data, out length);
+            // u16 id, u16 hideoutHash, u16 musicHash, u8 environment, u16 count, count * 11B (writer 0x141fa3630 → 0x141fab3f0).
+            case InstanceHideoutEditing.LayoutId:
+                return InstanceHideoutEditing.MeasureLayoutLength(data, out length);
+            // Custom mod envelope (non-retail): u16 BE 0xF7E0, u32 BE payloadLen (<= ModEnvelopeMaxPayload), payload bytes.
+            case ModEnvelopeId:
+                return MeasureModEnvelope(data, out length);
+            // The Trade Market panel's requests: u16 id, u8, u32 BE request number (writer 0x14085f290), then
+            // 0x01e2 CompactUInt(len), len bytes (0x14085f360); 0x01e4 CompactUInt(len), len bytes, u16 BE len, len bytes
+            // (0x1408c0f40); 0x01e6 u16 BE len, len bytes (0x1408c1070); 0x01e8 / 0x01ea u16 BE len, len bytes, u8 (0x1408c1230).
+            case 0x01e2 or 0x01e4 or 0x01e6 or 0x01e8 or 0x01ea:
+                return MeasureTradeMarket(id, data, out length);
             default:
                 if (KnownClientLength(id) is int fixedLen) { length = fixedLen; return WireMeasure.Ok; }
                 length = 0;
                 return WireMeasure.Invalid;
         }
     }
+
+    /// <summary>Largest CompactUInt part of a Trade Market request (0x01e2 / 0x01e4) that is framed; a larger one is
+    /// malformed. The search carries an LZ4-packed search JSON of a few hundred bytes.</summary>
+    const uint TradeMarketMaxPayload = 0x200000;
+
+    /// <summary>Measures a C→S Trade Market request (0x01e2, 0x01e4, 0x01e6, 0x01e8, 0x01ea): the 7-byte header, then the
+    /// parts the request's writer adds (see <see cref="TryClientMessageLength"/>).</summary>
+    static WireMeasure MeasureTradeMarket(ushort id, ReadOnlySpan<byte> data, out int length)
+    {
+        length = 0;
+        int pos = 7;
+        if (data.Length < pos) return WireMeasure.Incomplete;
+        if (id is 0x01e2 or 0x01e4)
+        {
+            if (data.Length < pos + 1) return WireMeasure.Incomplete;
+            int lengthBytes = CompactUIntLength(data[pos]);
+            if (data.Length < pos + lengthBytes) return WireMeasure.Incomplete;
+            uint n = ReadCompactUInt(data[pos..]);
+            if (n > TradeMarketMaxPayload) return WireMeasure.Invalid;
+            pos += lengthBytes + (int)n;
+        }
+        if (id != 0x01e2)
+        {
+            if (data.Length < pos + 2) return WireMeasure.Incomplete;
+            pos += 2 + BinaryPrimitives.ReadUInt16BigEndian(data[pos..]);
+            if (id is 0x01e8 or 0x01ea) pos += 1;
+        }
+        if (data.Length < pos) return WireMeasure.Incomplete;
+        length = pos;
+        return WireMeasure.Ok;
+    }
+
+    static int CompactUIntLength(byte first) => first < 0x80 ? 1 : first < 0xc0 ? 2 : first < 0xe0 ? 3 : first < 0xf0 ? 4 : 5;
+
+    static uint ReadCompactUInt(ReadOnlySpan<byte> b) => CompactUIntLength(b[0]) switch
+    {
+        1 => b[0],
+        2 => (uint)((b[0] & 0x3f) << 8 | b[1]),
+        3 => (uint)((b[0] & 0x1f) << 16 | b[1] << 8 | b[2]),
+        4 => (uint)((b[0] & 0x0f) << 24 | b[1] << 16 | b[2] << 8 | b[3]),
+        _ => (uint)(b[1] << 24 | b[2] << 16 | b[3] << 8 | b[4]),
+    };
 
     static WireMeasure FromNullableLength(int? len, out int length)
     {
@@ -750,6 +1037,99 @@ public static class InstanceProtocol
         return WireMeasure.Ok;
     }
 
+    static WireMeasure MeasureFourNarrowStrMessage(ReadOnlySpan<byte> data, out int length)
+    {
+        length = 0;
+        int pos = 2;
+        for (int i = 0; i < 4; i++)
+        {
+            if (data.Length - pos < 2) return WireMeasure.Incomplete;
+            int strLen = BinaryPrimitives.ReadUInt16BigEndian(data[pos..]);
+            pos += 2 + strLen;
+            if (pos > data.Length) return WireMeasure.Incomplete;
+        }
+        length = pos;
+        return WireMeasure.Ok;
+    }
+
+    static WireMeasure MeasureU8ListMessage(ReadOnlySpan<byte> data, int prefixBytes, out int length)
+    {
+        length = 0;
+        if (data.Length <= prefixBytes) return WireMeasure.Incomplete;
+        int total = prefixBytes + 1 + data[prefixBytes];
+        if (data.Length < total) return WireMeasure.Incomplete;
+        length = total;
+        return WireMeasure.Ok;
+    }
+
+    static WireMeasure MeasureNecropolisLantern(ReadOnlySpan<byte> data, out int length)
+    {
+        length = 0;
+        if (data.Length < 7) return WireMeasure.Incomplete;
+        int total = 7 + data[6] * 9;
+        if (data.Length < total) return WireMeasure.Incomplete;
+        length = total;
+        return WireMeasure.Ok;
+    }
+
+    static WireMeasure MeasureModEnvelope(ReadOnlySpan<byte> data, out int length)
+    {
+        length = 0;
+        if (data.Length < 6) return WireMeasure.Incomplete;
+        uint payloadLen = BinaryPrimitives.ReadUInt32BigEndian(data[2..]);
+        if (payloadLen > ModEnvelopeMaxPayload) return WireMeasure.Invalid;
+        int total = 6 + (int)payloadLen;
+        if (data.Length < total) return WireMeasure.Incomplete;
+        length = total;
+        return WireMeasure.Ok;
+    }
+
+    /// <summary>First 8 bytes of the 16-byte SipHash-2-4 key for C→S 0x0E (<c>0x142fc9c38</c> in 3.29.3c, loaded by
+    /// <c>0x14214ee50</c> and concatenated with login 0x14 / instance 0x27 <c>Data8</c>).</summary>
+    public static ReadOnlySpan<byte> OpeningDigestKeyPrefix => [0x8d, 0x75, 0x09, 0xa3, 0xfe, 0xa5, 0x17, 0x81];
+
+    /// <summary>Computes the 12-byte C→S 0x0E <see cref="InstanceOpening.Digest"/>: 8-byte little-endian SipHash-2-4
+    /// over <paramref name="unixTime"/> (LE) with key <see cref="OpeningDigestKeyPrefix"/> ‖ <paramref name="data8"/>,
+    /// followed by <paramref name="unixTime"/> in big-endian (<c>0x14214ee50</c> / <c>0x141f97550</c>).</summary>
+    public static byte[] ComputeOpeningDigest(ReadOnlySpan<byte> data8, uint unixTime)
+    {
+        if (data8.Length != 8) throw new ArgumentException("Opening Data8 must be 8 bytes.", nameof(data8));
+        Span<byte> key = stackalloc byte[16];
+        OpeningDigestKeyPrefix.CopyTo(key);
+        data8.CopyTo(key[8..]);
+        Span<byte> timeLe = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(timeLe, unixTime);
+        var digest = new byte[12];
+        SipHash24.ComputeBytes(key, timeLe, digest);
+        BinaryPrimitives.WriteUInt32BigEndian(digest.AsSpan(8, 4), unixTime);
+        return digest;
+    }
+
+    /// <summary>Verifies a client's C→S 0x0E <see cref="InstanceOpening.Digest"/> against <paramref name="data8"/> in
+    /// constant time. When <paramref name="nowUnixSeconds"/> is given, also checks that the embedded 32-bit Unix
+    /// timestamp is within <paramref name="maxSkewSeconds"/> (handling uint32 wrap safely).</summary>
+    public static bool VerifyOpeningDigest(InstanceOpening opening, ReadOnlySpan<byte> data8, long? nowUnixSeconds = null,
+        long maxSkewSeconds = 300)
+    {
+        if (opening is null || opening.Digest.Length != 12 || data8.Length != 8) return false;
+        uint clientTime = BinaryPrimitives.ReadUInt32BigEndian(opening.Digest.AsSpan(8, 4));
+        Span<byte> key = stackalloc byte[16];
+        OpeningDigestKeyPrefix.CopyTo(key);
+        data8.CopyTo(key[8..]);
+        Span<byte> timeLe = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(timeLe, clientTime);
+        Span<byte> expected = stackalloc byte[8];
+        SipHash24.ComputeBytes(key, timeLe, expected);
+        if (!CryptographicOperations.FixedTimeEquals(expected, opening.Digest.AsSpan(0, 8))) return false;
+        if (nowUnixSeconds is long now)
+        {
+            if (maxSkewSeconds < 0) return false;
+            long diff = unchecked((int)(clientTime - (uint)now));
+            if (Math.Abs(diff) > maxSkewSeconds) return false;
+        }
+        return true;
+    }
+
     /// <summary>Parses the client's plaintext opening, or null if fewer than <see cref="OpeningLength"/> bytes arrived.</summary>
     public static InstanceOpening? TryReadOpening(ReadOnlySpan<byte> buf)
     {
@@ -767,37 +1147,78 @@ public static class InstanceProtocol
 /// "Client-Safe Instance ID = {InstanceId}" and "Generating level {Level} area "{id}" with seed {Seed}", then queues area
 /// generation. AreaHash is WorldAreas.HASH16 (unknown: "Instance sent world area that does not exist"). Level 0 means
 /// the area's own level. LeagueStats enables flag 0x21.6 and the first compact pair list (+0x100), copied to world
-/// stats at +0x120 by 0x142189aa0. Other optional parts remain off. Defaults follow the constructor (0x1421a42b0).
+/// stats at +0x120 by 0x142189aa0. ReturnAreaHash enables flag 0x21.3 (+0x08) and writes u16 BE WorldAreas.HASH16
+/// immediately after B28 (AreaState +0xc0 via 0x142149620). GuildHideout sets flag 0x22.7 (bit 15, 0x80; no extra wire
+/// bytes, AreaState +0xda via 0x142149670): the hideout is the guild's (0x1421719c0). There the Decorations panel and the
+/// editor read the guild's owned list (0x1f4 flags 3, session +0xd630; 0x1408dc0c0, 0x140204fc6) instead of the
+/// account's (flags 1, +0xd618), so a personal hideout leaves it clear; 0x21's own-hideout bit marks that one.
+/// Defaults follow the constructor (0x1421a42b0).
 /// B28 is the league category (world +0xd0, <see cref="GameServer.Core.World.LeagueCategory"/>), 60 for none.
 /// </summary>
 public sealed record AreaInstance(uint InstanceId, ushort AreaHash, uint Seed, byte Level, string Text = "",
     byte B1e = 3, byte B20 = 0, byte B1f = 2, byte B24 = 0x23, byte B1d = 0, byte B28 = 0x3c,
     IReadOnlyDictionary<uint, int>? LeagueStats = null, byte[]? TerrainData = null,
-    IReadOnlyList<byte>? AchievementSets = null)
+    IReadOnlyList<byte>? AchievementSets = null, bool GuildHideout = false, ushort? ReturnAreaHash = null,
+    IReadOnlyDictionary<uint, int>? DisplayStats = null, IReadOnlyList<byte>? Rulesets = null,
+    IReadOnlyList<byte>? PreloadGroups = null)
 {
+    /// <summary>B20 of a hideout that is not the player's own. The dispatcher (case 6, 0x1421510e4) copies B20 to session
+    /// +0xcf38; the HUD (0x140dba5d0) shows "Leave Hideout" (ClientStrings2 HUDLeaveUnownedHideoutButtonLabel,
+    /// return_from_unowned_hideout_button) when the area is a hideout (WorldAreas +0x14e) and that byte is 11. Its click
+    /// (0x140deb730) sends chat command 45, /hideout.</summary>
+    public const byte UnownedHideoutKind = 11;
+
     public byte[] Encode()
     {
-        bool hasStats = LeagueStats is { Count: > 0 };
+        bool hasStats = LeagueStats is { Count: > 0 } || DisplayStats is { Count: > 0 };
+        bool hasReturnArea = ReturnAreaHash is > 0;
+        bool hasRulesets = Rulesets is { Count: > 0 };
         var writer = new LoginWriter()
             .U16(InstanceProtocol.AreaInstanceId).U32(InstanceId).U16(AreaHash).WStr(Text).U32(Seed)
-            .U8(B1e).U8(B20).U8(B1f).U8(B24).Bytes([(byte)(hasStats ? 0x40 : 0), (byte)(TerrainData is null ? 0 : 4), 0]).U8(Level).U8(B1d).U8(B28)
-            .U16(0)  // vec16<u32> +0x68
-            .U16(0); // vec16<u8> +0x80
+            .U8(B1e).U8(B20).U8(B1f).U8(B24)
+            .Bytes([
+                (byte)((hasStats ? 0x40 : 0) | (hasReturnArea ? 0x08 : 0)),
+                (byte)((hasRulesets ? 1 : 0) | (TerrainData is null ? 0 : 4) | (GuildHideout ? 0x80 : 0)),
+                0,
+            ])
+            .U8(Level).U8(B1d).U8(B28);
+        if (hasReturnArea) writer.U16(ReturnAreaHash!.Value);
+        writer.U16(0); // vec16<u32> +0x68
+        if (PreloadGroups is { Count: > ushort.MaxValue }) throw new ArgumentOutOfRangeException(nameof(PreloadGroups));
+        writer.U16((ushort)(PreloadGroups?.Count ?? 0));
+        foreach (byte row in PreloadGroups ?? [])
+        {
+            if (row == byte.MaxValue) throw new ArgumentOutOfRangeException(nameof(PreloadGroups));
+            writer.U8((byte)(row + 1));
+        }
         // +0x50 becomes instance +0xc418. The shared achievements/league-upgrades TabControl
         // stays hidden when this list is empty, even when the Delve child tab exists.
         if (AchievementSets is { Count: > byte.MaxValue }) throw new ArgumentOutOfRangeException(nameof(AchievementSets));
         writer.U8((byte)(AchievementSets?.Count ?? 0));
         foreach (byte set in AchievementSets ?? []) writer.U8(set);
         writer.U16(0); // vec16<u16> +0xe0
+        if (hasRulesets)
+        {
+            if (Rulesets!.Count > byte.MaxValue) throw new ArgumentOutOfRangeException(nameof(Rulesets));
+            writer.U8((byte)Rulesets.Count);
+            foreach (byte row in Rulesets) writer.U8(row);
+        }
         if (hasStats)
         {
-            InstanceProtocol.CompactUInt(writer, (uint)LeagueStats!.Count);
-            foreach (var (key, value) in LeagueStats.OrderBy(p => p.Key))
+            var first = LeagueStats ?? new Dictionary<uint, int>();
+            InstanceProtocol.CompactUInt(writer, (uint)first.Count);
+            foreach (var (key, value) in first.OrderBy(p => p.Key))
             {
                 InstanceProtocol.CompactUInt(writer, key);
                 InstanceProtocol.CompactInt(writer, value);
             }
-            InstanceProtocol.CompactUInt(writer, 0); // second compact pair list (+0x120)
+            var second = DisplayStats ?? new Dictionary<uint, int>();
+            InstanceProtocol.CompactUInt(writer, (uint)second.Count);
+            foreach (var (key, value) in second.OrderBy(p => p.Key))
+            {
+                InstanceProtocol.CompactUInt(writer, key);
+                InstanceProtocol.CompactInt(writer, value);
+            }
             writer.U8(0); // third list (+0x138), u8 count, no entries
         }
         if (TerrainData is { } terrain)
@@ -810,9 +1231,11 @@ public sealed record AreaInstance(uint InstanceId, ushort AreaHash, uint Seed, b
 }
 
 /// <summary>
-/// C→S 0x0F + 0x0E. Ticket is login 0x14's u32 at +0x38. Digest: 12 bytes the client computes over a constant 8 bytes,
-/// 0x14's Data8 and the u32 _time64 (0x141fe7d90 family, algorithm not identified yet). Address is 0x14's u32 at +0x34.
-/// U32_128 is always 0, Realm is 0x40 (international) and Flag is global 0x1445998ce.
+/// C→S 0x0F + 0x0E (<c>0x14214ee50</c>, writer <c>0x141f97550</c>). Ticket is login 0x14's u32 at +0x38. Digest is
+/// 12 bytes: 8-byte little-endian SipHash-2-4 (<c>0x141fe7d90</c>) over the low 32 bits of <c>_time64(NULL)</c> (LE)
+/// keyed by the 8-byte constant at <c>0x142fc9c38</c> (3.29.3c, <see cref="InstanceProtocol.OpeningDigestKeyPrefix"/>)
+/// concatenated with 0x14/0x27 <c>Data8</c>, followed by that 32-bit Unix timestamp in big-endian. Address is 0x14's
+/// u32 at +0x34. U32_128 is always 0, Realm is 0x40 (international) and Flag is global 0x1445998ce.
 /// </summary>
 public sealed record InstanceOpening(uint Ticket, byte[] Digest, uint Address, uint U32_128, byte Realm, byte Flag);
 
@@ -847,6 +1270,19 @@ public sealed class InstanceKeyring(byte[] secret)
         Span<byte> t = stackalloc byte[4];
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(t, ticket);
         return HMACSHA512.HashData(secret, t);
+    }
+
+    /// <summary>Derives the 8-byte ticket-bound <c>Data8</c> nonce sent in login S→C 0x14 and instance S→C 0x27,
+    /// distinct from <see cref="Key"/> via the <c>"D8"</c> domain separator (<c>[ticket BE, 0x44, 0x38]</c>).</summary>
+    public byte[] Data8(uint ticket)
+    {
+        Span<byte> input = stackalloc byte[6];
+        BinaryPrimitives.WriteUInt32BigEndian(input, ticket);
+        input[4] = 0x44;
+        input[5] = 0x38;
+        Span<byte> mac = stackalloc byte[64];
+        HMACSHA512.HashData(secret, input, mac);
+        return mac[..8].ToArray();
     }
 
     /// <summary>The server's Salsa20 pair for a ticket (mirror of the client's isClient=1 setup).</summary>

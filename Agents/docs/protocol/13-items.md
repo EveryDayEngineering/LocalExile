@@ -16,7 +16,10 @@ the item on the wire the hash of the new Id let it drop and stack (2026-11-20).
 
 Components come from the `.it` files, merged like `.ot` files ([04](04-player-entity.md), `scripts/re/ot_components.py`)
 with two differences: nothing is prepended (no Positioned), and most leaf rows have no `.it` of their own, so their
-chain is the row's `InheritsFrom`. `client { }` blocks (RenderItem) are never read. Generate every row's list with:
+chain is the row's `InheritsFrom`. For `QuestItems.dat` rows with a non-empty `Script` (the nine `AtlasSkillBook*`
+items and `Sentinel/Controller`), the client overrides `InheritsFrom` to `Metadata/Items/QuestItems/AbstractUsableQuestItem`
+(`Base, Quest, Usable, Stack`), adding the 2-byte `Stack` count on the wire (`ItemCatalog.cs`, `ot_components.py`).
+`client { }` blocks (RenderItem) are never read. Generate every row's list with:
 
 ```bash
 python -I scripts/re/ot_components.py --items --json data/item-types.json
@@ -517,7 +520,7 @@ Headhunter mechanics count those as an exception to "you"; Replica Headhunter is
 totems, totem projectiles) mark the monster first; a Mirage Archer's kills and an ownerless damage-over-time death are
 not marked.
 
-**Paradoxica** (`GamblerModifiers.ForWeapon`): `local_double_damage_with_attacks` is weapon-local (Stats `IsWeaponLocal`;
+**Paradoxica** (`HitRollModifiers.ForWeapon`): `local_double_damage_with_attacks` is weapon-local (Stats `IsWeaponLocal`;
 its hand aliases are `base_main_hand_number_of_times_damage_is_doubled` and the off-hand one). Every hit of an attack
 made with that weapon doubles, before the triple-damage roll can override it. The server's attack hits are the main
 hand's (a shield skill's are the shield's), so a Paradoxica in the off hand doubles nothing: dual-wield swings do not
@@ -564,6 +567,19 @@ Fields come from the client's readers and its debug dumps of the two components,
 `0x1421e7b00`, which print each field's name.
 A refusal code near a check names it too: the code is a ClientStrings row + 1 (`0x1762` is
 `ItemErrorFailedRerollVariableDefence`, row `0x1761`).
+About 60 of the client's currency validators (`0x141f86f70`, `0x141f89920` among them) return `0x4b8`
+(`ItemErrorItemEquipped`, "Item is currently equipped.") when the target's inventory has the character-slot flag
+(+0x149: equipment and the flask bar) or is row 23 (passive tree jewels); about 30 others lack the test.
+In the official game (live 2026-11-23) quality currency (armour, weapon, flask, catalysts) and Enkindling/Instilling
+work on worn items, and transmutation through scouring, Divine, Blessed and Eldritch currency are refused.
+The client still sends 0x71 for a refused target, so the Gateway refuses it before anything is spent
+(`Game.RefusedOnWorn`, by the CurrencyItems action), and the Hinekora preview answers with a failure.
+Sockets, Vaal, Fracturing, Hinekora's Lock and Mirror were not checked live and are refused. The official game prints "Failed to apply item: Item is currently equipped." (BackendErrors
+`FailedToApplyCurrency`); the message that carries it is not found, so the Gateway sends that line as chat (0x17).
+A mirrored target (`0x4c8` `ItemErrorItemMirrored`, "Item is mirrored.") and a corrupted one (`0x4b4`
+`ItemErrorTargetCorrupted`, "Target is corrupted.", except a Scroll of Wisdom and Tainted currency) are refused the
+same way, after the worn check (`Game.RefusedByState`); the client's order of the three checks, and the text for a
+Mirror or Hinekora's Lock on a corrupted item, are not checked.
 
 | State | Where | Server |
 |---|---|---|
@@ -687,7 +703,7 @@ All senders sit together at `0x142165c70`… and queue through `0x1421752b0`.
 | 0x16 | 5 + n | `0x1435ca938` / `0x141f97d70` | a Commands.dat command: u8 command (row + 1), u16 byte count + UTF-8 argument. The town popup's Destroy sends **9** (row 8 DestroyCursorItem, `/destroy`) | 0xbf cursor (the item is gone) |
 | 0x2d | 8 | `0x1435cacf0` / `0x141f96c30`, senders `0x142165e90` / `0x142165ee0` | inventory request, not mapped: u8, u32, u8 flag (0 / 1 by sender) | not handled |
 | 0x58 | 10 | `0x1435ca2c0` / `0x141f98f90` | use an item that needs no target (right-click): u32 inventory id, u32 item id, both big-endian | an Orb of Regret loses one item and adds one refund point (0xbf the stack, 0x33 the tree) |
-| 0x71 | 18 | not traced | use an item on an item (right-click it, then click the target): u32 inventory id, u32 item id of the used item, then of the target, all big-endian (live 2026-10-20); the first inventory id is a stash tab (e.g. 2053) when the currency is right-clicked in the open stash (live 2026-10-23): one is taken off that tab's stack; the target inventory id can be a stash tab too, e.g. the currency tab's crafting slot (live 2026-10-23: currency in its slot used on the item in the crafting slot, both inventory ids 2053). `ItemMoves.UseAcross`: the currency and the target saved together, one 0xbf per place changed (one for both when they share it) | a Scroll of Wisdom identifies the target (§2b); a Chromatic Orb uses the 3.29 rule (`CurrencyEffects.Chromatic`, below): one socket is forced non-white, the rest roll normally, gems and links stay: 0xbf with the stack and the target |
+| 0x71 | 18 | not traced | use an item on an item (right-click it, then click the target): u32 inventory id, u32 item id of the used item, then of the target, all big-endian (live 2026-10-20); the first inventory id is a stash tab (e.g. 2053) when the currency is right-clicked in the open stash (live 2026-10-23): one is taken off that tab's stack; the target inventory id can be a stash tab too, e.g. the currency tab's crafting slot (live 2026-10-23: currency in its slot used on the item in the crafting slot, both inventory ids 2053). `ItemMoves.Use`: the currency and the target saved together, one 0xbf per place changed (one for both when they share it) | a Scroll of Wisdom identifies the target (§2b); a Chromatic Orb uses the 3.29 rule (`CurrencyEffects.Chromatic`, below): one socket is forced non-white, the rest roll normally, gems and links stay: 0xbf with the stack and the target |
 | 0x72 | 23 | not traced | the held currency used again with **Shift** (the client keeps it on the cursor while the inventory has more, live 2026-10-21): u32 its BaseItemTypes HASH32 (the type, not an item), u32 inventory id and u32 item id of the target, all big-endian, then u32 0, u8 1, u8 0, u8 7, u16 2 (unknown) | as 0x71, with a stack of that type from the inventories (the main inventory first), then from the stash tabs |
 | 0x74 | 14 | `0x1435cac10` / `0x141f9ad60` | use an item on a **world object** (right-click it, then click the object, live 2026-11-17: a currency on a strongbox): u32 inventory id, u32 item id of the used item, u32 the object's id, all big-endian (`0074 00000001 0000000E 04000000`). No reply of its own, as for 0x71 | `MapStrongboxes`: on its box, the currency's change, 0xbf with the stack, the box removed and created again (same id) |
 | 0x4a | 14 | `0x1435ca0e8` / `0x141fa7300`, sender `0x142165f30` | the held item clicked **on an item** (§4a): u32 inventory id with HNC bits from bit 20 (mask `0xc00fffff`), u32 the clicked item's id, u8 flags (bit 2 = Shift; HNC bits 3-7), u8 (3), u16 (low byte first, differs every click, unknown) | a merge (0xbf the stack, 0xbf cursor), else a swap as 0x2a |
@@ -802,6 +818,9 @@ once (0x1ab aimed at the object, from the player's current cell) and picks the i
 reach: WorldItem.ot `InteractionAction interaction_distance_override = 20` is in grid cells, and the client's walk adds
 the item's size on the ground (BaseItemTypes `SizeOnGround`, 1 to 3) as its tolerance, so it stops on the first cell
 within 21, 22 or 23 ([07](07-latency-visibility-movement.md) Pickups).
+When the inventory has no room, S→C **0x0117** (2 bytes, id only; dispatcher case `0x44` at `0x142155509` →
+`0x140d60680`) plays the character's `InvFull` voice event (`CharacterAudioEvents` row 247), and re-creating the item
+under a fresh object id with `WorldItem +0x50 = 1` (`justDropped: true`) replays its ground bounce and drop/filter sound.
 
 Dying monsters drop items as WorldItems around the corpse (`DropLoot`, [15](15-progression.md) §3).
 Gold can be auto-picked before a committed kill's presentation queue drains.
@@ -1027,7 +1046,6 @@ The local server samples uniformly, as it does for newly created armour; the off
 One orb is spent even when the new roll equals the old roll.
 Mods, quality, rarity, identification, sockets, gems, links, names and fractured state stay unchanged.
 The existing atomic inventory/stash mutation saves the stack and target together and sends their 0xbf replacements.
-Rerolling worn equipment refreshes the character's shared defence pools and panel.
 
 The native target validator `0x141f89920` requires Armour and Mods components and rejects mirrored items.
 The ordinary crafting protection also refuses corrupted targets.
@@ -1098,7 +1116,7 @@ See [the game rules](../re/fracturing-mirror-mechanics.md).
 
 ### Mirror of Kalandra (2026-10-21, verified live; rules rechecked 2026-10-30)
 
-`CurrencyDuplicate`, same 0x71 / 0x72 messages (`MirrorItem`). Non-unique equipment, flasks and maps of tiers 1–16
+`CurrencyDuplicate`, same 0x71 / 0x72 messages (`UseItemOn`). Non-unique equipment, flasks and maps of tiers 1–16
 are eligible. Flask/map admission extends the native equipment-class rule; map tiers come from `MapKeys` or `Maps`.
 The target must be neither corrupted nor mirrored, on a supported non-`Unmodifiable` base with `Mods`.
 It is copied with every property (mods and values, fractured mods, quality, sockets, links, socketed gems, rarity,
@@ -1106,7 +1124,8 @@ identification and name); the copy is **mirrored** and goes onto the cursor (S�
 the player to place, the original stays unchanged. A held item, a corrupted or mirrored target, a unique item, a
 different item class (including jewels and currency), a map outside tiers 1–16, an unmodifiable base or an item without mods is refused and
 nothing is spent. A mirrored item takes no currency at all, including a Scroll of Wisdom; Reflective Oil is not
-modelled. Using a Mirror from a stash tab is a local limitation, not a game rule.
+modelled. The Mirror and the target can each be in a stash tab (`ItemMoves.Use`, the copy as its held item): 0xbf on the
+Mirror's tab or inventory, then on the cursor; the target's place gets none.
 
 `Item.Mirrored` (saved) is sent as the Mods component's u16 flags bit 1 (`+0x2df`, a plain bool with no data after
 it): the client's crafting check refuses an item with it (`0x141d6c62b`); the tooltip shows
@@ -1131,6 +1150,7 @@ u32 target inventory, u32 target item (all BE)
 Captured: `029C 0001 00000001 0000054D 00000001 0000054F` = key 1, Orb of Alchemy 1357 on wand 1359. Sender
 `0x142173fa0`, reader `0x141fa52d0`; it only sends when both inventories are the player inventory (`client+0xc9d0`).
 The client sends 0x71 immediately after the 0x29d on the same use: 0x29d asks for the preview, 0x71 is the commit.
+The currency and the target are looked up as for 0x71 (`Game.Locate`), so either can be in a stash tab.
 
 The answer is **S→C 0x02a0 CurrencyApplicationForesightResult**: `u16 0x02a0`, `u16 BE keyA` (the 0x29d key),
 `u16 raw status` (0: preview, non-zero: failure; 0x04FA is the client's own fail code), `u64 raw count`, then
@@ -1151,26 +1171,47 @@ foreseeing item; 0x2a0 status 0 shows the preview, any non-zero status plays `Hi
 preview/commit identity and all refusal/persistence rules are covered by the Gateway tests. See
 [the evidence](../re/hinekora-lock.md).
 
-### Vaal Orb and corruption (2026-10-21, verified live)
+### Vaal Orb and corruption (2026-10-21, verified live; 3.29 retail parity updated 2026-11-24)
 
 **Corrupted** is bit 0 of the Base component's u8 `+0xc7` (the second u8 after the visual identity): the client's
 crafting checks read it ("input_is_corrupted" at `0x141d6c4f4`, `test byte ptr [base+0xc7], 1`). `Item.Corrupted` writes
-it and is saved with the item. A corrupted item takes no currency but a Scroll of Wisdom (there is no corrupted
-currency yet), and nothing removes corruption.
+it and is saved with the item. A corrupted item takes only a Scroll of Wisdom, Tainted currency, or socket crafting
+bench recipes (at an added Vaal Orb cost); nothing removes corruption.
 
-`CurrencyCorrupt`, same handler (0x71, 0x72 with Shift). For gems, the server chooses one of four outcomes with equal
-weight: corruption alone, one level up or down, 1–10 quality up or down (bounded to 0–23), or conversion to a
-matching Vaal variant. `SkillGems.VaalVariant_BaseItemTypesKey` links the base, and the Vaal variant's second
-granted effect identifies the original skill. A conversion with no matching variant only corrupts the gem.
-Experience `-1` represents one level above the normal cap.
+`CurrencyCorrupt` (`VaalCorruption.Apply` in `Modules/Core/Game/Item/VaalCorruption.cs`), same handler (`0x71`, `0x72`
+with Shift, and Hinekora's Lock `0x29d`/`0x2a0` foresight via `CurrencyResult`). Already-corrupted, mirrored, vestigial,
+unmodifiable, unidentified (non-gem) and non-corruptible bases (including Tinctures, whose `ItemClasses.CanBeCorrupted`
+is 0) are refused before spending. `CurrencyMoreCorrupt` and `CurrencyIncursionCorrupt1` remain separate via
+`CurrencyEffects.TryAction`.
 
-For equipment, `ItemRolls.Vaal` uses a local outcome table for a modifiable weapon, armour piece or jewellery
-(ring, amulet, belt) that is neither unique, corrupted nor mirrored.
-A normal or magic item becomes rare with 4-6 new affixes and a rare name. A rare item has 1, 2, 3 or 4 random affixes
-replaced (20% each), 5 (10%) or all of them rerolled (10%: 4-6, new name) (`ItemRolls.ReplaceAffixes`: the replaced
-ones come back through `AddAffix`, at most three of each kind, so the count stays).
-Unknown/unsupported or `Unmodifiable` bases and empty pools are refused before spending.
-Official CoE Vaal outcomes are separate work; see [the admission check and boundary](../re/vaal-coe.md).
+- **Gems** (active and support): four equal outcomes — no change, one level up or down (`-1` experience represents one
+  level over the cap), 1–10 quality up or down (clamped 0–23), or conversion to the matching Vaal variant via
+  `SkillGems.VaalVariant_BaseItemTypesKey` (keeping a transfigured base skill, level, quality and flags; no-change when
+  none exists).
+- **Equipment** (weapons, armour, shields, quivers, rings, amulets, belts, fishing rods — normal, magic, rare and
+  unique): four equal outcomes — no change; 3.29 socket colour corruption (one random white socket turns coloured;
+  fizzles to no-change when none exist, giving socketless gear an effective 50% no-change rate); a weighted
+  `GenerationType = 5` (`Domain = 1`, `Level <= ilvl <= MaxLevel`) corrupted implicit (replacing one random existing
+  implicit when Eldritch implicits are present, otherwise replacing implicits); or bricking into a 6-affix corrupted
+  rare (respecting base affix caps, preserving fractured mods, restoring base artwork and clearing unique hidden mods,
+  with freshly rolled sockets/links and a 1/36 chance for maximum sockets fully linked when no gems are socketed).
+- **Maps and MapKeys** (normal, magic, rare and unique): non-unique maps roll four equal outcomes — no change;
+  unidentified preserving existing mods (normal maps stay identified); an 8-mod corrupted rare (4 prefixes, 4 suffixes;
+  awards `CorruptMap8Mods`); or a rerolled 4–6 mod corrupted rare upgraded by +1 tier (`MapKeyTier1..15` -> `+1`,
+  `MapKeyTier16` -> `MapKeyVaalTemple` with its Vaal Vessels implicit; matching legacy `MapWorlds*` upgrades). Unique
+  maps roll no change (50%), unidentified preserving unique mods (25%), or brick to a 4–6 mod rare on the same base
+  (25%).
+- **Jewels** (standard Crimson/Viridian/Cobalt, Prismatic, Timeless, Abyss, Cluster and unique): four equal outcomes —
+  no change; a weighted `GenerationType = 5` corrupted implicit (`Domain = 10` for `Jewel` including Cluster Jewels,
+  `Domain = 13` for `AbyssJewel`, preserving Cluster enchantments); brick to a 3–4 affix corrupted rare (preserving
+  fractured mods and Cluster enchantments, rolling base Cluster enchantments if bricked from a unique Cluster Jewel);
+  or transformation into a weighted corruption-exclusive unique jewel of the same base (Crimson/Viridian/Cobalt only,
+  excluding pinnacle boss, Simulacrum, Heist and recipe uniques, awarding `CorruptToCorruptUniqueJewel`; Abyss,
+  Cluster, Prismatic and Timeless jewels fall back to no-change).
+- **Flasks** (life, mana, hybrid, utility — normal, magic and unique): corrupts the flask and shifts quality by -10% to
+  +10% (clamped 0–40%, allowing 20% flasks to reach up to 30%).
+
+See [the admission check and CoE notes](../re/vaal-coe.md).
 
 ### Eldritch Ichors and Embers (2026-10-30)
 

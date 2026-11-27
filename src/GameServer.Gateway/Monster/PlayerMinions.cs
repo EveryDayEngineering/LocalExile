@@ -36,7 +36,15 @@ public sealed class PlayerMinions
 
     /// <summary>An aura a minion casts on its owner: the skill, its BuffDefinitions row, its radius (cells) and its stats.
     /// The owner's aura effect does not scale it: it is the minion's skill, not his.</summary>
-    public sealed record Aura(string EffectId, ushort BuffRow, int Radius, IReadOnlyList<(uint Key, int Value)> Stats);
+    public sealed record Aura(string EffectId, ushort BuffRow, int Radius, IReadOnlyList<(uint Key, int Value)> Stats)
+    {
+        public bool SharesWithAllies { get; init; }
+        public IReadOnlyList<uint>? BuffValues { get; init; }
+        public bool AffectsSource { get; init; } = true;
+        /// <summary>The emitter's own increased aura effect % (e.g. Generosity + gear) kept separate from <see cref="Stats"/>
+        /// so owner-granted bonuses (such as Luminary's Bestowed Knighthood) add linearly before scaling.</summary>
+        public int OwnAuraEffectPct { get; init; }
+    }
 
     /// <summary>A death explosion: this percent of the minion's maximum life as this type of damage to the hostile monsters
     /// within the radius (cells).</summary>
@@ -48,6 +56,7 @@ public sealed class PlayerMinions
         SpawnedMonster Target, (int X, int Y) To, double ContactAt)
     {
         public bool Started;
+        public double? TemporaryAllyUntil { get; init; }
     }
     public readonly Dictionary<uint, Attack> Attacks = [];
     // Accepted gameplay finishes in the area's frame; only neutral output/projection data crosses Game replacement.
@@ -65,6 +74,7 @@ public sealed class PlayerMinions
     public readonly List<FlaskReward> FlaskRewards = [];
     public readonly HashSet<SpawnedMonster> Rewarded = [];
     public long StatRevision, PresentedStatRevision, AccountRevision, PresentedAccountRevision;
+    public int? PendingLevelBefore;
     readonly Dictionary<uint, Minion> minions = [];
 
     public IReadOnlyCollection<Minion> All => minions.Values;

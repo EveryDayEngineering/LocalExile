@@ -11,29 +11,43 @@
 /// </summary>
 public static class SkillArea
 {
-    public static bool IsCyclone(string? effect) => effect is "Cyclone" or "CycloneAltX";
+    public static bool IsCyclone(string? effect) => effect is "Cyclone" or "CycloneAltX" or "VaalCyclone";
 
     /// <summary>Explicit data wins. Cyclone's base radius is not in its exported stat set (PoB: 16 cells). The player's
     /// Ground Slam ("GroundSlam") has none either: the +40% final radius belongs to the old "ExileGroundSlam" row, which
     /// no gem grants (see GroundSlamWave).</summary>
     public static int BaseRadius(string? effect, Func<uint, int> get) =>
-        get(Stat.ActiveSkillBaseAreaOfEffectRadius) is int radius and > 0 ? radius : KnownBaseRadius(effect) ?? 12;
+        effect == Game.ManabondEffect ? Math.Max(0, ActorScale.Saturate(18L + get(Stat.ActiveSkillBaseAreaOfEffectRadius)))
+            : get(Stat.ActiveSkillBaseAreaOfEffectRadius) is int radius and > 0 ? radius : KnownBaseRadius(effect) ?? 12;
 
     static int? KnownBaseRadius(string? effect) =>
-        effect == "LightningWarp" ? 16 : effect == "VaalGroundSlam" ? 40 : IsCyclone(effect) ? 16 : effect == "RollingMagma" ? 14
-            : effect == "FireTrap" ? 15 : effect == "StormblastMine" ? 20 : effect is "DarkPact" or "DarkPactRoyale" ? 26
-            : effect is "StormCall" or "Frostblink" or "FrostblinkHardMode" ? 20
+        Game.IsLightningWarpEffect(effect) ? 16
+            : effect == "VaalGroundSlam" ? GroundSlamWave.VaalBaseRadius : IsCyclone(effect) ? 16 : effect == "RollingMagma" ? 14
+            : effect is "Earthquake" or "Earthshatter" or "EarthshatterAltX" or "EarthshatterAltY" ? 18
+            : effect is "ConsecratedPath" or "ConsecratedPathAltX" ? 23
+            : Game.LacerateEffect(effect) ? LacerateWaves.BaseRadius
+            : Game.CleaveAttack(effect) ? Game.CleaveBaseRadius
+            : Game.IsBladestorm(effect) ? 24
+            : effect is "TectonicSlam" or "VaalBladeVortex" or Game.SpectrumHitEffect ? 15
+            : effect == "PrismaticBurst" ? 13
+            : GatewayProjectileSkillProfiles.IsShatteringSteel(effect) ? 28
+            : effect is "FireTrap" or "VaalFireTrap" ? 16 : effect == "StormblastMine" ? 20 : effect is "DarkPact" or "DarkPactAltX" or "DarkPactRoyale" ? 26
+            : effect is "StormCall" or "StormCallAltX" or "Frostblink" or "FrostblinkHardMode" or "FrostblinkAltX" || Game.IsPyroclastMine(effect) ? 20
+            : effect is "GalvanicArrow" or "GalvanicArrowAltX" or "GalvanicArrowAltY" ? 28
             : effect is "StormBrand" or "StormBrandAltX" or "StormBrandAltY"
                 or "PenanceBrand" or "PenanceBrandAltX" or "PenanceBrandAltY"
                 or "WintertideBrand" or "WintertideBrandAltX" or "WintertideBrandAltY" ? 22
             : effect == "Brandsurge" ? 26
+            : effect == "EarthquakeAltX" ? 18
+            : effect == "TectonicSlamAltX" ? 15
             : GatewayProjectileSkillProfiles.IsMoltenStrike(effect) ? 9 : 12;
 
     static readonly uint[] MoreArea =
     [
         Stat.ActiveSkillAreaOfEffectPlusPctFinal, Stat.SkillAreaOfEffectPlusPctFinal,
         Stat.SupportConcentratedEffectSkillAreaOfEffectPlusPctFinal, Stat.SkillAreaOfEffectPlusPctFinalFromSkillSpecificStat,
-        Stat.BloodSandStanceMeleeSkillsAreaOfEffectPlusPctFinal,
+        Stat.BloodSandStanceMeleeSkillsAreaOfEffectPlusPctFinal, Stat.MapPlayersSkillAreaOfEffectPlusPctFinal,
+        Stat.GladiatorAreaOfEffectPlusPctFinalWhileWieldingMace,
     ];
 
     const uint MorePerRemovableCharge = Stat.AreaOfEffectPlusPctFinalPerRemovablePowerFrenzyOrEnduranceCharge;
@@ -57,8 +71,10 @@ public static class SkillArea
         get(Stat.BaseSkillAreaOfEffectPlusPct) + get(Stat.SkillAreaOfEffectPlusPct) + (spell ? get(Stat.SpellAreaOfEffectPlusPct) : 0);
 
     /// <summary>The client's precomputed radius percentage (0x1591), not the increased area percentage.</summary>
-    public static int RadiusPercent(Func<uint, int> get, bool spell) =>
-        (int)Math.Clamp((long)Math.Floor(100 * Math.Sqrt(Modifier(get, spell)))
+    public static int RadiusPercent(Func<uint, int> get, bool spell) => RadiusPercent(get, spell, 1);
+
+    internal static int RadiusPercent(Func<uint, int> get, bool spell, double areaMore) =>
+        (int)Math.Clamp((long)Math.Floor(100 * Math.Sqrt(Modifier(get, spell) * areaMore))
             * Math.Max(0L, 100L + get(Stat.ActiveSkillAreaOfEffectRadiusPlusPctFinal)) / 100 - 100, -100, int.MaxValue);
 
     /// <summary>Supports' more or less area, each a "_final" multiplier on the supported skill: Spell Cascade, Arcanist
@@ -67,6 +83,7 @@ public static class SkillArea
     [
         Stat.SupportSpellCascadeAreaOfEffectPlusPctFinal, Stat.SupportBrandAreaOfEffectPlusPctFinal,
         Stat.SupportCorruptingCryAreaOfEffectPlusPctFinal, Stat.ConsecratedCryWarcryAreaOfEffectPlusPctFinal,
+        Stat.SupportSpellBoostAreaOfEffectPlusPctFinal, Stat.SupportPulveriseAreaOfEffectPlusPctFinal,
     ];
 
     /// <summary>Greater Spell Echo: increased area for each repeat of the spell (the first cast is repeat 0).</summary>
@@ -83,6 +100,10 @@ public static class SkillArea
         double mod = Math.Max(0, 1 + increased / 100.0);
         foreach (uint more in MoreArea) mod *= Math.Max(0, 1 + get(more) / 100.0);
         foreach (uint more in SupportMoreArea) mod *= Math.Max(0, 1 + get(more) / 100.0);
+        if (get(Stat.IsTotem) != 0)
+            mod *= Math.Max(0, 1 + get(Stat.StygianSpireTotemAreaOfEffectPlusPctFinalPerMaximumTotem) / 100.0);
+        if (get(Stat.AffectedBySandstorm) != 0)
+            mod *= Math.Max(0, 1 + get(Stat.BladestormAreaOfEffectPlusPctFinalWhileInSandstorm) / 100.0);
         // Discharge: more area per removable charge it will spend (the charges above the minimum).
         if (get(MorePerRemovableCharge) is int perCharge and not 0)
             mod *= Math.Max(0, 1 + perCharge * Charges.Types.Sum(t => Math.Max(0, get(Stat.Of($"current_removable_{Charges.Name(t)}_charges")))) / 100.0);
@@ -105,10 +126,13 @@ public static class SkillArea
     public const uint Increase = Stat.SkillAreaOfEffectPlusPct;
 
     /// <summary>The radius in cells for <paramref name="baseRadius"/> (the skill's base when it has none of its own).</summary>
-    public static int Radius(int baseRadius, Func<uint, int> get, bool spell)
+    public static int Radius(int baseRadius, Func<uint, int> get, bool spell) => Radius(baseRadius, get, spell, 1);
+
+    internal static int Radius(int baseRadius, Func<uint, int> get, bool spell, double areaMore)
     {
         int radius = baseRadius + get(Stat.ActiveSkillBaseRadiusPlus);
-        double scaled = radius * Math.Floor(100 * Math.Sqrt(Modifier(get, spell))) / 100;
+        double hundredths = 100 * Math.Sqrt(Modifier(get, spell) * areaMore);
+        double scaled = radius * Math.Floor(hundredths > 0 ? Math.BitIncrement(hundredths) : hundredths) / 100;
         scaled *= Math.Max(0, 1 + get(Stat.ActiveSkillAreaOfEffectRadiusPlusPctFinal) / 100.0);
         return Math.Max(0, (int)Math.Floor(scaled));
     }
@@ -133,9 +157,15 @@ public static class GroundSlamWave
 {
     /// <summary>ActionTypes "DistanceScaledGroundSlam" HASH16 (row 3): the action of the player's Ground Slam and its
     /// alternate-quality and Royale forms (GrantedEffects GroundSlam, GroundSlamAltX, GroundSlamAltY, GroundSlamRoyale
-    /// and PlaytestSlam). Vaal Ground Slam's own skill is "VaalDistanceScaledGroundSlam" (row 4), so the Vaal blast keeps
-    /// its radial hit.</summary>
+    /// and PlaytestSlam). Vaal Ground Slam uses "VaalDistanceScaledGroundSlam" (row 4) for its own radial wave.</summary>
     public const ushort Action = 0x2390;
+
+    // The Vaal action reaches its scaled radius in a fixed time (the 3.29.3c action update).
+    public const int VaalBaseRadius = 39;
+    public const double VaalTravelSeconds = 0.375;
+
+    public static double VaalAdvanceSeconds(double distance, int radius) =>
+        VaalTravelSeconds * Math.Max(0, distance) / Math.Max(1, radius);
 
     /// <summary>The wave's reach in cells at the generic area radius (12 cells). The exported tables carry no length;
     /// the community describes Ground Slam's wave as about 60 units and the client draws it well past melee reach, so
@@ -158,11 +188,18 @@ public static class GroundSlamWave
     /// reach in about 0.15 s and keeps the nearest-first stagger.</summary>
     public const double CellsPerSecond = 400;
 
-    /// <summary>The reach in cells of the wave a skill of <paramref name="areaRadius"/> cells sends: the base length,
-    /// moved by however far the skill's own radius sits from the generic one (so the gem's per-level radius, a
-    /// support's more area and the player's area stats all lengthen it without the level×base runaway a plain
-    /// multiple of the radius gives).</summary>
-    public static double Length(int areaRadius) => Math.Max(0, BaseLength + (areaRadius - GenericAreaRadius));
+    // Volcanic Fissure and older callers use the original bounded sweep.
+    public static double Length(int areaRadius) => Math.Max(0, BaseLength + areaRadius - GenericAreaRadius);
+
+    /// <summary>The reach in cells of the wave a skill of <paramref name="areaRadius"/> cells sends: at 0% AoE it grows
+    /// by <paramref name="gemBasePlus"/> (e.g. gem level's active_skill_base_radius_+) without runaway multiplication, and
+    /// scales proportionally with increased/more area (including Fist of War).</summary>
+    public static double Length(int areaRadius, int gemBasePlus)
+    {
+        double baseScaleRadius = Math.Max(1, GenericAreaRadius + Math.Max(0, gemBasePlus));
+        double baseLength = Math.Max(0, BaseLength + Math.Max(0, gemBasePlus));
+        return Math.Max(0, baseLength * Math.Max(0, areaRadius) / baseScaleRadius);
+    }
 
     /// <summary>The half angle in degrees this use sends: the estimate above, grown by the skill's own
     /// <c>ground_slam_angle_+%</c> (Ground Slam's alternate-quality form holds a flat 100), capped at a right angle so an

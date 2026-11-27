@@ -63,7 +63,8 @@ public static partial class Game
         var sourceWeapon = HandWeapon(player, hand);
         int handAccuracy = HandAccuracy(player, hand, character);
         int criticalChance = CriticalProhibited(player, attack: true)
-            ? AttackBaseCriticalStrike.Chance(!weapon.Unarmed, HandWeaponCritical(player, hand), player.Pools.CriticalStrikeChancePct, RawCritical)
+            ? AttackBaseCriticalStrike.Chance(!weapon.Unarmed, HandWeaponCritical(player, hand, character),
+                player.Pools.CriticalStrikeChancePct, RawCritical)
             : HandAttackCriticalChance(player, hand, character);
         var captured = OrdinaryRangedShot.Capture(sourceWeapon, character, SkillsFor(player).EffectStats(effect, 1), Stats,
             handAccuracy, criticalChance, player.Pools.CriticalStrikeMultiplier);
@@ -74,39 +75,65 @@ public static partial class Game
             : OrdinaryRangedShot.Capture(sourceWeapon, character, SkillsFor(player).EffectStats(effect, 1), Stats,
                 handAccuracy, criticalChance, player.Pools.CriticalStrikeMultiplier,
                 additionalBlindedIncreased);
+        if (Get(Stat.KeystoneLightningPurist) != 0)
+        {
+            captured = captured with { Hit = ApplyRoilingTempest(captured.Hit, Get) };
+            if (blindedCapture is not null)
+                blindedCapture = blindedCapture with { Hit = ApplyRoilingTempest(blindedCapture.Hit, Get) };
+        }
         var raw = SupportedAttackDamage.Raw(sourceWeapon, Get, new(handAccuracy));
-        var conversion = DamageStats.Conversion(character, Stats, attack: true);
-        var ailmentRows = AilmentPanelStats.Compute(new("main_hand", Spell: false), raw, conversion, Get);
+        var conversion = SupportedAttackDamage.WithWeaponGains(
+            DamageStats.Conversion(character, Stats, attack: true), sourceWeapon, Get);
+        var ailmentContext = new AilmentPanelStats.Context("main_hand", Spell: false) { WeaponStats = sourceWeapon.LocalSources };
+        var ailmentRows = AilmentPanelStats.Compute(ailmentContext, raw, conversion, Get);
         var blindedRows = blindedCapture is null ? null
-            : AilmentPanelStats.Compute(new("main_hand", Spell: false), raw, conversion, Get, additionalBlindedIncreased);
+            : AilmentPanelStats.Compute(ailmentContext, raw, conversion, Get, additionalBlindedIncreased);
+        int damagePerChain = Get(Stat.ProjectileDamagePlusPctPerChain);
+        int damagePerPierce = Get(Stat.ProjectileDamagePlusPctPerPiercedEnemy);
         var shot = new ProjectileOffense(captured.Hit, false, captured.Accuracy, captured.CriticalChance,
             captured.CriticalMultiplier, wand ? "ordinary wand" : "ordinary bow")
         {
             WeaponAttack = true,
+            DirectAttackContact = true,
             TinctureKill = TinctureKillBonusFor(player, character, hand),
             NoExtraCriticalDamage = CriticalHitsDealNoExtraDamage(character),
-            Spider = !HasSpiderDamage(Get) ? null : new(raw, conversion, new Dictionary<uint, int>(character),
+            TargetCritical = TargetCriticalBonuses.From(character, null),
+            DamageIncreasePerChain = damagePerChain,
+            DamageIncreasePerPierce = damagePerPierce,
+            Spider = damagePerChain == 0 && damagePerPierce == 0
+                && !HasSpiderDamage(Get) && !HasLowLifeDamage(Get) && !HasTypedTargetDamage(Get)
+                && !HasContactDamage(Get) && !HasLocalTargetDamage(sourceWeapon.LocalSources)
+                && Get(Stat.AttackDamagePlusPctVsMaimedEnemies) == 0 ? null
+                : new(raw, conversion, new Dictionary<uint, int>(character),
                 new Dictionary<uint, int>(character), true, false, false, true, [], new HashSet<int> { 0, 2 }, 1,
-                Volatile: false, Local: sourceWeapon.LocalSources is null ? null : new Dictionary<uint, int>(sourceWeapon.LocalSources),
-                Bow: !wand),
+                WieldingWand: sourceWeapon.WieldingWand, Volatile: false,
+                Local: sourceWeapon.LocalSources is null ? null : new Dictionary<uint, int>(sourceWeapon.LocalSources),
+                Bow: !wand, WeaponIncreased: SupportedAttackDamage.WeaponIncrease(sourceWeapon, Get),
+                WeaponTypedIncreases: WeaponTypeDamage.Of(sourceWeapon, Get))
+            {
+                Armed = WeaponAttributeDamage.Armed(sourceWeapon), OffHand = hand == AttackHand.Off,
+                ProjectileAttackHitIncrease = (long)SupportedAttackDamage.HitModifiers(sourceWeapon, Get, handAccuracy)(Stat.ProjectileDamagePlusPct)
+                    - Get(Stat.ProjectileDamagePlusPct),
+            },
             SkillStats = SkillsFor(player).EffectStats(effect, 1).ToDictionary(s => s.Item1, s => s.Item2),
             VsBlindedCriticalChance = AttackCriticalChanceVsBlinded(player, character, release: true, hand: hand),
             VsGroundCriticalChance = AttackCriticalChanceVsGround(player, character, release: true, hand: hand),
             Penetration = captured.Penetration, ResistanceMods = captured.ResistanceMods, ImpaleChance = captured.ImpaleChance,
             ImpaleSettings = captured.ImpaleSettings, AccuracyProfile = captured.AccuracyProfile,
-            Ignite = MonsterIgnites.Settings.From(ailmentRows, "main_hand", Get),
-            Poison = MonsterPoisons.Settings.From(ailmentRows, "main_hand", Get, sourceWeapon.LocalSources,
+            Ignite = VoraciousFlame(IgniteWithTargetCondition(ailmentRows, ailmentContext, raw, conversion, Get, Get, 0), Get),
+            Poison = PoisonSettingsFrom(ailmentRows, "main_hand", Get, sourceWeapon.LocalSources,
                 projectileAttack: true),
             Bleed = BleedSettings(ailmentRows, "main_hand", Get, sourceWeapon.LocalSources, melee: false, bow: !wand,
                 projectileAttack: true),
             VsBlinded = blindedCapture is null || blindedRows is null ? null : new(blindedCapture.Hit, null,
-                MonsterIgnites.Settings.From(blindedRows, "main_hand", Get),
+                VoraciousFlame(IgniteWithTargetCondition(blindedRows, ailmentContext, raw, conversion, Get, Get, additionalBlindedIncreased), Get),
                 BleedSettings(blindedRows, "main_hand", Get, sourceWeapon.LocalSources, melee: false, bow: !wand,
                     projectileAttack: true),
-                MonsterPoisons.Settings.From(blindedRows, "main_hand", Get, sourceWeapon.LocalSources,
+                PoisonSettingsFrom(blindedRows, "main_hand", Get, sourceWeapon.LocalSources,
                     projectileAttack: true)),
             MaimChance = Get(Stat.ProjectileAttacksChanceToMaimOnHitPctIfYouHaveBeastMinion),
             CriticalRoll = criticalRoll, Leech = captured.Leech, WeaponLocal = sourceWeapon.LocalSources,
+            OffHandWeapon = hand == AttackHand.Off,
             AccuracyMoreUnique = player.Pools.AccuracyMoreVsUniquePct, AccuracyMoreClose = player.Pools.AccuracyMoreInCloseRangePct,
             LocalStunThresholdReduction = sourceWeapon.LocalSources?.GetValueOrDefault(Stat.LocalStunThresholdReductionPlusPct) ?? 0,
             AlwaysHits = Get(Stat.GlobalAlwaysHit) != 0, FarShot = Get(Stat.PlayerFarShot) != 0,
@@ -119,13 +146,17 @@ public static partial class Game
         };
         var origin = ProjectileSession.Vector(player.Walk.Position(session.Runtime.Now / (double)ProjectileRuntime.QuantaPerSecond));
         var target = ProjectileSession.Vector(aim);
-        // The shot leaves from the clip's contact keyframe, in front of the body along the aim (the Ranger's bow
-        // 5.5 cells, a wand's tip 7.5), else 1.5 cells ahead; never past half way to the aim, so a close target
-        // is not behind the release. The lateral part of the keyframe is not applied (ContactPoint).
-        double ahead = release is { ForwardCells: > 0 } point ? point.ForwardCells : OrdinaryRangedAttack.ReleaseAheadCells;
-        origin += (target - origin).Unit * Math.Min(ahead, (target - origin).Length / 2);
+        // 3.29.3c client spawn forward offset (0x141ba7840 -> 0x141ba7c30): 30 world units (~2.76 cells) for ordinary
+        // bows/wands (projectile_uses_contact_position is 0 on PlayerMelee), clamped so a close aim is not behind origin.
+        double ahead = NativeProjectileForwardCells(Get, release);
+        if (ahead > 0)
+            origin += (target - origin).Unit * Math.Min(ahead, (target - origin).Length / 2);
         var profile = OrdinaryRangedProfile(player, projectileId, weapon.Bow, Get);
-        profile = clientDrawn ? ClientDrawnProfile(player, profile, Get, sequence, target - origin) : NativeVolley(profile, Get);
+        profile = clientDrawn ? ClientDrawnProfile(player, profile, Get, sequence, target - origin)
+            : NativeVolley(profile, Get, sequence, target - origin, player.Id);
+        SpendProjectileSteelShards(player, session, skillCost: 0,
+            Get(Stat.SteelAmmoConsumedPerUseWithAttacksThatFireProjectiles),
+            Get(Stat.SkillsFireXAdditionalProjectilesFor4SecondsAfterConsuming8SteelAmmo));
         return new(profile, new(player.Id, session.Player.ProjectileEpoch), new(player.Id, session.Player.ProjectileEpoch), 1,
             origin, target)
             { Payload = shot, ReturnAnchor = new(player.Id, session.Player.ProjectileEpoch) };
