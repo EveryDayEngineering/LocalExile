@@ -485,7 +485,8 @@ public static partial class Game
         ClampReservedResources(player);
         // The player's own aura buffs are its auras now (both buffs of each, Generosity's too: its received one only has
         // its icon suppressed); the Buffs component writes what changed.
-        player.Area.Buffs.Replace(player.Id, b => b.Source == player.Id && b.Tag is 0 or (ushort)BuffTag.BloodAndSand or (ushort)BuffTag.VaalAura
+        player.Area.Buffs.Replace(player.Id, b => b.Source == player.Id
+                && (b.Tag is 0 or (ushort)BuffTag.BloodAndSand or (ushort)BuffTag.VaalAura || b.Row == AuraCatalog.BuffRow(SpellslingerEffect))
                 && (AuraCatalog.IsAuraRow(b.Row) || TimedVaalAuraBuffRows.ContainsValue(b.Row)),
             player.Auras.Values.SelectMany(aura => AuraBuffs(player.Id, aura, TemporaryAuraSecondsLeft(player, aura))));
         PresentAvianPhaseLocked(player);
